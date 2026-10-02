@@ -269,7 +269,7 @@ The design lives in [`design.md`](design.md); §N.M below refers to its sections
 
 ## M3: engine → simplified variant complete
 
-### [ ] T11: Replica trait and LocalReplica
+### [x] T11: Replica trait and LocalReplica
 - **Depends on:** T06, T10
 - **Read:** §7, §5.3 step 5, §5.8 (only the "no echo" idea; the journal comes in T15)
 - **Files:** `src/replica/{mod,local}.rs`
@@ -283,6 +283,46 @@ The design lives in [`design.md`](design.md); §N.M below refers to its sections
   - unit tests apply each `Op` on a tempdir replica and check both the disk and the index;
   - a stale precondition gives `PreconditionFailed`.
 - **Notes:**
+  - **API deviations (design §7 updated):**
+    - `apply` takes the `path` (§7's signature had none).
+    - Every `Op` that leaves an entry carries its `vv` (and `Mkdir`/`Symlink` their `mtime_ns`), since "the vv comes from the op": `WriteFile{meta: FileMeta, hash, vv}`, `Mkdir{mode, mtime_ns, vv}`, `Symlink{target, mtime_ns, vv}`, `Delete{vv}`, `Rmdir{vv}`, `RenameToConflict{to: RelPath}`, `SetMeta{mode, mtime_ns, vv}`.
+    - `Precondition::Matches{kind: Kind, vv}`: the `Kind` carries the hash or target, and `Precondition::matching(&entry)` builds one.
+    - `Outcome::Applied(Entry)` is the path's new entry and `PreconditionFailed` carries the current index entry, both without `LocalMeta`, like `changes_since`.
+    - `ContentReader` = `Read + Send` (blanket impl). `Op`, `Precondition` and `FileMeta` derive serde for T20.
+  - **`LocalReplica`** (`replica/local.rs`): `open(&ReplicaConfig, pair_dir)` owns the capability probe (log + `require_minimum`, as T02 asked). Builder options `racy_window` and `quarantine_grace`. Accessors `root`, `caps`, `index`, `config`, `quarantine`, plus `sweep_quarantine()` for T16's timer (not in the trait). `scan` builds the T10 `Scanner` with the replica's policy and `munge_links`. `watch()` returns `None`. A minimal `watch::Hint { Paths, FullRescan }` exists for the trait; T16 owns it.
+  - **apply** is one redb write txn: logical check against the index, then `Expected` from the entry (files from the index; symlinks by checking the indexed (dev, ino, ctime) against a fresh `statx`, because the index keeps a symlink's mtime from its last *logical* change), then the `fs::commit` call, then the put(s) and the commit. A failed commit or an `Err` aborts the txn, so the index is untouched.
+    - Refused with `PreconditionFailed`: an `Unmanaged` entry; a path that is, or lies beneath, a followed link (`via_link`; T17's write-back); a parent that is not an indexed real directory; `Rmdir` while an indexed descendant is still live.
+    - `Error::InvalidOp` (new) for an op that can't fit the indexed kind (caller bug).
+    - Files we write are stored `racy`: the next scan rehashes them once (and, being within that scan's racy window, once more). It finds nothing to bump: no echo, tested after every op.
+  - **New commit functions** (each gets hook points and attack-suite coverage):
+    - `commit::rename_to(ctx, path, &Expected, to)` for `RenameToConflict`: pin and check, move aside to a reserved name, verify (rehash), restore on change, then `NOREPLACE` onto `to` (restore → `PreconditionFailed("new name exists")` if it was taken), then step 5 at `to`.
+    - `commit::set_dir_mode(ctx, path, &Fingerprint, mode)`: pin the dir, require the same inode **and** the indexed mode, `fchmod` through the pin, then step 5. This is the one in-place change (design §5.4).
+    - Hook points: `rename.{before_pin,pinned,before_rename,after_rename,before_rehash,verified,before_restore,moved}` and `chmod.{before_pin,pinned,after_chmod}`.
+    - `tests/attack.rs` gained `RenameFile` (Plain + EditBefore at `rename.before_rename`), `RenameSymlink` and `ChmodDir`: 1464 cases (was 1242), all passing with no change to existing commit code.
+  - **RenameToConflict index update:** the path becomes a tombstone with the old vv plus a **local bump**. With the old vv unchanged, it would equal the peer's view of the loser while the content differs, and §6.1 would loop on "rescan". The copy at `to` gets a fresh vv `{local: tombstone counter + 1}`. Files and symlinks only; `to` must be a sibling (`InvalidPath` otherwise). T12 must resolve dir-vs-dir (mode) conflicts without renaming.
+  - **SetMeta:**
+    - A file whose mode or mtime differs is rewritten as a **copy** (a `StableReader` on itself → `replace_file`; the hash check guards against a change mid-copy), never `fchmod`ed in place. In-place metadata changes would hide a concurrent write from the rehash shortcut.
+    - A directory whose mode differs → `set_dir_mode`.
+    - Otherwise the index alone is updated after a `statx` check: same file mode/mtime, a directory's mtime, any symlink. So T12/T13 can use `SetMeta` with unchanged metadata to record a **merged vv** (`MergeVv`).
+  - **open_read** uses the new `fs::StableReader` (in `stat.rs`): one attempt, §5.2 checks, size checked at open, hash at EOF. Failures are `io::Error`s wrapping `Error::Unstable`; new `Error::from_stream` unwraps them, and `TempFile::copy_from` now uses it, so a torn source makes `apply` return `Err(Unstable)` with nothing committed. Also new: `Error::is_unstable`, `Error::is_not_found`.
+    - Our index entry must have the expected kind (else `Unstable`), and `expect` must be a file (else `InvalidOp`).
+    - Followed links (`-L`) are read via `Root::open_referent`, moved there from the scanner. At EOF the link must still be the indexed inode with the same ctime; the referent path is not re-resolved.
+  - **CLI:** `sync --once` and `daemon` now open both `LocalReplica`s (probe, log, open the index), then still say "not implemented" (T13/T16).
+  - **For T13/T17/T18:**
+    - `apply` doesn't check whether this replica's policy would manage an incoming symlink (e.g. an unsafe target under `SafeLinks` becomes `IgnoredLink` on the next scan, which bumps it). T17 should refuse or adapt that.
+    - The `SetMeta` file copy keeps its read fd open across the exchange, which would block T18's lease. T18 should close it first (e.g. stage, then drop the reader).
+    - `Preserved` leaves the index untouched (rescan).
+  - Tests: 12 in `replica/local.rs`:
+    - create/replace/file↔symlink, with no echo;
+    - stale vv, kind or `Absent`, a disk change since the scan for every CAS op, a hook-injected edit mid-commit, unindexed name, unmanaged FIFO;
+    - mkdir, nested write, parent-not-indexed, rmdir with live child, delete, rmdir, recreate over a tombstone;
+    - munged symlinks;
+    - rename to conflict (non-sibling, taken name, vv shapes, `changes_since`, winner create);
+    - `SetMeta` (file copy, index-only merge, dir chmod, dir mtime, symlink, user chmod → `PreconditionFailed`);
+    - `open_read` (normal 200 KB, foreign entry, non-file, rewrite mid-read → stays failed, size changed, torn source → apply `Err` with nothing committed);
+    - `-L` read and retarget mid-read, write refused;
+    - invalid ops; `changes_since` without `LocalMeta`.
+  - Plus 6 in `commit.rs`: rename trace and refusals, an edit before the move → restored, the name taken after verify → restored; chmod trace and refusals, a dir swapped after the pin → only the pinned one changed.
 
 ### [ ] T12: Reconciler and planner (pure)
 - **Depends on:** T08

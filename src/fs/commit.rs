@@ -15,7 +15,13 @@
 //!   `.~fsync.del.` name with `RENAME_NOREPLACE`, verifies it, and quarantines
 //!   it, or moves it back if it was modified in between;
 //! - **rmdir** (§5.7) relies on `unlinkat(AT_REMOVEDIR)` as an atomic
-//!   emptiness check.
+//!   emptiness check;
+//! - **rename to a conflict name** (§6.2) moves a checked file or symlink
+//!   aside like a delete, verifies it, and then renames it on to the new name
+//!   with `RENAME_NOREPLACE`;
+//! - **directory mode** (§5.4) is the one in-place change: a directory
+//!   cannot be replaced by a copy, so it is pinned, checked and `fchmod`ed
+//!   through the pinning fd.
 //!
 //! After the rename, the parent is fsynced, the name must hold the inode we
 //! staged (or nothing, after a delete), and the parent must still resolve to
@@ -50,7 +56,7 @@ pub struct Ctx<'a> {
 }
 
 /// Metadata set on a new file before it is committed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FileMeta {
     /// Permission bits; setuid and setgid are stripped.
     pub mode: u32,
@@ -251,6 +257,88 @@ pub fn rmdir(ctx: &Ctx<'_>, quarantine: &mut Quarantine, path: &RelPath) -> Resu
     }
     point("rmdir.after_rmdir");
     t.finish_removed()
+}
+
+/// Renames the file or symlink at `path`, which must match `expected`, to
+/// its sibling `to`, which must be free (§6.2: the losing side of a conflict
+/// is renamed to a conflict name).
+///
+/// Like a delete, the object is first moved aside to a reserved name and
+/// verified; if it was modified before that, it goes back to `path` (or, if
+/// the name was taken meanwhile, to a conflict name of our choosing). Then it
+/// is renamed to `to` with `RENAME_NOREPLACE`; if `to` was taken meanwhile it
+/// goes back too. `Applied` carries its fingerprint at `to`.
+pub fn rename_to(
+    ctx: &Ctx<'_>,
+    path: &RelPath,
+    expected: &Expected,
+    to: &RelPath,
+) -> Result<Outcome> {
+    let to_name = match to.name() {
+        Some(name) if to.parent() == path.parent() && to != path => name,
+        _ => {
+            return Err(Error::InvalidPath {
+                path: to.as_bytes().to_vec(),
+                reason: "rename target is not a sibling of the renamed path",
+            });
+        }
+    };
+    if tmpname::is_reserved(to_name) {
+        return Err(Error::InvalidPath {
+            path: to.as_bytes().to_vec(),
+            reason: "reserved `.~fsync.` name",
+        });
+    }
+    let t = Target::resolve(ctx.root, path)?;
+    if let Some(reason) = precheck(&t, expected)? {
+        return Ok(Outcome::PreconditionFailed(reason));
+    }
+    if t.stat(to_name)?.is_some() {
+        return Ok(Outcome::PreconditionFailed("new name exists"));
+    }
+    commit_rename(ctx, &t, expected, to_name)
+}
+
+/// Sets the permission bits of the directory at `path` to `mode` (§5.4).
+///
+/// The directory must be `expected`'s inode with `expected`'s mode. It is
+/// pinned with an `O_RDONLY|O_DIRECTORY` fd, checked, and changed through
+/// that fd, so the chmod cannot hit another object swapped in at `path`.
+pub fn set_dir_mode(
+    ctx: &Ctx<'_>,
+    path: &RelPath,
+    expected: &Fingerprint,
+    mode: u32,
+) -> Result<Outcome> {
+    let t = Target::resolve(ctx.root, path)?;
+    point("chmod.before_pin");
+    let pin = match rustix::fs::openat2(
+        t.parent(),
+        t.name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+        RESOLVE,
+    ) {
+        Ok(pin) => pin,
+        Err(Errno::NOENT) => return Ok(Outcome::PreconditionFailed("name missing")),
+        // A symlink (ENOTDIR with O_NOFOLLOW|O_DIRECTORY, or ELOOP) or a file.
+        Err(Errno::NOTDIR | Errno::LOOP) => {
+            return Ok(Outcome::PreconditionFailed("not a directory"));
+        }
+        Err(e) => return Err(t.err("pin directory", e)),
+    };
+    let fp = Fingerprint::of_fd(pin.as_fd())?;
+    if !fp.same_file(expected)
+        || fp.kind != FileKind::Dir
+        || fp.mode & MODE_MASK != expected.mode & MODE_MASK
+    {
+        return Ok(Outcome::PreconditionFailed("changed since scan"));
+    }
+    point("chmod.pinned");
+    rustix::fs::fchmod(&pin, Mode::from_raw_mode(mode & MODE_MASK))
+        .map_err(|e| t.err("chmod", e))?;
+    point("chmod.after_chmod");
+    t.finish(&Fingerprint::of_fd(pin.as_fd())?)
 }
 
 // ---------------------------------------------------------------------------
@@ -490,7 +578,7 @@ impl<'p> TempFile<'p> {
                 Ok(0) => return Ok(()),
                 Ok(n) => n,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(Error::io("read content to commit", e)),
+                Err(e) => return Err(Error::from_stream("read content to commit", e)),
             };
             self.write_all(&buf[..n])?;
         }
@@ -1003,6 +1091,75 @@ fn commit_delete(
         }
     }
     t.finish_removed()
+}
+
+// ---------------------------------------------------------------------------
+// Rename to a conflict name (§6.2)
+// ---------------------------------------------------------------------------
+
+fn commit_rename(ctx: &Ctx<'_>, t: &Target<'_>, expected: &Expected, to: &[u8]) -> Result<Outcome> {
+    // 1. Pin the object and check it against the index.
+    point("rename.before_pin");
+    let (_pin, old) = match pin_expected(t, expected)? {
+        Ok(pinned) => pinned,
+        Err(reason) => return Ok(Outcome::PreconditionFailed(reason)),
+    };
+    point("rename.pinned");
+
+    // T18: take an F_WRLCK lease here when `ctx.caps.leases`.
+    point("rename.before_rename");
+
+    // 2. Move it aside to a reserved name, so what we verify next can only
+    //    be the object we moved.
+    let tmp = match with_fresh_name(TmpKind::Temp, |tmp| {
+        rustix::fs::renameat_with(t.parent(), t.name, t.parent(), tmp, RenameFlags::NOREPLACE)
+    }) {
+        Ok(((), tmp)) => tmp,
+        Err(Errno::NOENT) => return Ok(Outcome::PreconditionFailed("name removed")),
+        Err(e) => return Err(t.err("move aside for rename", e)),
+    };
+    point("rename.after_rename");
+
+    // 3. Verify what was moved; put it back if it was modified.
+    match verify_old(t, &tmp, &old, expected, "rename.before_rehash") {
+        Verified::Unchanged => point("rename.verified"),
+        Verified::Gone => return Err(t.unstable("renamed object vanished from its temp name")),
+        Verified::Changed => {
+            point("rename.before_restore");
+            return restore(ctx, t, &tmp);
+        }
+    }
+
+    // 4. On to the new name; never over something that appeared there.
+    match rustix::fs::renameat_with(
+        t.parent(),
+        tmp.as_slice(),
+        t.parent(),
+        to,
+        RenameFlags::NOREPLACE,
+    ) {
+        Ok(()) => {}
+        Err(Errno::EXIST) => {
+            point("rename.before_restore");
+            return Ok(match restore(ctx, t, &tmp)? {
+                Outcome::PreconditionFailed(_) => Outcome::PreconditionFailed("new name exists"),
+                other => other,
+            });
+        }
+        Err(Errno::NOENT) => return Err(t.unstable("renamed object vanished from its temp name")),
+        Err(e) => return Err(t.err("rename", e)),
+    }
+    point("rename.moved");
+
+    // 5. Step 5 checks at the new name.
+    t.sync_parent()?;
+    let now = match t.stat(to)? {
+        Some(now) if same_object(&old, &now) => now,
+        _ => return Err(t.unstable("renamed object replaced right after commit")),
+    };
+    t.check_parent()?;
+    point("commit.verified");
+    Ok(Outcome::Applied(now))
 }
 
 /// Renames `parent/from` to a free conflict name for `orig` (§6.2), trying
@@ -2211,5 +2368,165 @@ mod tests {
         assert!(!fx.p("d").exists());
         assert_eq!(q.len(), 1);
         assert_eq!(fx.leftovers().len(), 1);
+    }
+
+    // ----- T11: rename to a conflict name, directory mode -------------------
+
+    fn ren(fx: &Fx, rel: &str, exp: &Expected, to: &str) -> Result<Outcome> {
+        rename_to(&fx.ctx(), &rp(rel), exp, &rp(to))
+    }
+
+    #[test]
+    fn rename_to_normal() {
+        let fx = Fx::new();
+        let exp = fx.user_file("f.txt", b"loser");
+        hooks::start_trace();
+        let fp = applied(ren(&fx, "f.txt", &exp, "f.c.txt").unwrap());
+        assert_eq!(
+            hooks::take_trace(),
+            [
+                "commit.resolved",
+                "rename.before_pin",
+                "rename.pinned",
+                "rename.before_rename",
+                "rename.after_rename",
+                "rename.before_rehash",
+                "rename.verified",
+                "rename.moved",
+                "commit.synced",
+                "commit.verified",
+            ]
+        );
+        assert_eq!(fp.ino, exp.fp.ino);
+        assert_eq!(fs::read(fx.p("f.c.txt")).unwrap(), b"loser");
+        assert!(!fx.p("f.txt").exists());
+
+        symlink("t", fx.p("l")).unwrap();
+        let lexp = Expected::from(fx.root.stat(&rp("l")).unwrap());
+        applied(ren(&fx, "l", &lexp, "l.c").unwrap());
+        assert_eq!(fs::read_link(fx.p("l.c")).unwrap(), Path::new("t"));
+        assert!(fx.leftovers().is_empty());
+    }
+
+    #[test]
+    fn rename_to_refusals() {
+        let fx = Fx::new();
+        let exp = fx.user_file("f", b"data");
+        fs::create_dir(fx.p("d")).unwrap();
+        for to in ["d/f", "f", ".~fsync.x"] {
+            let out = ren(&fx, "f", &exp, to);
+            assert!(
+                matches!(out, Err(Error::InvalidPath { .. })),
+                "{to}: {out:?}"
+            );
+        }
+        fs::write(fx.p("taken"), b"user").unwrap();
+        let out = ren(&fx, "f", &exp, "taken").unwrap();
+        assert_eq!(out, Outcome::PreconditionFailed("new name exists"));
+        append(&fx.p("f"), b" edited");
+        let out = ren(&fx, "f", &exp, "c").unwrap();
+        assert_eq!(out, Outcome::PreconditionFailed("changed since scan"));
+        let dexp = Expected::from(fx.root.stat(&rp("d")).unwrap());
+        let out = ren(&fx, "d", &dexp, "c").unwrap();
+        assert_eq!(out, Outcome::PreconditionFailed("not a file or symlink"));
+        assert_eq!(fs::read(fx.p("taken")).unwrap(), b"user");
+        assert_eq!(fs::read(fx.p("f")).unwrap(), b"data edited");
+        assert!(fx.leftovers().is_empty());
+    }
+
+    #[test]
+    fn rename_to_modification_before_move_is_restored() {
+        let fx = Fx::new();
+        let exp = fx.user_file("f", b"old");
+        let user = fx.p("f");
+        let _g = hooks::once("rename.before_rename", move || append(&user, b" edited"));
+        let out = ren(&fx, "f", &exp, "c").unwrap();
+        assert_eq!(out, Outcome::PreconditionFailed("changed during commit"));
+        assert_eq!(fs::read(fx.p("f")).unwrap(), b"old edited");
+        assert_eq!(fs::symlink_metadata(fx.p("f")).unwrap().ino(), exp.fp.ino);
+        assert!(!fx.p("c").exists());
+        assert!(fx.leftovers().is_empty());
+    }
+
+    #[test]
+    fn rename_to_name_taken_after_verify_is_restored() {
+        let fx = Fx::new();
+        let exp = fx.user_file("f", b"old");
+        let taken = fx.p("c");
+        let _g = hooks::once("rename.verified", move || {
+            fs::write(&taken, b"user c").unwrap()
+        });
+        let out = ren(&fx, "f", &exp, "c").unwrap();
+        assert_eq!(out, Outcome::PreconditionFailed("new name exists"));
+        assert_eq!(fs::read(fx.p("f")).unwrap(), b"old");
+        assert_eq!(fs::read(fx.p("c")).unwrap(), b"user c");
+        assert!(fx.leftovers().is_empty());
+    }
+
+    #[test]
+    fn set_dir_mode_cases() {
+        let fx = Fx::new();
+        fs::create_dir(fx.p("d")).unwrap();
+        fs::set_permissions(fx.p("d"), fs::Permissions::from_mode(0o755)).unwrap();
+        let exp = fx.root.stat(&rp("d")).unwrap();
+        hooks::start_trace();
+        let fp = applied(set_dir_mode(&fx.ctx(), &rp("d"), &exp, 0o6700).unwrap());
+        assert_eq!(
+            hooks::take_trace(),
+            [
+                "commit.resolved",
+                "chmod.before_pin",
+                "chmod.pinned",
+                "chmod.after_chmod",
+                "commit.synced",
+                "commit.verified",
+            ]
+        );
+        let md = fs::symlink_metadata(fx.p("d")).unwrap();
+        assert_eq!(md.permissions().mode() & 0o7777, 0o700, "setgid stripped");
+        assert_eq!((fp.ino, fp.mode), (exp.ino, 0o700));
+
+        // The expected mode is stale now.
+        let out = set_dir_mode(&fx.ctx(), &rp("d"), &exp, 0o750).unwrap();
+        assert_eq!(out, Outcome::PreconditionFailed("changed since scan"));
+        // Missing, a file, a symlink to a directory.
+        fs::write(fx.p("f"), b"x").unwrap();
+        symlink("d", fx.p("l")).unwrap();
+        for (name, why) in [
+            ("x", "name missing"),
+            ("f", "not a directory"),
+            ("l", "not a directory"),
+        ] {
+            let out = set_dir_mode(&fx.ctx(), &rp(name), &fp, 0o750).unwrap();
+            assert_eq!(out, Outcome::PreconditionFailed(why), "{name}");
+        }
+        assert_eq!(
+            fs::symlink_metadata(fx.p("d"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o700
+        );
+    }
+
+    /// The directory is swapped for another after the pin: only the pinned
+    /// (verified) one is changed.
+    #[test]
+    fn set_dir_mode_changes_only_the_pinned_directory() {
+        let fx = Fx::new();
+        fs::create_dir(fx.p("d")).unwrap();
+        fs::set_permissions(fx.p("d"), fs::Permissions::from_mode(0o755)).unwrap();
+        let exp = fx.root.stat(&rp("d")).unwrap();
+        let (d, moved) = (fx.p("d"), fx.p("moved"));
+        let _g = hooks::once("chmod.pinned", move || {
+            fs::rename(&d, &moved).unwrap();
+            fs::create_dir(&d).unwrap();
+            fs::set_permissions(&d, fs::Permissions::from_mode(0o755)).unwrap();
+        });
+        let out = set_dir_mode(&fx.ctx(), &rp("d"), &exp, 0o700);
+        assert!(matches!(out, Err(Error::Unstable { .. })), "{out:?}");
+        let mode = |p: &str| fs::symlink_metadata(fx.p(p)).unwrap().permissions().mode() & 0o7777;
+        assert_eq!((mode("moved"), mode("d")), (0o700, 0o755));
     }
 }

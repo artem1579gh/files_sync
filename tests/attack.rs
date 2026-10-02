@@ -35,7 +35,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 use std::fs;
-use std::os::unix::fs::{FileExt, MetadataExt, symlink};
+use std::os::unix::fs::{FileExt, MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, SystemTime};
@@ -50,6 +50,8 @@ const REPLICA: ReplicaId = ReplicaId(0x0123456789abcdef);
 const TARGET: &str = "a/b/t";
 /// The file deleted before the `rmdir` in [`Op::DeleteThenRmdir`].
 const CHILD: &str = "a/b/t/c";
+/// Where [`Op::RenameFile`] and [`Op::RenameSymlink`] move the target.
+const CONFLICT: &str = "a/b/t.conflict";
 const NEW: &[u8] = b"new content from the peer";
 const META: FileMeta = FileMeta {
     mode: 0o644,
@@ -75,9 +77,14 @@ enum Op {
     /// Deletes `a/b/t/c`, then removes `a/b/t` (its quarantined child is
     /// settled by the rmdir).
     DeleteThenRmdir,
+    /// Renames the target to a conflict name.
+    RenameFile,
+    RenameSymlink,
+    /// Changes a directory's mode in place.
+    ChmodDir,
 }
 
-const ALL_OPS: [Op; 9] = [
+const ALL_OPS: [Op; 12] = [
     Op::CreateFile,
     Op::CreateSymlink,
     Op::Mkdir,
@@ -87,19 +94,26 @@ const ALL_OPS: [Op; 9] = [
     Op::DeleteSymlink,
     Op::Rmdir,
     Op::DeleteThenRmdir,
+    Op::RenameFile,
+    Op::RenameSymlink,
+    Op::ChmodDir,
 ];
 
 impl Op {
     /// Whether the operation starts from a user file we hold an fd on.
     fn holds_file(self) -> bool {
-        matches!(self, Op::ReplaceFile | Op::DeleteFile | Op::DeleteThenRmdir)
+        matches!(
+            self,
+            Op::ReplaceFile | Op::DeleteFile | Op::DeleteThenRmdir | Op::RenameFile
+        )
     }
 
     fn variants(self) -> &'static [Variant] {
-        if self.holds_file() {
-            &[Variant::Plain, Variant::EditBefore, Variant::LateWrite]
-        } else {
-            &[Variant::Plain]
+        match self {
+            // Nothing is quarantined, so there is no late write to catch.
+            Op::RenameFile => &[Variant::Plain, Variant::EditBefore],
+            _ if self.holds_file() => &[Variant::Plain, Variant::EditBefore, Variant::LateWrite],
+            _ => &[Variant::Plain],
         }
     }
 
@@ -110,13 +124,13 @@ impl Op {
 
     /// Where [`Variant::EditBefore`] edits and [`Variant::LateWrite`] writes.
     fn trigger(self, v: Variant) -> Option<&'static str> {
-        let replace = self == Op::ReplaceFile;
-        match v {
-            Variant::Plain => None,
-            Variant::EditBefore if replace => Some("replace.before_exchange"),
-            Variant::EditBefore => Some("delete.before_rename"),
-            Variant::LateWrite if replace => Some("replace.quarantined"),
-            Variant::LateWrite => Some("delete.quarantined"),
+        match (self, v) {
+            (_, Variant::Plain) => None,
+            (Op::ReplaceFile, Variant::EditBefore) => Some("replace.before_exchange"),
+            (Op::ReplaceFile, Variant::LateWrite) => Some("replace.quarantined"),
+            (Op::RenameFile, Variant::EditBefore) => Some("rename.before_rename"),
+            (_, Variant::EditBefore) => Some("delete.before_rename"),
+            (_, Variant::LateWrite) => Some("delete.quarantined"),
         }
     }
 }
@@ -215,8 +229,8 @@ impl World {
         };
         match op {
             Op::CreateFile | Op::CreateSymlink | Op::Mkdir => {}
-            Op::ReplaceFile | Op::DeleteFile => w.user_file(TARGET),
-            Op::ReplaceSymlink | Op::DeleteSymlink => {
+            Op::ReplaceFile | Op::DeleteFile | Op::RenameFile => w.user_file(TARGET),
+            Op::ReplaceSymlink | Op::DeleteSymlink | Op::RenameSymlink => {
                 symlink("orig-target", w.p(TARGET)).unwrap();
                 w.expected = Some(Expected::from(w.root.stat(&rp(TARGET)).unwrap()));
             }
@@ -224,6 +238,11 @@ impl World {
             Op::DeleteThenRmdir => {
                 fs::create_dir(w.p(TARGET)).unwrap();
                 w.user_file(CHILD);
+            }
+            Op::ChmodDir => {
+                fs::create_dir(w.p(TARGET)).unwrap();
+                fs::set_permissions(w.p(TARGET), fs::Permissions::from_mode(0o755)).unwrap();
+                w.expected = Some(Expected::from(w.root.stat(&rp(TARGET)).unwrap()));
             }
         }
         w
@@ -383,6 +402,12 @@ fn run(op: Op, v: Variant, caps: Caps, inj: Option<Injection>) -> (World, Run) {
             call(CHILD, &mut |q| commit::delete(&ctx, q, &rp(CHILD), exp()));
             call(TARGET, &mut |q| commit::rmdir(&ctx, q, &t));
         }
+        Op::RenameFile | Op::RenameSymlink => call(CONFLICT, &mut |_| {
+            commit::rename_to(&ctx, &t, exp(), &rp(CONFLICT))
+        }),
+        Op::ChmodDir => call(TARGET, &mut |_| {
+            commit::set_dir_mode(&ctx, &t, &exp().fp, 0o700)
+        }),
     }
     q.sweep();
     let trace = hooks::take_trace();
@@ -604,13 +629,15 @@ fn attack_op(op: Op) -> usize {
 /// `point("…")` calls plus the rehash points passed to `verify_old`.
 fn commit_points() -> BTreeSet<&'static str> {
     const SRC: &str = include_str!("../src/fs/commit.rs");
-    const PREFIXES: [&str; 7] = [
+    const PREFIXES: [&str; 9] = [
         "commit",
         "stage",
         "create",
         "replace",
         "delete",
         "rmdir",
+        "rename",
+        "chmod",
         "quarantine",
     ];
     let code = &SRC[..SRC.find("#[cfg(test)]").unwrap_or(SRC.len())];
@@ -700,4 +727,7 @@ attack_tests! {
     attack_delete_symlink => Op::DeleteSymlink,
     attack_rmdir => Op::Rmdir,
     attack_delete_then_rmdir => Op::DeleteThenRmdir,
+    attack_rename_file => Op::RenameFile,
+    attack_rename_symlink => Op::RenameSymlink,
+    attack_chmod_dir => Op::ChmodDir,
 }

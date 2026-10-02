@@ -64,6 +64,12 @@ pub enum Error {
     #[error("unstable path \"{}\": {reason}", path.escape_ascii())]
     Unstable { path: Vec<u8>, reason: &'static str },
 
+    /// A replica was asked to do something that cannot apply to the path's
+    /// indexed state (e.g. `Rmdir` on a file, `WriteFile` without content).
+    /// This is a caller bug, not a race: races give `PreconditionFailed`.
+    #[error("invalid operation on \"{}\": {reason}", path.escape_ascii())]
+    InvalidOp { path: Vec<u8>, reason: &'static str },
+
     /// The index database failed (I/O, corruption detected by redb, or a
     /// transaction error).
     #[error("index database: {0}")]
@@ -86,6 +92,31 @@ impl Error {
             context: context.into(),
             source,
         }
+    }
+}
+
+impl Error {
+    /// Wraps an [`io::Error`] from a content stream. If it carries a library
+    /// error (a [`StableReader`](crate::fs::stat::StableReader) reports
+    /// [`Error::Unstable`] that way), that error is returned unwrapped.
+    pub fn from_stream(context: impl Into<String>, e: io::Error) -> Self {
+        if e.get_ref().is_some_and(|inner| inner.is::<Error>()) {
+            let inner = e.into_inner().expect("checked above");
+            return *inner.downcast::<Error>().expect("checked above");
+        }
+        Error::io(context, e)
+    }
+
+    /// The path changed under us; rescan it ([`Error::Unstable`]).
+    pub fn is_unstable(&self) -> bool {
+        matches!(self, Error::Unstable { .. })
+    }
+
+    /// An I/O error meaning the path does not exist (or a parent is not a
+    /// directory).
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, Error::Io { source, .. }
+            if matches!(source.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory))
     }
 }
 

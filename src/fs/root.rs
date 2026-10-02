@@ -26,6 +26,11 @@ pub const RESOLVE: ResolveFlags = ResolveFlags::BENEATH
     .union(ResolveFlags::NO_MAGICLINKS)
     .union(ResolveFlags::NO_XDEV);
 
+/// Resolution for following a symlink to an in-tree referent (§4.5).
+const IN_TREE: ResolveFlags = ResolveFlags::BENEATH
+    .union(ResolveFlags::NO_MAGICLINKS)
+    .union(ResolveFlags::NO_XDEV);
+
 /// A path relative to a replica root, as raw bytes.
 ///
 /// It is either the root itself (empty) or a sequence of components joined by
@@ -289,6 +294,41 @@ impl Root {
             Error::Io { source, .. } => Error::io(format!("stat {p}"), source),
             e => e,
         })
+    }
+
+    /// Opens what the symlink `parent/name` (at `path`) points to, following
+    /// links (design §4.5). First beneath the root, from the root fd and the
+    /// link's own path; if that escapes the root (`EXDEV`), from the link's
+    /// directory with only `RESOLVE_NO_MAGICLINKS`, as an out-of-tree referent.
+    /// Returns the fd and whether the referent is out of tree.
+    ///
+    /// If the in-tree attempt fails for another reason, the out-of-tree route
+    /// must fail too (its errno is returned); if it succeeds instead, the two
+    /// views of the path disagree, and the result is `EAGAIN` (unstable).
+    pub(crate) fn open_referent(
+        &self,
+        parent: BorrowedFd<'_>,
+        path: &RelPath,
+        name: &[u8],
+        flags: OFlags,
+    ) -> std::result::Result<(OwnedFd, bool), Errno> {
+        let direct = || {
+            rustix::fs::openat2(
+                parent,
+                name,
+                flags,
+                Mode::empty(),
+                ResolveFlags::NO_MAGICLINKS,
+            )
+        };
+        match rustix::fs::openat2(self.fd(), path.as_bytes(), flags, Mode::empty(), IN_TREE) {
+            Ok(fd) => Ok((fd, false)),
+            Err(Errno::XDEV) => direct().map(|fd| (fd, true)),
+            Err(_) => match direct() {
+                Ok(_) => Err(Errno::AGAIN),
+                Err(e) => Err(e),
+            },
+        }
     }
 }
 

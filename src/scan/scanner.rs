@@ -35,7 +35,7 @@ use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rustix::fs::{Dir, Mode, OFlags, ResolveFlags};
+use rustix::fs::{Dir, OFlags};
 use rustix::io::Errno;
 
 use crate::config::ReplicaId;
@@ -56,11 +56,6 @@ pub const DEFAULT_RACY_WINDOW: Duration = Duration::from_secs(1);
 
 /// Pending index updates are committed in batches of this size.
 const FLUSH_EVERY: usize = 1024;
-
-/// Resolution for following a symlink to an in-tree referent (§4.5).
-const IN_TREE: ResolveFlags = ResolveFlags::BENEATH
-    .union(ResolveFlags::NO_MAGICLINKS)
-    .union(ResolveFlags::NO_XDEV);
 
 /// What to scan.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -539,13 +534,10 @@ impl Walk<'_> {
         let mut referent = None;
         let mut looped = false;
         let referent_kind = if needs_referent(self.policy, path, &target) {
-            match open_referent(
-                self.root,
-                parent,
-                path,
-                name,
-                OFlags::PATH | OFlags::CLOEXEC,
-            ) {
+            match self
+                .root
+                .open_referent(parent, path, name, OFlags::PATH | OFlags::CLOEXEC)
+            {
                 Ok((fd, out_of_tree)) => match Fingerprint::of_fd(fd.as_fd()) {
                     Ok(rfp) => {
                         referent = Some((fd, rfp, out_of_tree));
@@ -631,8 +623,8 @@ impl Walk<'_> {
             path.as_bytes(),
             || {
                 let flags = OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC;
-                match open_referent(root, parent, path, name, flags | OFlags::NOATIME) {
-                    Err(Errno::PERM) => open_referent(root, parent, path, name, flags),
+                match root.open_referent(parent, path, name, flags | OFlags::NOATIME) {
+                    Err(Errno::PERM) => root.open_referent(parent, path, name, flags),
                     res => res,
                 }
                 .map(|(fd, _)| fd)
@@ -756,41 +748,6 @@ fn list_dir(fd: &OwnedFd) -> io::Result<Vec<Vec<u8>>> {
     }
     names.sort();
     Ok(names)
-}
-
-/// Opens what the symlink `parent/name` (at `path`) points to, following
-/// links (design §4.5). First beneath the root, from the root fd and the
-/// link's own path; if that escapes the root (`EXDEV`), from the link's
-/// directory with only `RESOLVE_NO_MAGICLINKS`, as an out-of-tree referent.
-/// Returns the fd and whether the referent is out of tree.
-///
-/// If the in-tree attempt fails for another reason, the out-of-tree route
-/// must fail too (its errno is returned); if it succeeds instead, the two
-/// views of the path disagree, and the result is `EAGAIN` (unstable).
-fn open_referent(
-    root: &Root,
-    parent: BorrowedFd<'_>,
-    path: &RelPath,
-    name: &[u8],
-    flags: OFlags,
-) -> std::result::Result<(OwnedFd, bool), Errno> {
-    let direct = || {
-        rustix::fs::openat2(
-            parent,
-            name,
-            flags,
-            Mode::empty(),
-            ResolveFlags::NO_MAGICLINKS,
-        )
-    };
-    match rustix::fs::openat2(root.fd(), path.as_bytes(), flags, Mode::empty(), IN_TREE) {
-        Ok(fd) => Ok((fd, false)),
-        Err(Errno::XDEV) => direct().map(|fd| (fd, true)),
-        Err(_) => match direct() {
-            Ok(_) => Err(Errno::AGAIN),
-            Err(e) => Err(e),
-        },
-    }
 }
 
 /// `None` if `parent/name` is still the symlink `fp`, else why not.

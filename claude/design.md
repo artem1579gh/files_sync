@@ -240,7 +240,9 @@ We port rsync 3.4.1, quirks included (`symlink/safety.rs`), and check it against
 
 ### 5.4 Directories
 
-`mkdirat(parentfd, tmp, 0700)` under a temp name, pin it with an `O_RDONLY|O_DIRECTORY` fd, `fchmod` it to the wanted mode (so the umask does not apply and the chmod cannot hit someone else's directory), then `renameat2(tmp → name, RENAME_NOREPLACE)` and the usual step 5 checks. `EEXIST` means `PreconditionFailed`. (Originally `mkdirat` directly on the name; the temp name gives the same atomic emptiness of the name plus a verified inode and exact mode.)
+**Mode change** (`commit::set_dir_mode`, T11): a directory can't be replaced by a copy, so this is the one in-place change. Pin it with `openat2(O_RDONLY|O_DIRECTORY|O_NOFOLLOW)`, require the expected inode **and** the indexed mode, `fchmod` through the pin, then the step 5 checks. A concurrent swap only means the pinned (verified) directory is changed; only metadata is at stake.
+
+**Create:** `mkdirat(parentfd, tmp, 0700)` under a temp name, pin it with an `O_RDONLY|O_DIRECTORY` fd, `fchmod` it to the wanted mode (so the umask does not apply and the chmod cannot hit someone else's directory), then `renameat2(tmp → name, RENAME_NOREPLACE)` and the usual step 5 checks. `EEXIST` means `PreconditionFailed`. (Originally `mkdirat` directly on the name; the temp name gives the same atomic emptiness of the name plus a verified inode and exact mode.)
 
 ### 5.5 Symlinks
 
@@ -318,6 +320,7 @@ Take the union of paths over both indexes. For each path, given entries `ea` and
 - **Winner:** the newer mtime; a tie goes to the higher ReplicaId. For type conflicts, Dir > File > Symlink.
 - **Loser:** renamed on its own replica to `stem.sync-conflict-YYYYMMDD-HHMMSS-<ID7>.ext`, where `<ID7>` is the first 7 characters of the replica ID. Directories, symlinks and names without an extension get no extension split. If the name is taken, the timestamp is bumped by a second and retried. The helper is `fs::tmpname::conflict_name` (in `fs/`, because `fs::commit` needs it too).
 - The conflict copy gets a fresh version vector and syncs to both sides like any other file. The winner gets the merged version vector plus a bump.
+- **Renaming the loser** (`commit::rename_to`, `Op::RenameToConflict`, T11): pin and check as for a delete, move aside to a reserved name with `NOREPLACE`, verify (restore on failure, as in §5.6), then rename on to the conflict name with `NOREPLACE` (if it was taken, restore → `PreconditionFailed`), then the step 5 checks at the new name. Files and symlinks only. Since Dir wins every type conflict, a directory loses only a dir-vs-dir conflict (mode), which T12 should resolve without a rename.
 
 ### 6.3 Ordering
 
@@ -341,16 +344,27 @@ trait Replica {
     fn id(&self) -> ReplicaId;
     fn scan(&mut self, scope: Scope) -> Result<ScanStats>;               // replica-side: updates own index, bumps VVs
     fn changes_since(&self, seq: u64) -> Result<Vec<(RelPath, Entry)>>;  // Entry without LocalMeta on the wire
-    fn open_read(&self, p: &RelPath, expect: &Entry) -> Result<Box<dyn ContentReader>>; // stability checked at EOF
-    fn apply(&mut self, op: Op, pre: Precondition, content: Option<&mut dyn Read>) -> Result<Outcome>;
+    fn open_read(&self, p: &RelPath, expect: &Entry) -> Result<Box<dyn ContentReader>>; // stability + hash checked at EOF
+    fn apply(&mut self, p: &RelPath, op: Op, pre: Precondition, content: Option<&mut dyn Read>) -> Result<Outcome>;
     fn watch(&mut self) -> Option<Receiver<Hint>>;
 }
-enum Op { WriteFile{meta, hash}, Mkdir{mode}, Symlink{target}, Delete, Rmdir, RenameToConflict{to}, SetMeta{mode, mtime} }
-enum Precondition { Absent, Matches{ kind, hash_or_target, vv } }  // the replica maps it to its own physical fingerprint
+enum Op {                                   // every op that leaves an entry carries its vv (computed by the engine)
+    WriteFile{meta: FileMeta, hash, vv}, Mkdir{mode, mtime_ns, vv}, Symlink{target, mtime_ns, vv},
+    Delete{vv}, Rmdir{vv}, RenameToConflict{to: RelPath}, SetMeta{mode, mtime_ns, vv},
+}
+enum Precondition { Absent, Matches{ kind: Kind /* incl. hash or target */, vv } }  // mapped to the replica's own physical fingerprint
 enum Outcome { Applied(Entry), PreconditionFailed(Option<Entry>), Preserved{ conflict: RelPath } }
 ```
 
 **All CAS logic runs inside `LocalReplica::apply`, next to the files.** The engine never touches the filesystem. A `RemoteReplica` is a postcard-framed RPC stub around the same calls, so the network version inherits race-freedom unchanged.
+
+`LocalReplica::apply` (T11) runs in one index write transaction:
+- **Logical check** against the index. `Absent` = no entry or a tombstone; `Matches` = the entry's kind and vv are exactly these, and the entry is not `Unmanaged`. Every ancestor must be an indexed real directory, and neither the path nor an ancestor may be a followed link (`via_link`; writing through one is T17). Failure → `PreconditionFailed(current entry)`.
+- **Physical check:** the entry is mapped to an `Expected` fingerprint (files: from the index; symlinks: indexed (dev, ino, ctime) checked against a fresh `statx`, since the index keeps a symlink's mtime from its last logical change), and the matching `fs::commit` function does the binding CAS.
+- **Index:** on success the entry is written with the op's vv and the fingerprint the commit produced (files are marked `racy`, so the next scan rehashes them once). The next scan therefore finds nothing to do (no echo).
+- **Ops:** `WriteFile`/`Symlink` create (`Absent`) or replace a file or symlink. `Delete`/`Rmdir` leave a tombstone with the op's vv; `Rmdir` also requires every indexed descendant to be a tombstone. `RenameToConflict{to}` (files and symlinks; `to` must be a sibling) makes the path a tombstone with a **local bump** and indexes the copy at `to` with a fresh vv. `SetMeta` rewrites a file as a copy (via `replace_file`, never in place), `fchmod`s a directory (§5.4), and only updates the index when nothing on disk changes (same file mode and mtime, a directory's mtime, any symlink). So it also serves to record a merged vv.
+- An op that cannot apply to the indexed kind (e.g. `Rmdir` on a file, `WriteFile` over a directory, `WriteFile` without content) is `Error::InvalidOp`, a caller bug. Type changes from or to a directory are a delete plus a create (§6.3).
+- **`open_read`** streams through `fs::StableReader`: one attempt (bytes already sent can't be retried), the §5.2 checks, plus the expected size up front and hash at EOF. `read` returns `Ok(0)` only once all checks pass; otherwise it fails with an `io::Error` wrapping `Error::Unstable` (`Error::from_stream` unwraps it; `TempFile::copy_from` does so). A followed link's referent is read via `Root::open_referent`, and the link must be unchanged at EOF.
 
 ### 7.1 Network phase (sketch)
 

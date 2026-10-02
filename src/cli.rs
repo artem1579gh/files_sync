@@ -9,6 +9,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::config::{self, PairConfig};
 use crate::fs::caps::Caps;
+use crate::replica::LocalReplica;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -81,14 +82,18 @@ pub fn run() -> anyhow::Result<()> {
     }
 }
 
-/// Loads a pair's config and probes both replica roots.
-fn open_pair(pair: &str) -> anyhow::Result<(PairConfig, [Caps; 2])> {
-    let cfg = PairConfig::load(&config::state_home()?, pair)?;
-    let caps = [
-        probe_root(&cfg.replicas[0].root)?,
-        probe_root(&cfg.replicas[1].root)?,
-    ];
-    Ok((cfg, caps))
+/// Loads a pair's config and opens both replicas (which probes, logs and
+/// checks their roots' capabilities).
+fn open_pair(pair: &str) -> anyhow::Result<(PairConfig, [LocalReplica; 2])> {
+    let state_home = config::state_home()?;
+    let cfg = PairConfig::load(&state_home, pair)?;
+    let pair_dir = config::pair_dir(&state_home, pair)?;
+    let open = |r: &config::ReplicaConfig| {
+        LocalReplica::open(r, &pair_dir)
+            .with_context(|| format!("replica root {}", r.root.display()))
+    };
+    let replicas = [open(&cfg.replicas[0])?, open(&cfg.replicas[1])?];
+    Ok((cfg, replicas))
 }
 
 /// Probes a replica root, logs the result and checks the required features.

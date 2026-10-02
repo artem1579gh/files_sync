@@ -1,6 +1,6 @@
 //! `statx` fingerprints and stable reads (design §5.2).
 
-use std::io;
+use std::io::{self, Read};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::time::Duration;
 
@@ -303,6 +303,192 @@ where
         return Ok(Err(why));
     }
     Ok(Ok((f2, *hasher.finalize().as_bytes())))
+}
+
+/// The check a [`StableReader`] runs at EOF with the final fingerprint: why
+/// the file is no longer reachable the way it was opened, if it isn't (see
+/// [`stable_read_with`]).
+pub type Recheck = Box<dyn FnMut(&Fingerprint) -> Result<Option<&'static str>> + Send>;
+
+/// A streaming [`stable_read`] for content that is passed on as it is read
+/// (`Replica::open_read`, design §7): one attempt, no retries, since the
+/// bytes already handed out cannot be taken back.
+///
+/// It applies the same checks as `stable_read`, plus the expected size and
+/// hash. The file must be a regular file of the expected size when opened.
+/// At EOF its fingerprint must be unchanged, the byte count must equal the
+/// size, `recheck` must pass, and the content must hash to the expected
+/// hash. Only then does `read` return `Ok(0)`; so a consumer that reads to
+/// EOF has verified content. Otherwise `read` fails with an `io::Error` that
+/// wraps [`Error::Unstable`] (unwrap it with [`Error::from_stream`]), and so
+/// does every later call.
+pub struct StableReader {
+    what: Vec<u8>,
+    fd: OwnedFd,
+    f1: Fingerprint,
+    hash: [u8; 32],
+    hasher: blake3::Hasher,
+    total: u64,
+    recheck: Recheck,
+    state: ReaderState,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReaderState {
+    Reading,
+    Verified,
+    Failed(&'static str),
+}
+
+impl StableReader {
+    /// Reads the regular file `parent/name`; `name` must still be the same
+    /// inode at EOF. `what` names the file in errors.
+    pub fn open_at(
+        what: &[u8],
+        parent: OwnedFd,
+        name: &[u8],
+        size: u64,
+        hash: [u8; 32],
+    ) -> Result<StableReader> {
+        validate_name(name)?;
+        let fd = open_for_read(parent.as_fd(), name).map_err(|e| open_err(what, e))?;
+        let name = name.to_vec();
+        let recheck: Recheck =
+            Box::new(
+                move |f2| match Fingerprint::at_opt(parent.as_fd(), &name)? {
+                    Some(f3) if f2.same_file(&f3) => Ok(None),
+                    Some(_) => Ok(Some("name replaced during read")),
+                    None => Ok(Some("name removed during read")),
+                },
+            );
+        StableReader::new(what, fd, size, hash, recheck)
+    }
+
+    /// Reads the file open at `fd` (for files reached some other way, such
+    /// as a followed symlink's referent).
+    pub fn new(
+        what: &[u8],
+        fd: OwnedFd,
+        size: u64,
+        hash: [u8; 32],
+        recheck: Recheck,
+    ) -> Result<StableReader> {
+        let unstable = |reason| Error::Unstable {
+            path: what.to_vec(),
+            reason,
+        };
+        let f1 = Fingerprint::of_fd(fd.as_fd())?;
+        if f1.kind != FileKind::File {
+            return Err(unstable("not a regular file"));
+        }
+        if f1.size != size {
+            return Err(unstable("size differs from the expected entry"));
+        }
+        Ok(StableReader {
+            what: what.to_vec(),
+            fd,
+            f1,
+            hash,
+            hasher: blake3::Hasher::new(),
+            total: 0,
+            recheck,
+            state: ReaderState::Reading,
+        })
+    }
+
+    /// The fingerprint when the file was opened.
+    pub fn fingerprint(&self) -> &Fingerprint {
+        &self.f1
+    }
+
+    fn fail(&mut self, reason: &'static str) -> io::Error {
+        tracing::debug!(name = %self.what.escape_ascii(), reason, "unstable streaming read");
+        self.state = ReaderState::Failed(reason);
+        self.unstable(reason)
+    }
+
+    fn unstable(&self, reason: &'static str) -> io::Error {
+        io::Error::other(Error::Unstable {
+            path: self.what.clone(),
+            reason,
+        })
+    }
+
+    /// The EOF checks; `Ok(Some(reason))` if one fails.
+    fn verify(&mut self) -> Result<Option<&'static str>> {
+        let f2 = Fingerprint::of_fd(self.fd.as_fd())?;
+        if !self.f1.unchanged(&f2) {
+            return Ok(Some("file changed during read"));
+        }
+        if self.total != f2.size {
+            return Ok(Some("byte count differs from size"));
+        }
+        if let Some(why) = (self.recheck)(&f2)? {
+            return Ok(Some(why));
+        }
+        if *self.hasher.finalize().as_bytes() != self.hash {
+            return Ok(Some("content differs from the expected hash"));
+        }
+        Ok(None)
+    }
+}
+
+impl Read for StableReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self.state {
+            ReaderState::Reading => {}
+            ReaderState::Verified => return Ok(0),
+            ReaderState::Failed(reason) => return Err(self.unstable(reason)),
+        }
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let n = loop {
+            match rustix::io::read(&self.fd, &mut *buf) {
+                Ok(n) => break n,
+                Err(Errno::INTR) => continue,
+                Err(e) => return Err(e.into()),
+            }
+        };
+        if n == 0 {
+            return match self.verify() {
+                Ok(None) => {
+                    self.state = ReaderState::Verified;
+                    Ok(0)
+                }
+                Ok(Some(reason)) => Err(self.fail(reason)),
+                Err(e) => Err(io::Error::other(e)),
+            };
+        }
+        self.total += n as u64;
+        if self.total > self.f1.size {
+            return Err(self.fail("file grew during read"));
+        }
+        self.hasher.update(&buf[..n]);
+        Ok(n)
+    }
+}
+
+/// Maps a failed open for reading like [`read_once`] does, but as an error.
+fn open_err(what: &[u8], e: Errno) -> Error {
+    let reason = match e {
+        Errno::LOOP => "name is a symlink",
+        Errno::AGAIN => "file is leased",
+        Errno::NXIO => "not a regular file",
+        e => match unstable_reason(e) {
+            Some(reason) => reason,
+            None => {
+                return Error::io(
+                    format!("open {} for reading", what.escape_ascii()),
+                    e.into(),
+                );
+            }
+        },
+    };
+    Error::Unstable {
+        path: what.to_vec(),
+        reason,
+    }
 }
 
 /// `O_RDONLY | O_NOFOLLOW | O_NOATIME`, retrying without `O_NOATIME` on EPERM
