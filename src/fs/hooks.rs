@@ -5,6 +5,12 @@
 //! register closures with [`on`] that run when a point is reached, and so
 //! mutate the filesystem at exactly that moment.
 //!
+//! A [`fault`] point stands for a syscall whose failure no filesystem
+//! change can trigger on cue (e.g. `openat2`'s `EAGAIN` for a rename racing
+//! anywhere on the system). Closures registered with [`on_fault`] may make
+//! the caller act as if the call failed with an errno. Fault points are not
+//! traced, so the crash suite does not crash at them.
+//!
 //! Hooks are **per thread**: a closure only fires on the thread that
 //! registered it, which keeps parallel tests from seeing each other's hooks.
 //! The commit functions run on the caller's thread, so this is enough for unit,
@@ -19,11 +25,23 @@ pub use imp::*;
 #[inline(always)]
 pub fn point(_name: &'static str) {}
 
+/// A fault-injection point: the errno a test wants the syscall at `name` to
+/// fail with, if any. Always `None` in normal builds.
+#[cfg(not(any(test, feature = "hooks")))]
+#[inline(always)]
+pub fn fault(_name: &'static str) -> Option<rustix::io::Errno> {
+    None
+}
+
 #[cfg(any(test, feature = "hooks"))]
 mod imp {
     use std::cell::RefCell;
 
-    type Hook = Box<dyn FnMut()>;
+    use rustix::io::Errno;
+
+    /// A [`point`] closure returns `None`; an [`on_fault`] one may return an
+    /// errno to inject.
+    type Hook = Box<dyn FnMut() -> Option<Errno>>;
 
     #[derive(Default)]
     struct Registry {
@@ -40,8 +58,19 @@ mod imp {
     /// Marks a step boundary. Runs every closure registered for `name` on
     /// this thread, in registration order.
     pub fn point(name: &'static str) {
+        run(name, true);
+    }
+
+    /// A fault-injection point: runs every closure registered for `name` on
+    /// this thread (not traced) and returns the first errno one of them
+    /// asks the caller to fail with.
+    pub fn fault(name: &'static str) -> Option<Errno> {
+        run(name, false)
+    }
+
+    fn run(name: &'static str, traced: bool) -> Option<Errno> {
         let ids: Vec<u64> = REGISTRY.with_borrow_mut(|r| {
-            if let Some(trace) = &mut r.trace {
+            if let Some(trace) = r.trace.as_mut().filter(|_| traced) {
                 trace.push(name);
             }
             r.hooks
@@ -50,6 +79,7 @@ mod imp {
                 .map(|(id, _, _)| *id)
                 .collect()
         });
+        let mut injected = None;
         for id in ids {
             // Take the closure out so it can register hooks or reach points
             // itself without a double borrow.
@@ -60,7 +90,7 @@ mod imp {
                     .and_then(|(_, _, h)| h.take())
             });
             if let Some(mut hook) = hook {
-                hook();
+                injected = injected.or(hook());
                 REGISTRY.with_borrow_mut(|r| {
                     if let Some((_, _, slot)) = r.hooks.iter_mut().find(|(i, _, _)| *i == id) {
                         *slot = Some(hook);
@@ -68,6 +98,7 @@ mod imp {
                 });
             }
         }
+        injected
     }
 
     /// Unregisters its hook when dropped.
@@ -84,10 +115,26 @@ mod imp {
 
     /// Runs `f` every time this thread reaches `name`, until the returned
     /// guard is dropped.
-    pub fn on(name: &'static str, f: impl FnMut() + 'static) -> Guard {
+    pub fn on(name: &'static str, mut f: impl FnMut() + 'static) -> Guard {
+        register(
+            name,
+            Box::new(move || {
+                f();
+                None
+            }),
+        )
+    }
+
+    /// Runs `f` every time this thread reaches the fault point `name`, until
+    /// the returned guard is dropped; `Some(errno)` makes the call fail.
+    pub fn on_fault(name: &'static str, f: impl FnMut() -> Option<Errno> + 'static) -> Guard {
+        register(name, Box::new(f))
+    }
+
+    fn register(name: &'static str, hook: Hook) -> Guard {
         REGISTRY.with_borrow_mut(|r| {
             r.next_id += 1;
-            r.hooks.push((r.next_id, name, Some(Box::new(f))));
+            r.hooks.push((r.next_id, name, Some(hook)));
             Guard(r.next_id)
         })
     }
@@ -118,6 +165,7 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustix::io::Errno;
     use std::cell::Cell;
     use std::rc::Rc;
 
@@ -152,6 +200,27 @@ mod tests {
         assert_eq!(hits.get(), 11);
         assert_eq!(take_trace(), ["t.outer", "t.outer", "t.inner", "t.outer"]);
         assert!(take_trace().is_empty());
+    }
+
+    #[test]
+    fn faults_inject_errnos_untraced() {
+        assert_eq!(fault("t.fault"), None);
+        let mut left = 2;
+        let g = on_fault("t.fault", move || {
+            left -= 1;
+            (left >= 0).then_some(Errno::AGAIN)
+        });
+        let hits = Rc::new(Cell::new(0));
+        let h = hits.clone();
+        let _g2 = on("t.fault", move || h.set(h.get() + 1));
+        start_trace();
+        assert_eq!(fault("t.fault"), Some(Errno::AGAIN));
+        assert_eq!(fault("t.fault"), Some(Errno::AGAIN));
+        assert_eq!(fault("t.fault"), None);
+        assert_eq!(hits.get(), 3);
+        assert!(take_trace().is_empty());
+        drop(g);
+        assert_eq!(fault("t.fault"), None);
     }
 
     #[test]

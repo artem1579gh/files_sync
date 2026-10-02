@@ -176,7 +176,7 @@ A link the user made in a munging replica without the prefix is synced with its 
 
 - **Reading through a followed link:**
   - Run `readlinkat` before and after reading the referent. If the link was retargeted in between, the read is unstable (§5.2). In practice the "after" check is a `statx` of the link: a symlink's target cannot change without a new inode, so an unchanged (ino, ctime) means an unchanged target.
-  - In-tree referents are opened with `RESOLVE_BENEATH` (plus `NO_MAGICLINKS | NO_XDEV`), from the root fd and the link's own root-relative path, so the kernel follows the link but cannot leave the root. If that fails with `EXDEV` (the link, or a link it leads to, escapes), the referent is opened from the link's own directory fd with `RESOLVE_NO_MAGICLINKS` only and marked `out_of_tree`. If the in-tree attempt fails otherwise but the direct one succeeds, the two views of the path disagree and the link is unstable. Out-of-tree referents are **read-only**: we never write to them.
+  - In-tree referents are opened with `RESOLVE_BENEATH` (plus `NO_MAGICLINKS | NO_XDEV`), from the root fd and the link's own root-relative path, so the kernel follows the link but cannot leave the root. This is the only lookup that may step through `..` (in a target), and the kernel refuses such a step with `EAGAIN` whenever *any* rename or mount change on the system raced the lookup (global `rename_lock`/`mount_lock` seqcounts), since it cannot rule out an escape. That says nothing about the path, so the lookup is retried, as openat2(2) advises, up to 16 times (`SCOPED_RETRIES`); only then is the link unstable (T23: unretried, it made a busy system's scans report such links dirty at random). If that fails with `EXDEV` (the link, or a link it leads to, escapes), the referent is opened from the link's own directory fd with `RESOLVE_NO_MAGICLINKS` only and marked `out_of_tree`. If the in-tree attempt fails otherwise but the direct one succeeds, the two views of the path disagree and the link is unstable. Out-of-tree referents are **read-only**: we never write to them.
   - A referent is first opened `O_PATH` to learn its kind, so a FIFO or device is never opened for reading. A file referent is then read with `fs::stable_read_with` (the §5.2 checks, plus: still the same inode, link unchanged). A directory referent is opened as `"."` beneath its `O_PATH` fd, so it is exactly the classified inode.
   - A chain of links that never resolves (`ELOOP`) is `Unmanaged(Loop)` under a following policy.
 - **A followed referent changes:**
@@ -479,6 +479,8 @@ enum Outcome { Applied(Entry), PreconditionFailed(Option<Entry>), Preserved{ con
   - create a child just before rmdir.
 
   Each test asserts no loss and no escape.
+
+  A syscall failure that no filesystem change can trigger on cue (`openat2`'s `EAGAIN` for a rename racing anywhere on the system, §4.5) has a **fault point** instead: `fs::hooks::fault("root.in_tree_lookup")` returns the errno a closure registered with `hooks::on_fault` injects, and the caller acts as if the syscall had failed with it. Fault points are not traced, so the crash suite does not crash at them.
 - **proptest:**
   - the rsync `unsafe_symlink` table plus random targets;
   - munge/unmunge is a bijection;

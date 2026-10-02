@@ -711,7 +711,7 @@ The design lives in [`design.md`](design.md); §N.M below refers to its sections
 
 ## M9: follow-ups
 
-### [ ] T23: Fix the `crash` suite flake
+### [x] T23: Fix the `crash` suite flake
 - **Depends on:** T15, T17
 - **Read:** §4.3.1, §4.5, §5.8, §9 (crash suite)
 - **Files:** `tests/crash.rs`, plus whatever the root cause turns out to be (likely `src/replica/local.rs`, `src/scan/scanner.rs` or `src/fs/commit.rs`)
@@ -725,6 +725,16 @@ The design lives in [`design.md`](design.md); §N.M below refers to its sections
   - if it was a product bug, a deterministic regression test (a hook point, not timing) fails without the fix and passes with it;
   - `cargo test --features hooks` and clippy pass.
 - **Notes:**
+  - **Reproduced:** 2 of 15 runs of `crashes_at_every_hook_point`, then 3 of 30 runs of the `materialize` scenario alone (cases `materialize.copied`, `scan.read_chunk`, `replace.quarantined`, `stage.linked`, `replace.verified`; both temp strategies). Debug prints at the scanner's dirty branch and the stable-read retry gave the reason every time: `d/e/l concurrent rename during resolution`, sometimes with earlier `unstable read l/e/l … file is leased` lines (retried successfully by the stable read).
+  - **Root cause (a product defect, not the harness):** both are `EAGAIN` from the in-tree `openat2` in `Root::open_referent` (`RESOLVE_BENEATH`, symlinks followed). `d/e/l -> ../x` is the only link in the crash suite whose target has a `..`. With a scoped resolve, the kernel refuses each `..` step with `EAGAIN` if the global `rename_lock` (or `mount_lock`) seqcount moved during the lookup, i.e. if **any** rename on the system happened meanwhile, because it cannot prove the `..` did not escape. The suite runs a crash case per core, and every case renames all the time, so the final rescan of A sometimes classified `d/e/l` as unstable. The scanner then reports it dirty (no retry at classification). The stable read did retry (with backoff) but mislabelled the errno as a lease. A rescan was correct to report a path whose lookup failed, but the failure was spurious: openat2(2) says the caller may simply retry. So any busy system made scans of such links flaky (extra dirty rounds, and a "not converged" final rescan in tests). Crash recovery, the journal and materialize were all fine; the scenario index and hook points only varied because the failure depended on the other threads' timing.
+  - **Fix:** `open_referent` retries the in-tree lookup on `EAGAIN` up to `SCOPED_RETRIES` (16) times, then behaves as before (the out-of-tree probe; the link is unstable). No other `openat2` in the crate can see this `EAGAIN`: they all use `RESOLVE_NO_SYMLINKS` on `RelPath`s, which have no `..`, or do not scope (`follow_at`, the direct route). Leases also give `EAGAIN` with `O_NONBLOCK`; the bounded retries change nothing for them. No sleeps, and no change to the test or its assertions.
+  - **Regression tests (deterministic):** a rename racing *inside* one syscall cannot be triggered by a hook closure, so `fs::hooks` gained **fault points**: `hooks::fault(name) -> Option<Errno>` (always `None` without hooks; not traced, so the crash suite does not crash there) and `hooks::on_fault(name, f)`. `open_referent` asks `fault("root.in_tree_lookup")` before each try.
+    - `fs::root::tests::raced_dotdot_lookup_is_retried` (3 injected `EAGAIN`s → the in-tree referent, after 4 tries) and `raced_dotdot_lookup_gives_up` (endless → `EAGAIN` after 1 + 16 tries).
+    - `scan::scanner::tests::followed_dotdot_link_survives_unrelated_renames`: the flake's shape (`d/e/l -> ../x` under `CopyLinks`), every first try raced, in classification and in the read. Two scans report nothing dirty, and the link is indexed as the file.
+    - `fs::hooks::tests::faults_inject_errnos_untraced`.
+    - Mutation-checked: with `SCOPED_RETRIES = 0`, `raced_dotdot_lookup_is_retried` and the scanner test fail (`dirty: [RelPath("d/e/l")]`, the flake's exact report).
+  - **Design:** §4.5 (in-tree referents: the `EAGAIN` retry) and §9 (fault points).
+  - **Results:** after the fix, 30 runs of `materialize` alone showed no unstable lookup or read at all (the debug prints stayed silent); then 3 consecutive runs of the whole `--test crash` (~30 s each), and `cargo test --features hooks` and clippy (with and without `hooks`) pass. Before the fix, the same materialize-only loop failed 3 of 30 times. **The "50 consecutive runs" criterion was cut short at the user's request** (too long, ~25 min), so it is not met as written. The statistical evidence is the 30 + 3 clean runs, plus a debug trace that showed no `EAGAIN` at all after the fix. The deterministic tests above carry the regression.
 
 ### [ ] T24: Block-level delta transfer
 - **Depends on:** T22

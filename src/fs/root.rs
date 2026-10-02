@@ -18,6 +18,7 @@ use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::fs::hooks;
 use crate::fs::stat::{FileKind, Fingerprint};
 
 /// `openat2` resolve flags used for every lookup inside a replica.
@@ -25,6 +26,12 @@ pub const RESOLVE: ResolveFlags = ResolveFlags::BENEATH
     .union(ResolveFlags::NO_SYMLINKS)
     .union(ResolveFlags::NO_MAGICLINKS)
     .union(ResolveFlags::NO_XDEV);
+
+/// How often [`Root::open_referent`] retries its in-tree lookup after an
+/// `EAGAIN` (a rename raced a `..` step somewhere on the system). Each try
+/// takes microseconds, so only a sustained storm of renames exhausts them;
+/// the referent is then unstable and rescanned later.
+const SCOPED_RETRIES: usize = 16;
 
 /// Resolution for following a symlink to an in-tree referent (§4.5).
 const IN_TREE: ResolveFlags = ResolveFlags::BENEATH
@@ -325,6 +332,14 @@ impl Root {
     /// If the in-tree attempt fails for another reason, the out-of-tree route
     /// must fail too (its errno is returned); if it succeeds instead, the two
     /// views of the path disagree, and the result is `EAGAIN` (unstable).
+    ///
+    /// The in-tree lookup is the only one that may step through `..` (in a
+    /// link's target), and with `RESOLVE_BENEATH` the kernel refuses a `..`
+    /// step with `EAGAIN` whenever any rename (or mount change) on the system
+    /// raced the lookup, as it cannot rule out an escape. That says nothing
+    /// about this path, so the lookup is retried, as openat2(2) advises, up
+    /// to [`SCOPED_RETRIES`] times. (A leased file opened `O_NONBLOCK` gives
+    /// `EAGAIN` too: the retries cannot tell, and change nothing for it.)
     pub(crate) fn open_referent(
         &self,
         parent: BorrowedFd<'_>,
@@ -341,7 +356,26 @@ impl Root {
                 ResolveFlags::NO_MAGICLINKS,
             )
         };
-        match rustix::fs::openat2(self.fd(), path.as_bytes(), flags, Mode::empty(), IN_TREE) {
+        let in_tree = || {
+            let mut retries = 0;
+            loop {
+                let res = match hooks::fault("root.in_tree_lookup") {
+                    Some(e) => Err(e),
+                    None => rustix::fs::openat2(
+                        self.fd(),
+                        path.as_bytes(),
+                        flags,
+                        Mode::empty(),
+                        IN_TREE,
+                    ),
+                };
+                match res {
+                    Err(Errno::AGAIN) if retries < SCOPED_RETRIES => retries += 1,
+                    res => return res,
+                }
+            }
+        };
+        match in_tree() {
             Ok(fd) => Ok((fd, false)),
             Err(Errno::XDEV) => direct().map(|fd| (fd, true)),
             Err(_) => match direct() {
@@ -612,5 +646,58 @@ mod tests {
         assert_eq!(top, [b"d".to_vec()]);
         assert!(root.read_dir(&rp("d/e")).unwrap().is_empty());
         assert!(root.read_dir(&rp("d/f")).is_err());
+    }
+
+    /// A link whose target climbs with `..`, as `d/e/l -> ../x`.
+    fn dotdot_link() -> (tempfile::TempDir, Root) {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("d/e")).unwrap();
+        fs::write(dir.path().join("d/x"), b"x").unwrap();
+        symlink("../x", dir.path().join("d/e/l")).unwrap();
+        let root = Root::open(dir.path()).unwrap();
+        (dir, root)
+    }
+
+    /// Opens the referent of `d/e/l`, counting the in-tree lookups; the
+    /// first `fail` of them get `EAGAIN`, as when a rename anywhere on the
+    /// system races the lookup's `..` step.
+    fn open_with_races(
+        root: &Root,
+        fail: usize,
+    ) -> (std::result::Result<(OwnedFd, bool), Errno>, usize) {
+        let tries = std::rc::Rc::new(std::cell::Cell::new(0));
+        let t = tries.clone();
+        let _g = hooks::on_fault("root.in_tree_lookup", move || {
+            t.set(t.get() + 1);
+            (t.get() <= fail).then_some(Errno::AGAIN)
+        });
+        let link = rp("d/e/l");
+        let (parent, name) = root.resolve_parent(&link).unwrap();
+        let res = root.open_referent(parent.as_fd(), &link, name, OFlags::RDONLY);
+        (res, tries.get())
+    }
+
+    /// A raced `..` step is retried, not taken for a changed path (T23).
+    #[test]
+    fn raced_dotdot_lookup_is_retried() {
+        let (_dir, root) = dotdot_link();
+        let (res, tries) = open_with_races(&root, 3);
+        let (fd, out_of_tree) = res.unwrap();
+        assert!(!out_of_tree);
+        assert!(
+            Fingerprint::of_fd(fd.as_fd())
+                .unwrap()
+                .same_file(&root.stat(&rp("d/x")).unwrap())
+        );
+        assert_eq!(tries, 4);
+    }
+
+    /// Endless races give up after the retries: unstable, as before.
+    #[test]
+    fn raced_dotdot_lookup_gives_up() {
+        let (_dir, root) = dotdot_link();
+        let (res, tries) = open_with_races(&root, usize::MAX);
+        assert_eq!(res.err(), Some(Errno::AGAIN));
+        assert_eq!(tries, 1 + SCOPED_RETRIES);
     }
 }

@@ -1049,4 +1049,32 @@ mod tests {
         let now = f.get("f");
         assert_eq!((now.vv, now.seq), (theirs.vv, written.get()));
     }
+
+    /// A followed link whose target climbs with `..` (`d/e/l -> ../x`, the
+    /// crash suite's `materialize` scenario) is not reported dirty when a
+    /// rename elsewhere on the system races the referent's lookup (`openat2`'s
+    /// `EAGAIN`), neither while classifying the link nor while reading the
+    /// referent (T23).
+    #[test]
+    fn followed_dotdot_link_survives_unrelated_renames() {
+        let f = fixture();
+        fs::create_dir_all(f.dir.path().join("d/e")).unwrap();
+        fs::write(f.dir.path().join("d/x"), b"x").unwrap();
+        std::os::unix::fs::symlink("../x", f.dir.path().join("d/e/l")).unwrap();
+        let mut races = 0;
+        let _g = hooks::on_fault("root.in_tree_lookup", move || {
+            // Every first try of a lookup is raced.
+            races += 1;
+            (races % 2 == 1).then_some(Errno::AGAIN)
+        });
+        for _ in 0..2 {
+            let stats = Scanner::new(&f.root, &f.index, SymlinkPolicy::CopyLinks)
+                .scan(&Scope::Full)
+                .unwrap();
+            assert!(stats.dirty.is_empty(), "{stats:?}");
+        }
+        let l = f.get("d/e/l");
+        assert_eq!(l.kind, f.get("d/x").kind);
+        assert!(l.local.via_link.is_some());
+    }
 }
