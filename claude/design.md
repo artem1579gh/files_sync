@@ -48,7 +48,8 @@ src/fs/      root.rs     Root + openat2 parent resolution, fd-based readdir
              commit.rs   CAS create/replace/delete/symlink/mkdir/rmdir   <- the ONLY code that mutates replicas
              tmpname.rs  .~fsync.<id> naming
              lease.rs    F_SETLEASE helpers
-             caps.rs     filesystem feature checks
+             caps.rs     filesystem feature checks (creates and removes its own .~fsync.probe.* files:
+                         the one sanctioned mutation outside commit.rs)
              hooks.rs    cfg(test) race-injection points
 src/index/   entry.rs, vv.rs (version vectors), store.rs (redb), journal.rs (intent log)
 src/symlink/ policy.rs, safety.rs (port of rsync unsafe_symlink), munge.rs

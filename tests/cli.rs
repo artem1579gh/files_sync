@@ -53,8 +53,20 @@ fn init_writes_config_that_loads_back() {
 }
 
 #[test]
-fn stubs_report_not_implemented() {
-    let state = tempfile::tempdir().unwrap();
+fn stubs_probe_roots_and_report_not_implemented() {
+    let (state, a, b) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    let (a_str, b_str) = (a.path().to_str().unwrap(), b.path().to_str().unwrap());
+    let out = run(state.path(), &["init", "p", "--a", a_str, "--b", b_str]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
     for args in [
         &["sync", "--once", "p"][..],
         &["daemon", "p"],
@@ -64,5 +76,24 @@ fn stubs_report_not_implemented() {
         assert!(!out.status.success(), "{args:?}");
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(stderr.contains("not implemented"), "{args:?}: {stderr}");
+        if args[0] != "status" {
+            assert!(
+                stderr.contains("filesystem capabilities"),
+                "{args:?}: {stderr}"
+            );
+        }
     }
+    // Probing leaves nothing behind in the roots.
+    for root in [&a, &b] {
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+}
+
+#[test]
+fn sync_requires_initialised_pair() {
+    let state = tempfile::tempdir().unwrap();
+    let out = run(state.path(), &["sync", "--once", "nope"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("not initialised"), "{stderr}");
 }

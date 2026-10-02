@@ -1,13 +1,14 @@
 //! Command-line interface. This is the binary's front end, so it reports
 //! errors with `anyhow` rather than the library [`Error`](crate::Error).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use anyhow::bail;
+use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
-use crate::config;
+use crate::config::{self, PairConfig};
+use crate::fs::caps::Caps;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -51,6 +52,12 @@ pub fn run() -> anyhow::Result<()> {
     init_logging();
     match cli.command {
         Command::Init { pair, a, b } => {
+            // Missing or non-directory roots are reported by `config::init`.
+            for dir in [&a, &b] {
+                if dir.is_dir() {
+                    probe_root(dir)?;
+                }
+            }
             let state_home = config::state_home()?;
             let (cfg, path) = config::init(&state_home, &pair, &a, &b)?;
             println!("initialised pair {:?}: {}", cfg.name, path.display());
@@ -59,13 +66,38 @@ pub fn run() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Command::Sync { once: true, .. } => not_implemented("sync --once"),
+        Command::Sync { once: true, pair } => {
+            open_pair(&pair)?;
+            not_implemented("sync --once")
+        }
         Command::Sync { once: false, .. } => {
             bail!("`sync` requires --once; use `daemon` for continuous sync")
         }
-        Command::Daemon { .. } => not_implemented("daemon"),
+        Command::Daemon { pair } => {
+            open_pair(&pair)?;
+            not_implemented("daemon")
+        }
         Command::Status { .. } => not_implemented("status"),
     }
+}
+
+/// Loads a pair's config and probes both replica roots.
+fn open_pair(pair: &str) -> anyhow::Result<(PairConfig, [Caps; 2])> {
+    let cfg = PairConfig::load(&config::state_home()?, pair)?;
+    let caps = [
+        probe_root(&cfg.replicas[0].root)?,
+        probe_root(&cfg.replicas[1].root)?,
+    ];
+    Ok((cfg, caps))
+}
+
+/// Probes a replica root, logs the result and checks the required features.
+fn probe_root(root: &Path) -> anyhow::Result<Caps> {
+    let caps = Caps::probe_path(root)?;
+    caps.log(root);
+    caps.require_minimum()
+        .with_context(|| format!("replica root {}", root.display()))?;
+    Ok(caps)
 }
 
 fn not_implemented(what: &str) -> anyhow::Result<()> {

@@ -42,13 +42,22 @@ The design lives in [`design.md`](design.md); §N.M below refers to its sections
   - Config writes are atomic (temp file + fsync + rename/link + dir fsync), with dir mode 0700 and file mode 0600. These use `std::fs`, which is fine because the state dir is never inside a replica.
   - Tests: 8 unit tests in `config.rs`, plus `tests/cli.rs` (help lists the subcommands, `init` round-trips through the real binary, stubs report "not implemented").
 
-### [ ] T02: Filesystem feature checks (`fs/caps.rs`)
+### [x] T02: Filesystem feature checks (`fs/caps.rs`)
 - **Depends on:** T01
 - **Read:** §1 (environment caveat), §5.3 step 2, §5.3 step 4(b)
 - **Files:** `src/fs/caps.rs`
 - **Do:** implement `Caps::probe(root_dirfd) -> Caps { openat2, rename_exchange, rename_noreplace, o_tmpfile, linkat_empty_path, statx_btime, leases, fs_type }`. Each check is a real, harmless operation inside the root using `.~fsync.probe.*` names, cleaned up afterwards. Add a `require_minimum()` check that fails clearly when openat2 or the renameat2 flags are missing.
 - **Done when:** a test on a tempdir in `/tmp` reports everything supported (except leases, which depend on the environment). The result is logged at startup.
 - **Notes:**
+  - Extra field `linkat_proc_fd` (the `/proc/self/fd/N` + `AT_SYMLINK_FOLLOW` fallback from §5.3 step 2), plus `Caps::tmpfile_usable()` = `o_tmpfile && (linkat_empty_path || linkat_proc_fd)`. T04 should use these to choose between O_TMPFILE and a named temp file. Unprivileged `AT_EMPTY_PATH` only works on kernels ≥ 6.10; on older kernels it reports false (ENOENT).
+  - `fs_type` is an `FsType` enum built from the `statfs` magic (ext2/3/4, xfs, btrfs, tmpfs, 9p, fuse, nfs, overlay, `Other(magic)`). `Caps::log` warns when the type is not one of the four supported filesystems; `require_minimum` checks only features, not the type.
+  - `openat2` counts as supported only if `..` really fails with EXDEV under `RESOLVE_BENEATH`. `rename_noreplace` must give EEXIST on an existing name and succeed on a free one. `rename_exchange` must actually swap the inodes. `leases` takes, checks (`F_GETLEASE`) and releases an `F_WRLCK` lease; any failure counts as false.
+  - Errnos that mean "unsupported" give `false`. Anything else (e.g. EACCES/EROFS on the root) is an `Err`, since such a root couldn't be synced anyway.
+  - Cleanup safety: probe names are `.~fsync.probe.<random tag>.<suffix>`. Every probe inode stays pinned by an fd until cleanup, so its inode number can't be reused; `O_PATH` pins don't block write leases. Cleanup unlinks a name only if it still holds one of our (dev, ino); anything else is left and logged. There is a residual statx→unlink window on a random reserved name, which is accepted. Test: `cleanup_leaves_foreign_files_alone`.
+  - Mutating outside `commit.rs`: `caps.rs` creates and removes its own probe files. CLAUDE.md anticipates this (the "probe files" in the reserved prefix), and design §2 now says so.
+  - `Error::MissingCapabilities { fs_type, missing }` was added. Until `Root` (T03) exists, `Caps::probe_path` opens the root directly with `O_PATH|O_DIRECTORY`; T03/T11 can switch to `Root`.
+  - CLI: `init` probes both roots and refuses one missing the required features. `sync --once` and `daemon` load the config, probe and log both roots ("filesystem capabilities" at INFO), then say "not implemented". `status` is still a plain stub. In T11, `LocalReplica::open` should own the probe.
+  - Measured on this WSL2 machine (kernel 6.18): ext4 `/tmp` and tmpfs `/dev/shm` report every capability as true, leases included. The drvfs path is unit-tested only through forced flags, because tests must not touch `/mnt/c`.
 
 ## M1: race-safe filesystem primitives
 

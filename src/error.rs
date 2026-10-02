@@ -46,6 +46,13 @@ pub enum Error {
     #[error("cannot serialise config: {0}")]
     ConfigSerialize(#[from] toml::ser::Error),
 
+    /// The filesystem under a replica root lacks features race-freedom depends on.
+    #[error(
+        "filesystem {fs_type} lacks required features: {missing}; \
+         replica roots must be on ext4, xfs, btrfs or tmpfs (not WSL /mnt/c)"
+    )]
+    MissingCapabilities { fs_type: String, missing: String },
+
     /// Neither `$XDG_STATE_HOME` nor `$HOME` gives a usable state directory.
     #[error("cannot determine state directory: set XDG_STATE_HOME or HOME to an absolute path")]
     NoStateHome,
