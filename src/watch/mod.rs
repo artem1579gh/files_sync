@@ -21,12 +21,13 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
+use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::fs::RelPath;
 
 /// What a replica's watcher tells the sync loop (design §5.9).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Hint {
     /// These paths (and everything beneath them) may have changed: rescan them.
     Paths(Vec<RelPath>),

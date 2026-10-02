@@ -39,6 +39,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rustix::fs::{Dir, OFlags};
 use rustix::io::Errno;
+use serde::{Deserialize, Serialize};
 
 use crate::config::ReplicaId;
 use crate::error::{Error, Result};
@@ -60,7 +61,7 @@ pub const DEFAULT_RACY_WINDOW: Duration = Duration::from_secs(1);
 const FLUSH_EVERY: usize = 1024;
 
 /// What to scan.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Scope {
     /// The whole tree.
     Full,
@@ -70,7 +71,7 @@ pub enum Scope {
 }
 
 /// What a scan did.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScanStats {
     /// Objects examined (each name `statx`ed).
     pub scanned: u64,

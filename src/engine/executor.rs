@@ -26,7 +26,7 @@ use crate::engine::conflict::{ConflictCopy, log_resolutions};
 use crate::engine::{
     Action, ActionKind, IndexView, Side, SkipReason, Snapshot, Step, is_beneath, plan, reconcile,
 };
-use crate::error::{Error, Result};
+use crate::error::{Error, RemoteKind, Result};
 use crate::fs::RelPath;
 use crate::index::{DEFAULT_TOMBSTONE_RETENTION, Entry, Kind, PeerState, UnmanagedReason};
 use crate::replica::{Op, Outcome, Replica};
@@ -435,7 +435,9 @@ impl Cycle<'_> {
     }
 }
 
-/// Errors that are not about one path: the replica itself is unusable.
+/// Errors that are not about one path: the replica itself, or the
+/// connection to it, is unusable.
 fn is_fatal(e: &Error) -> bool {
-    matches!(e, Error::Db(_) | Error::BadIndex { .. })
+    // Db, BadIndex and Protocol, local or reported by a remote replica.
+    matches!(e.remote_kind(), RemoteKind::Index | RemoteKind::Protocol)
 }

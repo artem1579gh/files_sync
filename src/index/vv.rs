@@ -5,6 +5,7 @@
 //! therefore equal as values exactly when they compare [`Ord4::Equal`].
 
 use std::cmp::Ordering;
+use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use smallvec::SmallVec;
@@ -232,9 +233,30 @@ impl<'de> Deserialize<'de> for VersionVector {
     /// Rejects non-canonical input (unsorted, duplicate, zero or oversized
     /// counters), so every decoded vector upholds the invariants.
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let counters = Counters::deserialize(d)?;
+        let counters = d.deserialize_seq(CountersVisitor)?;
         VersionVector::validate(&counters).map_err(serde::de::Error::custom)?;
         Ok(VersionVector(counters))
+    }
+}
+
+/// Decodes [`Counters`] without trusting the encoded length for the
+/// allocation (smallvec's own impl reserves it up front; a peer's message
+/// could claim millions of counters, design §7.1).
+struct CountersVisitor;
+
+impl<'de> serde::de::Visitor<'de> for CountersVisitor {
+    type Value = Counters;
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("a sequence of (replica, counter) pairs")
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Counters, A::Error> {
+        let mut counters = Counters::with_capacity(seq.size_hint().unwrap_or(0).min(16));
+        while let Some(pair) = seq.next_element()? {
+            counters.push(pair);
+        }
+        Ok(counters)
     }
 }
 

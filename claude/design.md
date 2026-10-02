@@ -57,7 +57,7 @@ src/index/   entry.rs, vv.rs (version vectors), store.rs (redb), journal.rs (int
 src/symlink/ policy.rs, safety.rs (port of rsync unsafe_symlink), munge.rs
 src/scan/    scanner.rs, hasher.rs
 src/watch/   inotify.rs, debounce.rs
-src/replica/ mod.rs (trait), local.rs     [remote.rs, proto/ in the network phase]
+src/replica/ mod.rs (trait), local.rs, proto/{mod,messages,framing}.rs (wire protocol, T20)   [remote.rs later]
 src/engine/  reconcile.rs, plan.rs, executor.rs, conflict.rs
 tests/       harness/, attack.rs, symlink_matrix.rs, stress.rs, crash.rs
 ```
@@ -427,6 +427,14 @@ enum Outcome { Applied(Entry), PreconditionFailed(Option<Entry>), Preserved{ con
 - **Server:** a `serve` process wraps a `LocalReplica`.
 - **Index exchange:** incremental, by `seq`.
 - **Content:** streamed in chunks. Block lists (128 KiB blake3 blocks) for delta transfer come later.
+
+**Wire protocol as implemented (T20, `src/replica/proto/`):**
+- **Framing:** a 4-byte big-endian length, then exactly one postcard message (trailing bytes are an error). `MAX_FRAME` = 32 MiB bounds what a peer can make us allocate; the body buffer grows with the bytes that arrive, not with the claimed length. Every malformed input (short header or body, empty or oversized frame, unknown variant, invalid `RelPath`, non-canonical version vector, bad UTF-8, overflowing `Duration`) is `Error::Protocol`, never a panic. EOF between frames is a clean close (`Ok(None)`). `VersionVector` decoding no longer lets the encoded length size its allocation (smallvec's impl reserves it up front).
+- **Handshake** (`Hello`, `HelloReply`: their encoding is frozen for all versions): the client sends `MAGIC`, its version range and its replica ID; the server answers `Welcome { version, replica }` (the highest common version) or `Refused { reason }`. Each side checks the other's replica ID against the one it expects (the TLS certificate pinning of T21 authenticates the peer; this check catches a misconfigured pair). The server's replica ID answers `Replica::id`, so there is no `Id` request. A stranger (bad magic) gets no reply.
+- **Messages:** `Request` (client → server) has one variant per `Replica` call (`Scan`, `ChangesSince`, `OpenRead`, `Apply`, `Watch`, `Adopt`, `RecordSync`) plus `Content`; `Response` has the answers (`Scanned`, `Changes`, `Reading`, `Applied(Outcome)`, `Watching(bool)`, `Adopted`, `Collected`), `Error(WireError)`, `Content` and `Hint` (server push, any time after `Watching(true)`). The server answers requests in order. `Entry` goes in its wire form (no `LocalMeta`); preconditions travel as data and are checked on the server, next to the files.
+- **Batches:** the potentially huge lists (`Changes`, the tombstones of `RecordSync`, `Collected`) go in batches of about `BATCH_BYTES` (1 MiB) encoded, each with a `more` flag (`batches()` splits by `postcard::experimental::serialized_size`). `ScanStats` and `Hint::Paths` are single messages (bounded by `MAX_FRAME`).
+- **Content:** `Chunk(bytes)` of up to `CHUNK_SIZE` (64 KiB, encoded as a byte string), then `End { hash }` (blake3 of all chunks) or `Abort(WireError)` if the sender's source fails mid-stream (e.g. a `StableReader` that sees the file change). `send_content` sends a stream and tells a source error (stream ended with `Abort`, connection still in step) from a connection error. `ContentStream` reads one as a plain `Read`: EOF only after `End` with a matching hash; an `Abort` fails with the sender's error (so an `Unstable` on the server is `is_unstable()` on the client, and `TempFile::copy_from` → `apply` returns `Err(Unstable)` with nothing committed, as locally); a filter closure sets aside interleaved messages (pushed hints). `drain()` consumes an unread rest, so the connection stays in step: the server must drain an `Apply`'s content even when the precondition fails before reading it.
+- **Errors:** `WireError { kind: RemoteKind, message }`; `RemoteKind` (`Unstable`, `NotFound`, `InvalidOp`, `InvalidPath`, `Index`, `Protocol`, `Other`) keeps the class the executor acts on. The receiving side gets `Error::Remote { kind, message }`; `Error::is_unstable`/`is_not_found` recognise it, and the executor treats `Index` and `Protocol` (local or remote) as fatal, like `Db`/`BadIndex`.
 
 ---
 

@@ -15,4 +15,4 @@ pub mod status;
 pub mod symlink;
 pub mod watch;
 
-pub use error::{Error, Result};
+pub use error::{Error, RemoteKind, Result};

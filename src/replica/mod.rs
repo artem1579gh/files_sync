@@ -6,6 +6,7 @@
 //! says what it expects in logical terms ([`Precondition`]), and the replica
 //! maps that to its own physical fingerprint.
 pub mod local;
+pub mod proto;
 
 pub use local::LocalReplica;
 
@@ -165,7 +166,7 @@ impl Precondition {
 }
 
 /// Result of [`Replica::apply`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Outcome {
     /// Done; this is the path's index entry now (without [`LocalMeta`]).
     Applied(Entry),

@@ -620,7 +620,7 @@ The design lives in [`design.md`](design.md); §N.M below refers to its sections
 
 ## M8: network → production variant
 
-### [ ] T20: Wire protocol
+### [x] T20: Wire protocol
 - **Depends on:** T13
 - **Read:** §7, §7.1
 - **Files:** `src/replica/proto/{mod,messages,framing}.rs`
@@ -631,6 +631,14 @@ The design lives in [`design.md`](design.md); §N.M below refers to its sections
   - Version handshake.
 - **Done when:** a round-trip test of every message over an in-memory pipe passes, and malformed frames produce errors, not panics.
 - **Notes:**
+  - **Design:** §7.1 "Wire protocol as implemented (T20)" describes framing, handshake, messages, batches, content streams and errors.
+  - **Module** `replica::proto`: `mod.rs` (constants `MAGIC`, `PROTOCOL_VERSION`/`MIN_PROTOCOL_VERSION` = 1, `MAX_FRAME` 32 MiB, `CHUNK_SIZE` 64 KiB, `BATCH_BYTES` 1 MiB; `client_handshake`/`server_handshake` → `Session { version, peer }`), `messages.rs` (`Hello`, `HelloReply`, `Request`, `Response`, `Content`, `WireError`, `batches`), `framing.rs` (`write_frame`, `read_frame`, `send_content`, `ContentStream`).
+  - **Deviations:** no `Id` request (the handshake's `Welcome` carries the server's replica ID; both sides check the other's ID). Content is a nested `Content { Chunk, End { hash }, Abort(WireError) }` inside `Request::Content`/`Response::Content`; `Abort` was added so a source failing mid-stream (the `StableReader` on the server, or the client's reader from the other replica) ends the stream in step and reaches the receiver as the same error class. `Changes`, `RecordSync` and `Collected` are batched (`more` flag).
+  - **Changes outside `proto/`:** `Error::Remote { kind: RemoteKind, message }` and `Error::Protocol { reason }`, `RemoteKind`, `Error::remote_kind()`; `is_unstable`/`is_not_found` recognise remote errors; the executor's `is_fatal` is now `remote_kind() ∈ {Index, Protocol}` (same set as before for local errors, plus protocol and remote index errors). Serde derives on `Scope`, `ScanStats`, `Hint`, `Outcome`. `VersionVector` decodes through its own visitor, which caps the up-front reservation (smallvec's impl reserves the claimed length).
+  - **Tests** (15, in `proto/mod.rs`): every `Request`/`Response`/`Op`/`Outcome`/`Kind`/`Content`/`Hello`/`HelloReply` variant round-trips over `std::io::pipe` (exhaustive matches on `Request`, `Response`, `Op` and `Content`, so a new variant won't compile until the test covers it) with a clean EOF after; `LocalMeta` never crosses; the frame layout; handshake (success, version choice, no common version, wrong replica either way, server picking an unknown version, bad magic either way, hang-ups); content (0 / 1 / one chunk / 3 chunks + 17 bytes, in step for the next frame), a torn source → `Abort` → `is_unstable()` on the receiver and stays failed, hash mismatch, an unexpected message, hints set aside by the filter, connection closed at and inside a frame, `drain`; 17 hand-made malformed frames (incl. `..` and NUL in paths, unsorted/zero vv, 2^60-element and 4 GiB length claims, bad bool, bad UTF-8, overflowing `Duration`) are `Protocol` errors and I/O errors stay `Io`; oversized messages are not sent; proptest: random bytes and corrupted/truncated valid messages never panic (2000 cases each); `batches`; error classes survive the round trip and are not prefixed twice when passed on.
+  - Mutation-checked by hand: skipping the hash check, the trailing-bytes check, or `drain`'s loop each fails tests.
+  - **Pre-existing flake (not fixed, not caused by T20):** `cargo test --features hooks --test crash` fails about 1 run in 6–10, on this branch and on a clean T19 checkout alike (1 of 10 there). Always scenario 14 ("materialize"), at varying hook points (`stage.synced`, `commit.synced`, `scan.stat`): the harness's final rescan of A reports `d/e/l` dirty (`dirty: [RelPath("d/e/l")]`, no changes). Looks timing-dependent; worth a look by whoever touches T15/T17 code next.
+  - **For T21:** the server must answer requests in order and drain an `Apply`'s content before answering when `apply` did not consume it. A client that drops an `open_read` reader before EOF must `drain` it (or close the connection); there is no cancel message. The client side of hints needs a reader that demultiplexes `Response::Hint` from answers (`ContentStream`'s filter does this inside a stream). Map `Request::RecordSync` batches back to one `record_sync` call (same `peer` and `retention`).
 
 ### [ ] T21: RemoteReplica, server, TLS
 - **Depends on:** T20

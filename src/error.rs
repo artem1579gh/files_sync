@@ -80,9 +80,40 @@ pub enum Error {
     #[error("bad index: {reason}")]
     BadIndex { reason: String },
 
+    /// An error reported by a remote replica (design §7.1). `kind` keeps the
+    /// local error's class, so callers react to it as to the local error
+    /// (see [`Error::is_unstable`], [`Error::is_not_found`]).
+    #[error("remote replica: {message}")]
+    Remote { kind: RemoteKind, message: String },
+
+    /// The peer broke the wire protocol: a malformed or unexpected message, a
+    /// failed handshake, or a connection closed mid-message. The connection
+    /// cannot be used any more.
+    #[error("protocol error: {reason}")]
+    Protocol { reason: String },
+
     /// Neither `$XDG_STATE_HOME` nor `$HOME` gives a usable state directory.
     #[error("cannot determine state directory: set XDG_STATE_HOME or HOME to an absolute path")]
     NoStateHome,
+}
+
+/// The class of an error sent over the wire ([`Error::Remote`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum RemoteKind {
+    /// [`Error::Unstable`]: rescan the path.
+    Unstable,
+    /// An I/O error for which [`Error::is_not_found`] holds.
+    NotFound,
+    /// [`Error::InvalidOp`].
+    InvalidOp,
+    /// [`Error::InvalidPath`].
+    InvalidPath,
+    /// [`Error::Db`] or [`Error::BadIndex`]: the remote index is unusable.
+    Index,
+    /// [`Error::Protocol`]: the remote side saw us break the protocol.
+    Protocol,
+    /// Anything else: a per-path failure.
+    Other,
 }
 
 impl Error {
@@ -109,14 +140,41 @@ impl Error {
 
     /// The path changed under us; rescan it ([`Error::Unstable`]).
     pub fn is_unstable(&self) -> bool {
-        matches!(self, Error::Unstable { .. })
+        matches!(
+            self,
+            Error::Unstable { .. }
+                | Error::Remote {
+                    kind: RemoteKind::Unstable,
+                    ..
+                }
+        )
     }
 
     /// An I/O error meaning the path does not exist (or a parent is not a
     /// directory).
     pub fn is_not_found(&self) -> bool {
-        matches!(self, Error::Io { source, .. }
-            if matches!(source.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory))
+        match self {
+            Error::Io { source, .. } => matches!(
+                source.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ),
+            Error::Remote { kind, .. } => *kind == RemoteKind::NotFound,
+            _ => false,
+        }
+    }
+
+    /// The class this error is sent over the wire with.
+    pub fn remote_kind(&self) -> RemoteKind {
+        match self {
+            Error::Unstable { .. } => RemoteKind::Unstable,
+            Error::InvalidOp { .. } => RemoteKind::InvalidOp,
+            Error::InvalidPath { .. } => RemoteKind::InvalidPath,
+            Error::Db(_) | Error::BadIndex { .. } => RemoteKind::Index,
+            Error::Protocol { .. } => RemoteKind::Protocol,
+            Error::Remote { kind, .. } => *kind,
+            e if e.is_not_found() => RemoteKind::NotFound,
+            _ => RemoteKind::Other,
+        }
     }
 }
 
