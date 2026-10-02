@@ -1,12 +1,16 @@
 //! [`LocalReplica`]: a replica in a local directory (design §7).
 //!
-//! `apply` runs in one index write transaction: it checks the logical
-//! [`Precondition`] against the index, maps the indexed entry to the
-//! physical [`Expected`] fingerprint, runs the matching `fs::commit`
-//! operation (which does the binding compare-and-swap on disk), and on
-//! success writes the resulting entry, with the version vector from the op.
-//! The index is then already up to date when the next scan (or inotify
-//! event) sees our own write, so it causes no echo (§5.3 step 5, §5.8).
+//! `apply` checks the logical [`Precondition`] against an index snapshot,
+//! maps the indexed entry to the physical [`Expected`] fingerprint, runs the
+//! matching `fs::commit` operation (which does the binding compare-and-swap
+//! on disk, journaling its intent first), and on success writes the
+//! resulting entry, with the version vector from the op, in one transaction
+//! that also marks the intent done. The index is then already up to date when
+//! the next scan (or inotify event) sees our own write, so it causes no echo
+//! (§5.3 step 5, §5.8). Nothing else writes the index in between: `apply`
+//! and `scan` take `&mut self`, and redb locks the file to one process.
+//!
+//! [`LocalReplica::open`] replays the intents a crash left behind (§5.8).
 
 use std::io::Read;
 use std::os::fd::AsFd;
@@ -20,11 +24,12 @@ use rustix::io::Errno;
 use crate::config::{ReplicaConfig, ReplicaId};
 use crate::error::{Error, Result};
 use crate::fs::caps::Caps;
-use crate::fs::commit::{self, Ctx, Expected, FileMeta, Quarantine, SweepReport};
+use crate::fs::commit::{self, Ctx, Expected, FileMeta, Quarantine, Recovered, SweepReport};
 use crate::fs::root::path_err;
 use crate::fs::{FileKind, Fingerprint, Recheck, RelPath, Root, StableReader};
 use crate::index::{
-    Entry, IndexStore, Kind, LinkInfo, LocalMeta, VersionVector, WriteTxn, sync_mode,
+    Entry, IndexStore, Intent, IntentId, Kind, LinkInfo, LocalMeta, ReadTxn, VersionVector,
+    sync_mode,
 };
 use crate::replica::{ContentReader, Op, Outcome, Precondition, Replica, wire};
 use crate::scan::{DEFAULT_RACY_WINDOW, ScanStats, Scanner, Scope};
@@ -45,21 +50,30 @@ pub struct LocalReplica {
 impl LocalReplica {
     /// Opens the replica `config`: its root, its capabilities (probed,
     /// logged, and required, §1) and its index under `pair_dir`
-    /// (`$XDG_STATE_HOME/fsync/<pair>/`, which must exist).
+    /// (`$XDG_STATE_HOME/fsync/<pair>/`, which must exist). Then replays the
+    /// journal (§5.8): commits a crash interrupted are finished or undone,
+    /// and quarantined old inodes are quarantined again.
     pub fn open(config: &ReplicaConfig, pair_dir: &Path) -> Result<LocalReplica> {
         let root = Root::open(&config.root)?;
         let caps = Caps::probe(root.fd())?;
         caps.log(root.path());
         caps.require_minimum()?;
         let index = IndexStore::open(&IndexStore::path_for(pair_dir, config.id), config.id)?;
-        Ok(LocalReplica {
+        let mut replica = LocalReplica {
             config: config.clone(),
             root,
             caps,
             index,
             quarantine: Quarantine::new(config.id, Quarantine::DEFAULT_GRACE),
             racy_window: DEFAULT_RACY_WINDOW,
-        })
+        };
+        let pending = replica.index.journal().pending()?;
+        if !pending.is_empty() {
+            tracing::info!(root = %replica.root.path().display(), intents = pending.len(), "replaying the journal");
+            let ids = pending.into_iter().map(|(id, intent)| (id, Some(intent)));
+            replica.replay(ids.collect())?;
+        }
+        Ok(replica)
     }
 
     /// Overrides the scanner's racy window ([`DEFAULT_RACY_WINDOW`]).
@@ -68,12 +82,17 @@ impl LocalReplica {
         self
     }
 
-    /// Overrides the quarantine grace period ([`Quarantine::DEFAULT_GRACE`]).
-    /// Only before anything was quarantined.
+    /// Overrides the quarantine grace period ([`Quarantine::DEFAULT_GRACE`]),
+    /// for entries already waiting (replayed by `open`) too.
     pub fn quarantine_grace(mut self, grace: Duration) -> Self {
-        assert!(self.quarantine.is_empty(), "quarantine in use");
-        self.quarantine = Quarantine::new(self.config.id, grace);
+        self.quarantine.set_grace(grace);
         self
+    }
+
+    /// The probed capabilities, to override in tests (e.g. to force the
+    /// named temp-file fallback by clearing `o_tmpfile`).
+    pub fn caps_mut(&mut self) -> &mut Caps {
+        &mut self.caps
     }
 
     pub fn config(&self) -> &ReplicaConfig {
@@ -98,14 +117,62 @@ impl LocalReplica {
 
     /// Unlinks quarantined old inodes whose grace period is over, or turns
     /// them into conflict copies if they were written to (§5.3 step 4(f)).
+    /// Their journal intents are done then.
     pub fn sweep_quarantine(&mut self) -> SweepReport {
-        self.quarantine.sweep()
+        let report = self.quarantine.sweep();
+        if let Err(e) = self.index.journal().forget(&report.finished) {
+            // Replaying them later finds nothing to do.
+            tracing::warn!(error = %e, "cannot forget settled quarantine intents");
+        }
+        report
+    }
+
+    /// Replays the intents `ids` (§5.8), reading those given without one
+    /// from the journal, then finishes them: done, or kept while their old
+    /// inode is quarantined. An intent that cannot be replayed (an I/O error)
+    /// is kept for the next time.
+    fn replay(&mut self, mut ids: Vec<(IntentId, Option<Intent>)>) -> Result<()> {
+        if ids.iter().any(|(_, i)| i.is_none()) {
+            let pending = self.index.journal().pending()?;
+            for (id, intent) in &mut ids {
+                if intent.is_none() {
+                    *intent = pending
+                        .iter()
+                        .find(|(p, _)| p == id)
+                        .map(|(_, i)| i.clone());
+                }
+            }
+        }
+        let ctx = Ctx {
+            root: &self.root,
+            caps: &self.caps,
+            replica: self.config.id,
+            journal: self.index.journal(),
+        };
+        let (mut done, mut kept) = (Vec::new(), Vec::new());
+        for (id, intent) in ids {
+            if let Some(intent) = intent {
+                match commit::recover(&ctx, &mut self.quarantine, id, &intent) {
+                    Ok(rep) => log_recovered(&intent, &rep),
+                    Err(e) => {
+                        tracing::warn!(path = %intent.path, error = %e, "cannot replay intent; retrying at the next start");
+                        continue;
+                    }
+                }
+            }
+            if self.quarantine.holds(id) {
+                kept.push(id);
+            } else {
+                done.push(id);
+            }
+        }
+        ctx.journal.finish(&done, &kept)
     }
 
     /// Runs `op` after the precondition passed; `cur` is the path's entry.
     fn run(
         &mut self,
-        txn: &WriteTxn,
+        txn: &ReadTxn,
         path: &RelPath,
         op: Op,
         cur: Option<&Entry>,
@@ -117,6 +184,7 @@ impl LocalReplica {
             root: &self.root,
             caps: &self.caps,
             replica: id,
+            journal: self.index.journal(),
         };
         let q = &mut self.quarantine;
         let live = cur.filter(|e| e.is_live());
@@ -242,7 +310,7 @@ impl LocalReplica {
                 // The path: a local deletion. The copy: a new local object,
                 // whose counter comes after the tombstone's.
                 let mut gone_vv = e.vv.clone();
-                gone_vv.bump_after(id, txn.max_counter());
+                gone_vv.bump_after(id, txn.max_counter()?);
                 let mut copy_vv = VersionVector::new();
                 copy_vv.bump_after(id, gone_vv.max_counter());
                 let local = LocalMeta {
@@ -404,28 +472,58 @@ impl Replica for LocalReplica {
         if path.is_root() {
             return Err(invalid(path, "cannot apply to the replica root"));
         }
-        let mut txn = self.index.write()?;
-        let cur = txn.get(path)?;
+        // A snapshot, not a write transaction: the commit writes the journal
+        // in transactions of its own, and redb has one writer at a time.
+        let snap = self.index.read()?;
+        let cur = snap.get(path)?;
         let failed = |reason, cur: Option<Entry>| {
             tracing::debug!(%path, reason, "precondition failed");
             Ok(Outcome::PreconditionFailed(cur.map(wire)))
         };
-        if let Some(reason) = check(&txn, path, cur.as_ref(), &pre)? {
+        if let Some(reason) = check(&snap, path, cur.as_ref(), &pre)? {
             return failed(reason, cur);
         }
-        match self.run(&txn, path, op, cur.as_ref(), content)? {
-            Step::Failed(reason) => failed(reason, cur),
-            Step::Preserved(conflict) => Ok(Outcome::Preserved { conflict }),
-            Step::Put(entries) => {
-                let mut first = None;
-                for (p, mut e) in entries {
-                    txn.put(&p, &mut e)?;
-                    first.get_or_insert(e);
+        let step = self.run(&snap, path, op, cur.as_ref(), content);
+        drop(snap);
+        let open = self.index.journal().take_open();
+        let entries = match step {
+            Ok(Step::Put(entries)) => entries,
+            other => {
+                // Nothing to index. After an error the commit may have left
+                // reserved names behind: replay its intents right away.
+                let ids = open.into_iter().map(|id| (id, None));
+                let finished = if other.is_err() {
+                    self.replay(ids.collect())
+                } else {
+                    let (kept, done): (Vec<_>, Vec<_>) = ids
+                        .map(|(id, _)| id)
+                        .partition(|id| self.quarantine.holds(*id));
+                    self.index.journal().finish(&done, &kept)
+                };
+                if let (Err(e), Err(_)) = (&finished, &other) {
+                    // Report the commit's error; the next start replays.
+                    tracing::warn!(%path, error = %e, "cannot finish intents");
                 }
-                txn.commit()?;
-                Ok(Outcome::Applied(wire(first.expect("at least one entry"))))
+                let step = other?;
+                finished?;
+                return match step {
+                    Step::Failed(reason) => failed(reason, cur),
+                    Step::Preserved(conflict) => Ok(Outcome::Preserved { conflict }),
+                    Step::Put(_) => unreachable!("handled above"),
+                };
             }
+        };
+        let mut txn = self.index.write()?;
+        let mut first = None;
+        for (p, mut e) in entries {
+            txn.put(&p, &mut e)?;
+            first.get_or_insert(e);
         }
+        let (kept, done): (Vec<_>, Vec<_>) =
+            open.into_iter().partition(|id| self.quarantine.holds(*id));
+        txn.finish_intents(&done, &kept)?;
+        txn.commit()?;
+        Ok(Outcome::Applied(wire(first.expect("at least one entry"))))
     }
 
     fn watch(&mut self) -> Option<Receiver<Hint>> {
@@ -449,7 +547,7 @@ impl Step {
 
 /// The logical precondition, against the index. `Some(reason)` if it fails.
 fn check(
-    txn: &WriteTxn,
+    txn: &ReadTxn,
     path: &RelPath,
     cur: Option<&Entry>,
     pre: &Precondition,
@@ -520,6 +618,14 @@ fn expected(root: &Root, path: &RelPath, entry: &Entry) -> Result<Option<Expecte
         },
         Kind::Tombstone | Kind::Unmanaged(_) => return Ok(None),
     }))
+}
+
+fn log_recovered(intent: &Intent, rep: &Recovered) {
+    if let Some(why) = rep.skipped {
+        tracing::warn!(path = %intent.path, why, "cannot replay intent; its reserved names are left alone");
+    } else if *rep != Recovered::default() {
+        tracing::info!(path = %intent.path, op = ?intent.op, ?rep, "replayed intent");
+    }
 }
 
 /// For a streaming read of a followed link's referent: the link must still
@@ -1314,6 +1420,64 @@ mod tests {
         invalid_op(fx.apply("f", mkdir, Precondition::matching(&f)));
         assert_eq!(fs::read(fx.p("f")).unwrap(), b"x");
         assert!(fx.p("d").is_dir());
+    }
+
+    #[test]
+    fn intents_finish_with_the_index_and_replay_on_open() {
+        use crate::index::IntentState;
+        let mut fx = Fx::new();
+        let mut q = Quarantine::new(ME, Duration::from_secs(3600));
+        std::mem::swap(&mut fx.r.quarantine, &mut q);
+        let pending = |fx: &Fx| fx.r.index().journal().pending().unwrap();
+
+        // A create is done with its index update.
+        let e = applied(fx.write("f", b"one", Precondition::Absent, peer(1)));
+        assert!(pending(&fx).is_empty());
+        // A replace keeps its intent while the old inode is quarantined.
+        applied(fx.write("f", b"two", Precondition::matching(&e), peer(2)));
+        let p = pending(&fx);
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].1.state, IntentState::Quarantined);
+        assert_eq!(fx.r.quarantine().len(), 1);
+
+        // After a restart the old inode is quarantined again.
+        let (dir, state) = (fx.dir.path().to_path_buf(), fx._state.path().to_path_buf());
+        let cfg = fx.r.config().clone();
+        drop(std::mem::replace(
+            &mut fx.r,
+            LocalReplica::open(&cfg, tempfile::tempdir().unwrap().path()).unwrap(),
+        ));
+        // A crashed commit's staged file, recorded but never finished.
+        let staged = dir.join(".~fsync.00000000000000aa");
+        fs::write(&staged, b"partial").unwrap();
+        {
+            let index = IndexStore::open(&IndexStore::path_for(&state, ME), ME).unwrap();
+            let root = Root::open(&dir).unwrap();
+            index
+                .journal()
+                .begin(&Intent {
+                    op: crate::index::IntentOp::Create,
+                    path: rp("g"),
+                    parent: Fingerprint::of_fd(root.fd()).unwrap(),
+                    tmp: b".~fsync.00000000000000aa".to_vec(),
+                    old: None,
+                    expected: None,
+                    staged: None,
+                    state: IntentState::Started,
+                })
+                .unwrap();
+        }
+        fx.r = LocalReplica::open(&cfg, &state)
+            .unwrap()
+            .quarantine_grace(Duration::ZERO);
+        assert!(!staged.exists());
+        assert_eq!(fx.r.quarantine().len(), 1);
+        assert_eq!(pending(&fx).len(), 1);
+        let report = fx.r.sweep_quarantine();
+        assert_eq!((report.removed, report.finished.len()), (1, 1));
+        assert!(pending(&fx).is_empty());
+        assert_eq!(fs::read(fx.p("f")).unwrap(), b"two");
+        assert!(fx.leftovers().is_empty());
     }
 
     #[test]

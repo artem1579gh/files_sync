@@ -7,11 +7,13 @@
 //! - `by_seq`: seq → path bytes. Holds exactly one row per entry, at its
 //!   current seq, so `changes_since` is a range scan.
 //! - `meta`: schema version, replica ID, next seq, max counter.
+//! - `intents`: the commit journal ([`Journal`], design §5.8).
 //!
 //! Every write goes through a [`WriteTxn`]; the single-op helpers on
 //! [`IndexStore`] open one per call.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use redb::{
     Database, ReadOnlyTable, ReadTransaction, ReadableDatabase, ReadableTable,
@@ -23,6 +25,7 @@ use crate::config::ReplicaId;
 use crate::error::{Error, Result};
 use crate::fs::RelPath;
 use crate::index::entry::{Entry, LocalMeta};
+use crate::index::journal::{INTENTS, Journal};
 
 const ENTRIES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("entries");
 const BY_SEQ: TableDefinition<u64, &[u8]> = TableDefinition::new("by_seq");
@@ -63,7 +66,8 @@ fn decode(key: &[u8], value: &[u8]) -> Result<(RelPath, Entry)> {
 
 /// The index of one replica.
 pub struct IndexStore {
-    db: Database,
+    db: Arc<Database>,
+    journal: Journal,
     path: PathBuf,
     replica: ReplicaId,
 }
@@ -92,6 +96,7 @@ impl IndexStore {
             let mut meta = txn.open_table(META).map_err(dberr)?;
             let entries = txn.open_table(ENTRIES).map_err(dberr)?;
             txn.open_table(BY_SEQ).map_err(dberr)?;
+            txn.open_table(INTENTS).map_err(dberr)?;
             match get_meta(&meta, META_SCHEMA)? {
                 None => {
                     if !entries.is_empty().map_err(dberr)? {
@@ -125,7 +130,9 @@ impl IndexStore {
             }
         }
         txn.commit().map_err(dberr)?;
+        let db = Arc::new(db);
         Ok(IndexStore {
+            journal: Journal::new(db.clone()),
             db,
             path: path.to_owned(),
             replica,
@@ -138,6 +145,11 @@ impl IndexStore {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The commit journal, in the same database.
+    pub fn journal(&self) -> &Journal {
+        &self.journal
     }
 
     /// A consistent read-only snapshot.
@@ -261,6 +273,10 @@ impl WriteTxn {
             next_seq,
             max_counter,
         })
+    }
+
+    pub(crate) fn raw(&self) -> &WriteTransaction {
+        &self.txn
     }
 
     fn entries(&self) -> Result<Table<'_, &'static [u8], &'static [u8]>> {

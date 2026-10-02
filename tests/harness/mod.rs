@@ -30,7 +30,10 @@ pub const ID_B: ReplicaId = ReplicaId(0x2222_bbbb_0000_0002);
 
 /// One replica: its directory (the user's view) and the `LocalReplica`.
 pub struct Tree {
-    dir: tempfile::TempDir,
+    root: PathBuf,
+    /// Removes the directory on drop, unless the pair was opened at
+    /// existing directories.
+    _dir: Option<tempfile::TempDir>,
     pub replica: LocalReplica,
 }
 
@@ -40,7 +43,25 @@ pub struct Pair {
     pub b: Tree,
     pub engine: Engine,
     policy: SymlinkPolicy,
-    _state: tempfile::TempDir,
+    state: PathBuf,
+    _state: Option<tempfile::TempDir>,
+}
+
+/// Opens the replica `id` rooted at `root`, with its index in `state`.
+pub fn open_replica(
+    root: &Path,
+    state: &Path,
+    id: ReplicaId,
+    policy: SymlinkPolicy,
+) -> LocalReplica {
+    let mut cfg = ReplicaConfig::new(root.canonicalize().unwrap()).unwrap();
+    cfg.id = id;
+    cfg.symlinks = policy;
+    LocalReplica::open(&cfg, state)
+        .unwrap()
+        // Old inodes are unlinked by the first sweep, so
+        // `assert_converged` can demand a tree without leftovers.
+        .quarantine_grace(Duration::ZERO)
 }
 
 impl Pair {
@@ -49,22 +70,73 @@ impl Pair {
         let state = tempfile::tempdir().unwrap();
         let tree = |id| {
             let dir = tempfile::tempdir().unwrap();
-            let mut cfg = ReplicaConfig::new(dir.path().canonicalize().unwrap()).unwrap();
-            cfg.id = id;
-            cfg.symlinks = policy;
-            let replica = LocalReplica::open(&cfg, state.path())
-                .unwrap()
-                // Old inodes are unlinked by the first sweep, so
-                // `assert_converged` can demand a tree without leftovers.
-                .quarantine_grace(Duration::ZERO);
-            Tree { dir, replica }
+            let replica = open_replica(dir.path(), state.path(), id, policy);
+            Tree {
+                root: dir.path().to_path_buf(),
+                _dir: Some(dir),
+                replica,
+            }
         };
         Pair {
             a: tree(ID_A),
             b: tree(ID_B),
             engine: Engine::new(),
             policy,
-            _state: state,
+            state: state.path().to_path_buf(),
+            _state: Some(state),
+        }
+    }
+
+    /// Opens the replicas of existing directories, which are left in place
+    /// when the pair is dropped (for a child process of a crash test).
+    pub fn open_at(a: &Path, b: &Path, state: &Path, policy: SymlinkPolicy) -> Pair {
+        let tree = |root: &Path, id| Tree {
+            root: root.to_path_buf(),
+            _dir: None,
+            replica: open_replica(root, state, id, policy),
+        };
+        Pair {
+            a: tree(a, ID_A),
+            b: tree(b, ID_B),
+            engine: Engine::new(),
+            policy,
+            state: state.to_path_buf(),
+            _state: None,
+        }
+    }
+
+    /// The roots of A and B, and the state directory.
+    pub fn dirs(&self) -> [PathBuf; 3] {
+        [self.a.root.clone(), self.b.root.clone(), self.state.clone()]
+    }
+
+    /// Closes both replicas while `f` runs (another process may open them),
+    /// then opens them again, which replays their journals.
+    pub fn reopen_after(self, f: impl FnOnce()) -> Pair {
+        let Pair {
+            a,
+            b,
+            engine,
+            policy,
+            state,
+            _state,
+        } = self;
+        let (ida, idb) = (a.replica.id(), b.replica.id());
+        let close = |t: Tree| (t.root, t._dir);
+        let (a, b) = (close(a), close(b));
+        f();
+        let open = |(root, dir): (PathBuf, Option<tempfile::TempDir>), id| Tree {
+            replica: open_replica(&root, &state, id, policy),
+            root,
+            _dir: dir,
+        };
+        Pair {
+            a: open(a, ida),
+            b: open(b, idb),
+            engine,
+            policy,
+            state,
+            _state,
         }
     }
 
@@ -246,11 +318,11 @@ pub enum Node {
 
 impl Tree {
     pub fn root(&self) -> &Path {
-        self.dir.path()
+        &self.root
     }
 
     pub fn path(&self, rel: &str) -> PathBuf {
-        self.dir.path().join(rel)
+        self.root.join(rel)
     }
 
     pub fn id(&self) -> ReplicaId {

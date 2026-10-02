@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 use crate::fs::root::{open_beneath, unstable_reason, validate_name};
 
 /// Object type, from `st_mode`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum FileKind {
     File,
     Dir,
@@ -34,7 +34,7 @@ impl FileKind {
 }
 
 /// What `statx` says about one inode, enough to notice any change to it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Fingerprint {
     pub dev: u64,
     pub ino: u64,

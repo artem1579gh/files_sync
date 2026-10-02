@@ -28,6 +28,10 @@ hooks = []
 name = "attack"
 required-features = ["hooks"]
 
+[[test]]
+name = "crash"
+required-features = ["hooks"]
+
 [dev-dependencies]
 proptest = "1.11.0"
 tempfile = "3.27.0"

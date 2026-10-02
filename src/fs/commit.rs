@@ -28,6 +28,10 @@
 //! the same directory (§5.3 step 5). Nothing is ever written in place, and nothing is unlinked unless
 //! it is verified to be ours or a verified, quarantined old inode.
 //!
+//! Before a commit creates a reserved name, or moves a user object to one, it
+//! records an intent in the [`Journal`] (§5.3 step 1, §5.8). [`recover`]
+//! replays an intent left over from a crash.
+//!
 //! Every step boundary calls [`point`](crate::fs::hooks::point) so tests can inject races.
 
 use std::io::{self, Read};
@@ -45,6 +49,7 @@ use crate::fs::hooks::point;
 use crate::fs::root::{RESOLVE, RelPath, Root, path_err};
 use crate::fs::stat::{Discard, FileKind, Fingerprint, stable_read};
 use crate::fs::tmpname::{self, TmpId, TmpKind};
+use crate::index::journal::{Intent, IntentId, IntentOp, IntentState, Journal};
 
 /// Everything a commit needs to know about the replica it modifies.
 #[derive(Clone, Copy, Debug)]
@@ -53,6 +58,9 @@ pub struct Ctx<'a> {
     pub caps: &'a Caps,
     /// Used in conflict-copy names (§6.2).
     pub replica: ReplicaId,
+    /// Where commits record their intents (§5.8). The caller finishes them
+    /// ([`Journal::take_open`]).
+    pub journal: &'a Journal,
 }
 
 /// Metadata set on a new file before it is committed.
@@ -64,7 +72,7 @@ pub struct FileMeta {
 }
 
 /// The state a replace expects to find at the target name (§5.3 step 4(a)).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Expected {
     /// The indexed fingerprint: ino, kind, size, mtime and ctime must match.
     pub fp: Fingerprint,
@@ -107,7 +115,7 @@ pub const REHASH_BELOW: u64 = 1 << 20;
 
 /// Permission bits we set: setuid and setgid are stripped (§3).
 const MODE_MASK: u32 = 0o1777;
-/// Attempts at finding a free random reserved name, or a free conflict name.
+/// Attempts at finding a free conflict name.
 const NAME_RETRIES: i64 = 16;
 
 // ---------------------------------------------------------------------------
@@ -130,7 +138,8 @@ pub fn create_file(
     if t.stat(t.name)?.is_some() {
         return Ok(Outcome::PreconditionFailed("name exists"));
     }
-    let staged = match stage_file(&t, ctx.caps, content, meta, expected_hash)? {
+    let mut rec = Record::new(ctx.journal, IntentOp::Create, &t, None)?;
+    let staged = match stage_file(&t, ctx.caps, &mut rec, content, meta, expected_hash)? {
         Ok(staged) => staged,
         Err(reason) => return Ok(Outcome::PreconditionFailed(reason)),
     };
@@ -144,7 +153,8 @@ pub fn create_symlink(ctx: &Ctx<'_>, path: &RelPath, target: &[u8]) -> Result<Ou
     if t.stat(t.name)?.is_some() {
         return Ok(Outcome::PreconditionFailed("name exists"));
     }
-    let staged = stage_symlink(&t, target)?;
+    let mut rec = Record::new(ctx.journal, IntentOp::Create, &t, None)?;
+    let staged = stage_symlink(&t, &mut rec, target)?;
     commit_create(&t, staged)
 }
 
@@ -159,7 +169,8 @@ pub fn mkdir(ctx: &Ctx<'_>, path: &RelPath, mode: u32) -> Result<Outcome> {
     if t.stat(t.name)?.is_some() {
         return Ok(Outcome::PreconditionFailed("name exists"));
     }
-    let staged = stage_dir(&t, mode)?;
+    let mut rec = Record::new(ctx.journal, IntentOp::Create, &t, None)?;
+    let staged = stage_dir(&t, &mut rec, mode)?;
     commit_create(&t, staged)
 }
 
@@ -179,11 +190,12 @@ pub fn replace_file(
     if let Some(reason) = precheck(&t, expected)? {
         return Ok(Outcome::PreconditionFailed(reason));
     }
-    let staged = match stage_file(&t, ctx.caps, content, meta, expected_hash)? {
+    let mut rec = Record::new(ctx.journal, IntentOp::Replace, &t, Some(expected))?;
+    let staged = match stage_file(&t, ctx.caps, &mut rec, content, meta, expected_hash)? {
         Ok(staged) => staged,
         Err(reason) => return Ok(Outcome::PreconditionFailed(reason)),
     };
-    commit_replace(ctx, quarantine, &t, staged, expected)
+    commit_replace(ctx, quarantine, &t, staged, expected, &mut rec)
 }
 
 /// Replaces the file or symlink at `path`, which must match `expected`, with
@@ -199,8 +211,9 @@ pub fn replace_symlink(
     if let Some(reason) = precheck(&t, expected)? {
         return Ok(Outcome::PreconditionFailed(reason));
     }
-    let staged = stage_symlink(&t, target)?;
-    commit_replace(ctx, quarantine, &t, staged, expected)
+    let mut rec = Record::new(ctx.journal, IntentOp::Replace, &t, Some(expected))?;
+    let staged = stage_symlink(&t, &mut rec, target)?;
+    commit_replace(ctx, quarantine, &t, staged, expected, &mut rec)
 }
 
 /// Deletes the file or symlink at `path`, which must match `expected` (§5.6).
@@ -220,7 +233,8 @@ pub fn delete(
     if let Some(reason) = precheck(&t, expected)? {
         return Ok(Outcome::PreconditionFailed(reason));
     }
-    commit_delete(ctx, quarantine, &t, expected)
+    let mut rec = Record::new(ctx.journal, IntentOp::Delete, &t, Some(expected))?;
+    commit_delete(ctx, quarantine, &t, expected, &mut rec)
 }
 
 /// Removes the empty directory at `path` (§5.7).
@@ -241,6 +255,7 @@ pub fn rmdir(ctx: &Ctx<'_>, quarantine: &mut Quarantine, path: &RelPath) -> Resu
     };
     point("rmdir.checked");
     let settled = quarantine.settle_dir(&dir);
+    ctx.journal.forget(&settled.finished)?;
     if !settled.conflicts.is_empty() {
         tracing::warn!(path = %t.path, conflicts = ?settled.conflicts, "directory being removed holds conflict copies");
     }
@@ -296,7 +311,8 @@ pub fn rename_to(
     if t.stat(to_name)?.is_some() {
         return Ok(Outcome::PreconditionFailed("new name exists"));
     }
-    commit_rename(ctx, &t, expected, to_name)
+    let mut rec = Record::new(ctx.journal, IntentOp::Rename, &t, Some(expected))?;
+    commit_rename(ctx, &t, expected, to_name, &mut rec)
 }
 
 /// Sets the permission bits of the directory at `path` to `mode` (§5.4).
@@ -357,6 +373,12 @@ struct Target<'a> {
 
 impl<'a> Target<'a> {
     fn resolve(root: &'a Root, path: &'a RelPath) -> Result<Target<'a>> {
+        let t = Target::open(root, path)?;
+        point("commit.resolved");
+        Ok(t)
+    }
+
+    fn open(root: &'a Root, path: &'a RelPath) -> Result<Target<'a>> {
         let (parent, name) = root.resolve_parent(path)?;
         if tmpname::is_reserved(name) {
             return Err(Error::InvalidPath {
@@ -365,7 +387,6 @@ impl<'a> Target<'a> {
             });
         }
         let parent_fp = Fingerprint::of_fd(parent.as_fd())?;
-        point("commit.resolved");
         Ok(Target {
             root,
             path,
@@ -479,69 +500,155 @@ fn precheck(t: &Target<'_>, expected: &Expected) -> Result<Option<&'static str>>
 }
 
 // ---------------------------------------------------------------------------
-// Staging (§5.3 step 2)
+// Journal (§5.3 step 1, §5.8)
 // ---------------------------------------------------------------------------
 
-/// Calls `f` with fresh random reserved names of `kind` until one is free.
-fn with_fresh_name<T>(
-    kind: TmpKind,
-    mut f: impl FnMut(&[u8]) -> rustix::io::Result<T>,
-) -> std::result::Result<(T, Vec<u8>), Errno> {
-    for _ in 0..NAME_RETRIES {
-        let id = TmpId::random().map_err(|_| Errno::IO)?;
-        let name = tmpname::name(kind, id);
-        match f(&name) {
-            Ok(v) => return Ok((v, name)),
-            Err(Errno::EXIST) => continue,
-            Err(e) => return Err(e),
+/// The journal record of one commit. Every reserved name the commit may use
+/// is chosen here, so it is in the journal before it exists on disk.
+struct Record<'j> {
+    journal: &'j Journal,
+    /// `None` until first written.
+    id: Option<IntentId>,
+    intent: Intent,
+}
+
+impl<'j> Record<'j> {
+    fn new(
+        journal: &'j Journal,
+        op: IntentOp,
+        t: &Target<'_>,
+        expected: Option<&Expected>,
+    ) -> Result<Record<'j>> {
+        let fresh = |kind| TmpId::random().map(|id| tmpname::name(kind, id));
+        let tmp = fresh(match op {
+            IntentOp::Delete => TmpKind::Del,
+            _ => TmpKind::Temp,
+        })?;
+        let old = match op {
+            IntentOp::Replace | IntentOp::Delete => Some(fresh(TmpKind::Old)?),
+            IntentOp::Create | IntentOp::Rename => None,
+        };
+        Ok(Record {
+            journal,
+            id: None,
+            intent: Intent {
+                op,
+                path: t.path.clone(),
+                parent: t.parent_fp,
+                tmp,
+                old,
+                expected: expected.copied(),
+                staged: None,
+                state: IntentState::Started,
+            },
+        })
+    }
+
+    /// The staging or move-aside name.
+    fn tmp(&self) -> &[u8] {
+        &self.intent.tmp
+    }
+
+    /// The quarantine name (replace, delete).
+    fn old(&self) -> &[u8] {
+        self.intent
+            .old
+            .as_deref()
+            .expect("replace and delete have a quarantine name")
+    }
+
+    fn id(&self) -> IntentId {
+        self.id.expect("intent recorded")
+    }
+
+    /// Records the intent durably. Called before the first reserved name is
+    /// created or a user object is moved to one.
+    fn begin(&mut self) -> Result<()> {
+        if self.id.is_none() {
+            self.id = Some(self.journal.begin(&self.intent)?);
+            point("journal.started");
+        }
+        Ok(())
+    }
+
+    /// Records the staged object N durably, before anything can be
+    /// exchanged with it. For an `O_TMPFILE` this happens before it is
+    /// linked in, and is the first record. A create never exchanges, so once
+    /// begun it needs no update.
+    fn staged(&mut self, fp: &Fingerprint) -> Result<()> {
+        self.intent.staged = Some(*fp);
+        if self.id.is_some() && self.intent.op == IntentOp::Create {
+            return Ok(());
+        }
+        self.intent.state = IntentState::TempWritten;
+        match self.id {
+            None => self.id = Some(self.journal.begin(&self.intent)?),
+            Some(id) => self.journal.update(id, &self.intent, true)?,
+        }
+        point("journal.temp_written");
+        Ok(())
+    }
+
+    /// The user's object is at our reserved name now. Not durable, and a
+    /// failure is only logged: replay inspects the names whatever the state
+    /// says, and the commit must go on to put the object where it belongs.
+    fn exchanged(&mut self) {
+        self.intent.state = IntentState::Exchanged;
+        if let Err(e) = self.journal.update(self.id(), &self.intent, false) {
+            tracing::warn!(path = %self.intent.path, error = %e, "cannot update intent");
         }
     }
-    Err(Errno::EXIST)
 }
+
+// ---------------------------------------------------------------------------
+// Staging (§5.3 step 2)
+// ---------------------------------------------------------------------------
 
 /// A new file being written in a replica directory, not yet visible.
 ///
 /// It is an unnamed `O_TMPFILE` inode when [`Caps::tmpfile_usable`], else an
-/// `O_CREAT|O_EXCL` file under a reserved temp name. Content is hashed as it
-/// is written. Dropping it before [`TempFile::finish`] removes it.
+/// `O_CREAT|O_EXCL` file under its reserved temp name. Content is hashed as
+/// it is written. Dropping it before [`TempFile::finish`] removes it.
 pub struct TempFile<'p> {
     parent: BorrowedFd<'p>,
     /// Always `Some` until `finish` moves it out.
     fd: Option<OwnedFd>,
-    /// The temp name of a named temp file; `None` for `O_TMPFILE` (until
-    /// linked) and after `finish`.
-    named: Option<Vec<u8>>,
+    /// The reserved name it is (or will be) linked in under.
+    name: Vec<u8>,
+    /// Whether `name` exists: from the start for a named temp file; for
+    /// `O_TMPFILE` only once linked.
+    named: bool,
     link_empty_path: bool,
     hasher: blake3::Hasher,
     size: u64,
 }
 
 impl<'p> TempFile<'p> {
-    pub fn create(parent: BorrowedFd<'p>, caps: &Caps) -> Result<TempFile<'p>> {
+    /// Creates the temp file for the reserved name `name`, which must be
+    /// free (it was chosen at random and journaled before).
+    pub fn create(parent: BorrowedFd<'p>, caps: &Caps, name: &[u8]) -> Result<TempFile<'p>> {
         let mode = Mode::from_raw_mode(0o600);
-        let (fd, named) = if caps.tmpfile_usable() {
-            let fd = rustix::fs::openat2(
+        let named = !caps.tmpfile_usable();
+        let fd = if named {
+            let flags =
+                OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+            rustix::fs::openat2(parent, name, flags, mode, RESOLVE)
+                .map_err(|e| sys_err("create temp file", e))?
+        } else {
+            rustix::fs::openat2(
                 parent,
                 ".",
                 OFlags::TMPFILE | OFlags::WRONLY | OFlags::CLOEXEC,
                 mode,
                 RESOLVE,
             )
-            .map_err(|e| sys_err("create O_TMPFILE", e))?;
-            (fd, None)
-        } else {
-            let flags =
-                OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-            let (fd, name) = with_fresh_name(TmpKind::Temp, |name| {
-                rustix::fs::openat2(parent, name, flags, mode, RESOLVE)
-            })
-            .map_err(|e| sys_err("create temp file", e))?;
-            (fd, Some(name))
+            .map_err(|e| sys_err("create O_TMPFILE", e))?
         };
         point("stage.created");
         Ok(TempFile {
             parent,
             fd: Some(fd),
+            name: name.to_vec(),
             named,
             link_empty_path: caps.linkat_empty_path,
             hasher: blake3::Hasher::new(),
@@ -593,9 +700,14 @@ impl<'p> TempFile<'p> {
         self.size
     }
 
-    /// Sets mode and mtime, fsyncs, and links the file in under a reserved
-    /// temp name. The returned [`Staged`] keeps the fd open, pinning the inode.
-    pub fn finish(mut self, meta: FileMeta) -> Result<Staged<'p>> {
+    /// Sets mode and mtime, fsyncs, calls `record` with the file's
+    /// fingerprint (to journal it) and links the file in under its reserved
+    /// name. The returned [`Staged`] keeps the fd open, pinning the inode.
+    pub fn finish(
+        mut self,
+        meta: FileMeta,
+        record: impl FnOnce(&Fingerprint) -> Result<()>,
+    ) -> Result<Staged<'p>> {
         // On failure before the hand-over below, `self`'s Drop removes a
         // named temp file.
         let fd = self
@@ -615,31 +727,32 @@ impl<'p> TempFile<'p> {
         rustix::fs::futimens(fd, &times).map_err(|e| sys_err("set temp file mtime", e))?;
         rustix::fs::fsync(fd).map_err(|e| sys_err("fsync temp file", e))?;
         point("stage.synced");
+        record(&Fingerprint::of_fd(fd)?)?;
 
-        if self.named.is_none() {
-            let proc_path = format!("/proc/self/fd/{}", fd.as_raw_fd());
-            let ((), name) = with_fresh_name(TmpKind::Temp, |name| {
-                if self.link_empty_path {
-                    rustix::fs::linkat(fd, "", self.parent, name, AtFlags::EMPTY_PATH)
-                } else {
-                    rustix::fs::linkat(
-                        CWD,
-                        proc_path.as_str(),
-                        self.parent,
-                        name,
-                        AtFlags::SYMLINK_FOLLOW,
-                    )
-                }
-            })
-            .map_err(|e| sys_err("link temp file", e))?;
-            self.named = Some(name);
+        if !self.named {
+            let name = self.name.as_slice();
+            let res = if self.link_empty_path {
+                rustix::fs::linkat(fd, "", self.parent, name, AtFlags::EMPTY_PATH)
+            } else {
+                let proc_path = format!("/proc/self/fd/{}", fd.as_raw_fd());
+                rustix::fs::linkat(
+                    CWD,
+                    proc_path.as_str(),
+                    self.parent,
+                    name,
+                    AtFlags::SYMLINK_FOLLOW,
+                )
+            };
+            res.map_err(|e| sys_err("link temp file", e))?;
+            self.named = true;
         }
         let fp = Fingerprint::of_fd(fd)?;
         point("stage.linked");
         // Hand over: from here on `Staged` cleans up, and `self`'s Drop does nothing.
+        self.named = false;
         Ok(Staged {
             parent: self.parent,
-            name: self.named.take().expect("linked above"),
+            name: std::mem::take(&mut self.name),
             fp,
             pin: self.fd.take().expect("TempFile used after finish"),
             live: true,
@@ -650,9 +763,10 @@ impl<'p> TempFile<'p> {
 impl Drop for TempFile<'_> {
     fn drop(&mut self) {
         // An O_TMPFILE inode vanishes with its fd; a named one must be removed.
-        if let (Some(name), Some(fd)) = (self.named.take(), self.fd.as_ref()) {
+        if let (true, Some(fd)) = (self.named, self.fd.as_ref()) {
+            let name = &self.name;
             let res = Fingerprint::of_fd(fd.as_fd())
-                .and_then(|ours| remove_if(self.parent, &name, |f| f.same_file(&ours)));
+                .and_then(|ours| remove_if(self.parent, name, |f| f.same_file(&ours)));
             if let Err(e) = res {
                 tracing::warn!(name = %name.escape_ascii(), error = %e, "cannot remove temp file");
             }
@@ -739,25 +853,32 @@ fn remove_if(
 
 /// Writes `content` to a temp file in the target's directory and links it
 /// in. `Ok(Err(reason))` when the content does not hash to `expected_hash`.
+///
+/// A named temp file exists from the start, so its intent is recorded first;
+/// an `O_TMPFILE` is recorded, with its inode, just before it is linked in.
 fn stage_file<'p>(
     t: &'p Target<'_>,
     caps: &Caps,
+    rec: &mut Record<'_>,
     content: &mut dyn Read,
     meta: FileMeta,
     expected_hash: &[u8; 32],
 ) -> Result<std::result::Result<Staged<'p>, &'static str>> {
-    let mut tmp = TempFile::create(t.parent(), caps)?;
+    if !caps.tmpfile_usable() {
+        rec.begin()?;
+    }
+    let mut tmp = TempFile::create(t.parent(), caps, rec.tmp())?;
     tmp.copy_from(content)?;
     point("stage.written");
     if tmp.hash() != *expected_hash {
         return Ok(Err("content hash mismatch"));
     }
-    tmp.finish(meta).map(Ok)
+    tmp.finish(meta, |fp| rec.staged(fp)).map(Ok)
 }
 
 /// `symlinkat(target, parent, tmp)`, then pins the link and checks it is the
 /// one we made.
-fn stage_symlink<'p>(t: &'p Target<'_>, target: &[u8]) -> Result<Staged<'p>> {
+fn stage_symlink<'p>(t: &'p Target<'_>, rec: &mut Record<'_>, target: &[u8]) -> Result<Staged<'p>> {
     if target.is_empty() || target.contains(&0) {
         return Err(Error::io(
             format!("symlink {}", t.path),
@@ -768,10 +889,10 @@ fn stage_symlink<'p>(t: &'p Target<'_>, target: &[u8]) -> Result<Staged<'p>> {
         ));
     }
     let parent = t.parent();
-    let ((), name) = with_fresh_name(TmpKind::Temp, |name| {
-        rustix::fs::symlinkat(target, parent, name)
-    })
-    .map_err(|e| t.err("create temp symlink for", e))?;
+    rec.begin()?;
+    let name = rec.tmp().to_vec();
+    rustix::fs::symlinkat(target, parent, name.as_slice())
+        .map_err(|e| t.err("create temp symlink for", e))?;
     point("stage.linked");
     // O_PATH|O_NOFOLLOW opens the link itself, despite RESOLVE_NO_SYMLINKS.
     let pin = rustix::fs::openat2(
@@ -791,22 +912,24 @@ fn stage_symlink<'p>(t: &'p Target<'_>, target: &[u8]) -> Result<Staged<'p>> {
             reason: "temp symlink replaced before it was pinned",
         });
     }
-    Ok(Staged {
+    let staged = Staged {
         parent,
         name,
         fp,
         pin,
         live: true,
-    })
+    };
+    rec.staged(&fp)?;
+    Ok(staged)
 }
 
 /// `mkdirat(parent, tmp, 0700)`, then pins the directory and sets its mode.
-fn stage_dir<'p>(t: &'p Target<'_>, mode: u32) -> Result<Staged<'p>> {
+fn stage_dir<'p>(t: &'p Target<'_>, rec: &mut Record<'_>, mode: u32) -> Result<Staged<'p>> {
     let parent = t.parent();
-    let ((), name) = with_fresh_name(TmpKind::Temp, |name| {
-        rustix::fs::mkdirat(parent, name, Mode::from_raw_mode(0o700))
-    })
-    .map_err(|e| t.err("create temp directory for", e))?;
+    rec.begin()?;
+    let name = rec.tmp().to_vec();
+    rustix::fs::mkdirat(parent, name.as_slice(), Mode::from_raw_mode(0o700))
+        .map_err(|e| t.err("create temp directory for", e))?;
     point("stage.linked");
     let pin = rustix::fs::openat2(
         parent,
@@ -864,6 +987,7 @@ fn commit_replace(
     t: &Target<'_>,
     mut staged: Staged<'_>,
     expected: &Expected,
+    rec: &mut Record<'_>,
 ) -> Result<Outcome> {
     // (a) Pin the old inode and check it against the index.
     point("replace.before_pin");
@@ -896,6 +1020,7 @@ fn commit_replace(
         }
         Err(e) => return Err(t.err("exchange", e)),
     }
+    rec.exchanged();
     point("replace.after_exchange");
 
     // (d) Verify what came out.
@@ -903,7 +1028,7 @@ fn commit_replace(
         Verified::Unchanged => {
             point("replace.verified");
             // (f) Quarantine the old inode.
-            quarantine.add(t, &staged.name, old, pin)?;
+            quarantine.add(t, &staged.name, rec.old(), old, pin, rec.id())?;
             point("replace.quarantined");
         }
         Verified::Gone => {
@@ -1051,6 +1176,7 @@ fn commit_delete(
     quarantine: &mut Quarantine,
     t: &Target<'_>,
     expected: &Expected,
+    rec: &mut Record<'_>,
 ) -> Result<Outcome> {
     // 1. Pin the object and check it against the index.
     point("delete.before_pin");
@@ -1060,17 +1186,24 @@ fn commit_delete(
     };
     point("delete.pinned");
 
+    rec.begin()?;
     // T18: take an F_WRLCK lease here when `ctx.caps.leases`.
     point("delete.before_rename");
 
     // 2. Move it aside; NOREPLACE so a reserved name is never overwritten.
-    let del = match with_fresh_name(TmpKind::Del, |del| {
-        rustix::fs::renameat_with(t.parent(), t.name, t.parent(), del, RenameFlags::NOREPLACE)
-    }) {
-        Ok(((), del)) => del,
+    let del = rec.tmp().to_vec();
+    match rustix::fs::renameat_with(
+        t.parent(),
+        t.name,
+        t.parent(),
+        del.as_slice(),
+        RenameFlags::NOREPLACE,
+    ) {
+        Ok(()) => {}
         Err(Errno::NOENT) => return Ok(Outcome::PreconditionFailed("name removed")),
         Err(e) => return Err(t.err("move aside for delete", e)),
-    };
+    }
+    rec.exchanged();
     point("delete.after_rename");
 
     // 3. Verify what was moved.
@@ -1078,7 +1211,7 @@ fn commit_delete(
         Verified::Unchanged => {
             point("delete.verified");
             // 4. Quarantine rather than unlink, for writers holding an fd.
-            quarantine.add(t, &del, old, pin)?;
+            quarantine.add(t, &del, rec.old(), old, pin, rec.id())?;
             point("delete.quarantined");
         }
         Verified::Gone => {
@@ -1097,7 +1230,13 @@ fn commit_delete(
 // Rename to a conflict name (§6.2)
 // ---------------------------------------------------------------------------
 
-fn commit_rename(ctx: &Ctx<'_>, t: &Target<'_>, expected: &Expected, to: &[u8]) -> Result<Outcome> {
+fn commit_rename(
+    ctx: &Ctx<'_>,
+    t: &Target<'_>,
+    expected: &Expected,
+    to: &[u8],
+    rec: &mut Record<'_>,
+) -> Result<Outcome> {
     // 1. Pin the object and check it against the index.
     point("rename.before_pin");
     let (_pin, old) = match pin_expected(t, expected)? {
@@ -1106,18 +1245,25 @@ fn commit_rename(ctx: &Ctx<'_>, t: &Target<'_>, expected: &Expected, to: &[u8]) 
     };
     point("rename.pinned");
 
+    rec.begin()?;
     // T18: take an F_WRLCK lease here when `ctx.caps.leases`.
     point("rename.before_rename");
 
     // 2. Move it aside to a reserved name, so what we verify next can only
     //    be the object we moved.
-    let tmp = match with_fresh_name(TmpKind::Temp, |tmp| {
-        rustix::fs::renameat_with(t.parent(), t.name, t.parent(), tmp, RenameFlags::NOREPLACE)
-    }) {
-        Ok(((), tmp)) => tmp,
+    let tmp = rec.tmp().to_vec();
+    match rustix::fs::renameat_with(
+        t.parent(),
+        t.name,
+        t.parent(),
+        tmp.as_slice(),
+        RenameFlags::NOREPLACE,
+    ) {
+        Ok(()) => {}
         Err(Errno::NOENT) => return Ok(Outcome::PreconditionFailed("name removed")),
         Err(e) => return Err(t.err("move aside for rename", e)),
-    };
+    }
+    rec.exchanged();
     point("rename.after_rename");
 
     // 3. Verify what was moved; put it back if it was modified.
@@ -1195,6 +1341,204 @@ fn sys_err(what: &str, e: Errno) -> Error {
 }
 
 // ---------------------------------------------------------------------------
+// Recovery (§5.8)
+// ---------------------------------------------------------------------------
+
+/// What [`recover`] did with one intent.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Recovered {
+    /// Our own staged objects removed.
+    pub removed: usize,
+    /// Old inodes put (back) into the quarantine.
+    pub quarantined: usize,
+    /// User objects moved back to their name.
+    pub restored: usize,
+    /// User objects kept under these conflict names instead.
+    pub conflicts: Vec<RelPath>,
+    /// Foreign objects found at the intent's reserved names, left alone.
+    pub foreign: usize,
+    /// Why the intent was not replayed: its directory was moved, removed or
+    /// replaced, so its names are out of reach. Nothing was touched.
+    pub skipped: Option<&'static str>,
+}
+
+/// Replays the journal intent `id` of a commit that did not finish (a crash,
+/// or an error on the way), as §5.8 describes. It inspects every reserved
+/// name the intent recorded, whatever its state:
+///
+/// - our staged object N is removed. Before N is recorded
+///   ([`IntentState::Started`]) nothing of the user's can be at the staging
+///   name yet, so whatever is there is ours;
+/// - the expected old object O at the staging name (after an exchange) or
+///   the `.del.` name is verified as in §5.3 step 4(d): unchanged, it is
+///   quarantined as the commit would have done (roll forward); modified, it
+///   goes back to the name, by exchanging back if the name still holds N
+///   (step (e)), else with `RENAME_NOREPLACE` or under a conflict name;
+/// - any other object there is user data and goes back the same way. A
+///   rename's moved-aside object always goes back to its name;
+/// - O at the quarantine name is quarantined again, with a fresh grace
+///   period (whoever wrote to it may still hold an fd).
+///
+/// Replaying is idempotent: an intent that already finished finds its names
+/// empty. Afterwards the intent is done unless `quarantine` [holds] it.
+///
+/// [holds]: Quarantine::holds
+pub fn recover(
+    ctx: &Ctx<'_>,
+    quarantine: &mut Quarantine,
+    id: IntentId,
+    intent: &Intent,
+) -> Result<Recovered> {
+    let mut rep = Recovered::default();
+    if quarantine.holds(id) {
+        // The commit got as far as quarantining; nothing else is left.
+        return Ok(rep);
+    }
+    let t = match Target::open(ctx.root, &intent.path) {
+        Ok(t) if t.parent_fp.same_file(&intent.parent) => t,
+        Ok(_) => {
+            rep.skipped = Some("directory replaced");
+            return Ok(rep);
+        }
+        Err(e) if e.is_unstable() || e.is_not_found() => {
+            rep.skipped = Some("directory moved or removed");
+            return Ok(rep);
+        }
+        Err(e) => return Err(e),
+    };
+    point("recover.resolved");
+    let tmp = intent.tmp.as_slice();
+    match (intent.op, inspect(&t, tmp, intent)?) {
+        (_, Found::Absent) => {}
+        (IntentOp::Create | IntentOp::Replace, Found::Staged) => remove_ours(&t, tmp, &mut rep)?,
+        // Recorded before anything was exchanged: only ours can be there.
+        (IntentOp::Create | IntentOp::Replace, Found::Other) if intent.staged.is_none() => {
+            remove_ours(&t, tmp, &mut rep)?
+        }
+        (IntentOp::Create, _) => {
+            tracing::warn!(path = %t.path, name = %tmp.escape_ascii(), "foreign object at a reserved name; left alone");
+            rep.foreign += 1;
+        }
+        (IntentOp::Replace | IntentOp::Delete, Found::Expected(pin)) => {
+            let exp = intent.expected.as_ref().expect("found the expected object");
+            match verify_old(&t, tmp, &exp.fp, exp, "recover.before_rehash") {
+                Verified::Unchanged => {
+                    quarantine.add(&t, tmp, quarantine_name(intent), exp.fp, pin, id)?;
+                    rep.quarantined += 1;
+                }
+                Verified::Changed => put_back(ctx, &t, tmp, intent, &mut rep)?,
+                Verified::Gone => {}
+            }
+        }
+        _ => put_back(ctx, &t, tmp, intent, &mut rep)?,
+    }
+    // The quarantine name, unless the old inode just went there.
+    if let Some(old) = intent.old.as_deref().filter(|_| !quarantine.holds(id)) {
+        match inspect(&t, old, intent)? {
+            Found::Absent => {}
+            Found::Expected(pin) => {
+                let exp = intent.expected.as_ref().expect("found the expected object");
+                quarantine.add(&t, old, old, exp.fp, pin, id)?;
+                rep.quarantined += 1;
+            }
+            Found::Staged | Found::Other => {
+                tracing::warn!(path = %t.path, name = %old.escape_ascii(), "foreign object at a quarantine name; left alone");
+                rep.foreign += 1;
+            }
+        }
+    }
+    point("recover.done");
+    Ok(rep)
+}
+
+/// What a reserved name of an intent holds.
+enum Found {
+    Absent,
+    /// The staged object N, unchanged.
+    Staged,
+    /// The expected old object O (any size or mtime), pinned.
+    Expected(OwnedFd),
+    Other,
+}
+
+fn inspect(t: &Target<'_>, name: &[u8], intent: &Intent) -> Result<Found> {
+    let Some(fp) = t.stat(name)? else {
+        return Ok(Found::Absent);
+    };
+    if intent.staged.is_some_and(|n| same_object(&n, &fp)) {
+        return Ok(Found::Staged);
+    }
+    if let Some(exp) = intent.expected.filter(|e| e.fp.same_file(&fp)) {
+        let pin = rustix::fs::openat2(
+            t.parent(),
+            name,
+            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+            RESOLVE,
+        );
+        // Re-checked through the pin, so the inode cannot change under us.
+        if let Ok(pin) = pin
+            && Fingerprint::of_fd(pin.as_fd())?.same_file(&exp.fp)
+        {
+            return Ok(Found::Expected(pin));
+        }
+    }
+    Ok(Found::Other)
+}
+
+fn quarantine_name(intent: &Intent) -> &[u8] {
+    intent.old.as_deref().unwrap_or(&intent.tmp)
+}
+
+/// Removes our own object at `name` (a directory only if empty).
+fn remove_ours(t: &Target<'_>, name: &[u8], rep: &mut Recovered) -> Result<()> {
+    match remove_if(t.parent(), name, |_| true) {
+        Ok(true) => rep.removed += 1,
+        Ok(false) => {}
+        Err(e) => {
+            // A directory of ours that someone filled: keep it.
+            tracing::warn!(path = %t.path, name = %name.escape_ascii(), error = %e, "cannot remove staged object");
+            rep.foreign += 1;
+        }
+    }
+    Ok(())
+}
+
+/// The user object at our reserved name `from` goes back to the target name:
+/// by exchanging back if the name still holds our staged object (which then
+/// is removed), else with `RENAME_NOREPLACE`, or under a conflict name.
+fn put_back(
+    ctx: &Ctx<'_>,
+    t: &Target<'_>,
+    from: &[u8],
+    intent: &Intent,
+    rep: &mut Recovered,
+) -> Result<()> {
+    if let Some(n) = intent.staged
+        && t.stat(t.name)?.is_some_and(|fp| same_object(&n, &fp))
+    {
+        rustix::fs::renameat_with(t.parent(), from, t.parent(), t.name, RenameFlags::EXCHANGE)
+            .map_err(|e| t.err("undo exchange of", e))?;
+        point("recover.undone");
+        rep.restored += 1;
+        return match t.stat(from)? {
+            Some(back) if same_object(&n, &back) => remove_ours(t, from, rep),
+            Some(back) => {
+                rep.conflicts
+                    .push(t.preserve(ctx.replica, from, back.kind)?);
+                Ok(())
+            }
+            None => Ok(()),
+        };
+    }
+    match restore(ctx, t, from)? {
+        Outcome::Preserved { conflict } => rep.conflicts.push(conflict),
+        _ => rep.restored += 1,
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Quarantine (§5.3 step 4(f))
 // ---------------------------------------------------------------------------
 
@@ -1206,6 +1550,10 @@ fn sys_err(what: &str, e: Errno) -> Error {
 /// its grace period has passed with mtime and size unchanged; if it changed,
 /// [`Quarantine::sweep`] renames it to a conflict copy instead. (T18 adds the
 /// faster path: unlink as soon as a write lease can be taken.)
+///
+/// Each entry belongs to an intent in the journal, which outlives a crash
+/// (§5.8): the caller keeps it while [`Quarantine::holds`] it, and forgets it
+/// once a sweep reports it [`finished`](SweepReport::finished).
 pub struct Quarantine {
     replica: ReplicaId,
     grace: Duration,
@@ -1229,7 +1577,10 @@ struct Pending {
     fp: Fingerprint,
     /// Keeps the inode number from being reused while we compare it.
     _pin: OwnedFd,
-    deadline: Instant,
+    /// When the grace period started.
+    since: Instant,
+    /// The journal intent that records this entry.
+    intent: IntentId,
 }
 
 /// What a [`Quarantine::sweep`] did.
@@ -1242,6 +1593,9 @@ pub struct SweepReport {
     /// Entries forgotten because their name vanished or holds a foreign
     /// object (which is left alone).
     pub dropped: usize,
+    /// The journal intents of every entry that was settled (removed, made a
+    /// conflict copy or dropped); their records can go.
+    pub finished: Vec<IntentId>,
 }
 
 enum Verdict {
@@ -1271,22 +1625,53 @@ impl Quarantine {
         self.pending.is_empty()
     }
 
-    /// When the earliest entry becomes due for unlinking.
-    pub fn next_deadline(&self) -> Option<Instant> {
-        self.pending.iter().map(|p| p.deadline).min()
+    pub fn grace(&self) -> Duration {
+        self.grace
     }
 
-    /// Moves the old inode at the target's temp name `tmp` to a quarantine
-    /// name and starts its grace period.
-    fn add(&mut self, t: &Target<'_>, tmp: &[u8], old: Fingerprint, pin: OwnedFd) -> Result<()> {
-        let name = match with_fresh_name(TmpKind::Old, |name| {
-            rustix::fs::renameat_with(t.parent(), tmp, t.parent(), name, RenameFlags::NOREPLACE)
-        }) {
-            Ok(((), name)) => name,
-            Err(e) => {
-                // Keep it under the temp name; the sweep handles it all the same.
-                tracing::warn!(path = %t.path, error = %e, "cannot rename old inode to quarantine name");
-                tmp.to_vec()
+    /// Changes the grace period, for the entries already waiting too.
+    pub fn set_grace(&mut self, grace: Duration) {
+        self.grace = grace;
+    }
+
+    /// When the earliest entry becomes due for unlinking.
+    pub fn next_deadline(&self) -> Option<Instant> {
+        self.pending.iter().map(|p| p.since + self.grace).min()
+    }
+
+    /// Whether an entry of the journal intent `id` is waiting.
+    pub fn holds(&self, id: IntentId) -> bool {
+        self.pending.iter().any(|p| p.intent == id)
+    }
+
+    /// Moves the old inode at the target's reserved name `from` to its
+    /// quarantine name `to` (unless it is there already) and starts its grace
+    /// period.
+    fn add(
+        &mut self,
+        t: &Target<'_>,
+        from: &[u8],
+        to: &[u8],
+        old: Fingerprint,
+        pin: OwnedFd,
+        intent: IntentId,
+    ) -> Result<()> {
+        let name = if from == to {
+            to.to_vec()
+        } else {
+            match rustix::fs::renameat_with(
+                t.parent(),
+                from,
+                t.parent(),
+                to,
+                RenameFlags::NOREPLACE,
+            ) {
+                Ok(()) => to.to_vec(),
+                Err(e) => {
+                    // Keep it where it is; the sweep handles it all the same.
+                    tracing::warn!(path = %t.path, error = %e, "cannot rename old inode to quarantine name");
+                    from.to_vec()
+                }
             }
         };
         self.pending.push(Pending {
@@ -1300,7 +1685,8 @@ impl Quarantine {
             name,
             fp: old,
             _pin: pin,
-            deadline: Instant::now() + self.grace,
+            since: Instant::now(),
+            intent,
         });
         Ok(())
     }
@@ -1310,7 +1696,8 @@ impl Quarantine {
     /// wait. Errors are logged and the entry is retried on the next sweep.
     pub fn sweep(&mut self) -> SweepReport {
         let now = Instant::now();
-        self.process(|p| Some(now >= p.deadline))
+        let grace = self.grace;
+        self.process(|p| Some(now >= p.since + grace))
     }
 
     /// Settles every entry in the directory `dir` now, without waiting for
@@ -1328,7 +1715,12 @@ impl Quarantine {
         self.pending.retain(|p| {
             let Some(due) = due(p) else { return true };
             match p.sweep(due, replica, &mut report) {
-                Ok(done) => !done,
+                Ok(done) => {
+                    if done {
+                        report.finished.push(p.intent);
+                    }
+                    !done
+                }
                 Err(e) => {
                     tracing::warn!(dir = %p.dir, name = %p.name.escape_ascii(), error = %e, "quarantine sweep failed");
                     true
@@ -1410,6 +1802,7 @@ mod tests {
         dir: tempfile::TempDir,
         root: Root,
         caps: Caps,
+        journal: Rc<Journal>,
     }
 
     impl Fx {
@@ -1417,7 +1810,13 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let root = Root::open(dir.path()).unwrap();
             let caps = Caps::probe(root.fd()).unwrap();
-            Fx { dir, root, caps }
+            let journal = Rc::new(Journal::in_memory().unwrap());
+            Fx {
+                dir,
+                root,
+                caps,
+                journal,
+            }
         }
 
         /// Without O_TMPFILE: named temp files.
@@ -1432,6 +1831,7 @@ mod tests {
                 root: &self.root,
                 caps: &self.caps,
                 replica: REPLICA,
+                journal: &self.journal,
             }
         }
 
@@ -1692,6 +2092,7 @@ mod tests {
                 "stage.created",
                 "stage.written",
                 "stage.synced",
+                "journal.temp_written",
                 "stage.linked",
                 "create.before_rename",
                 "create.after_rename",
@@ -1795,6 +2196,7 @@ mod tests {
                 "stage.created",
                 "stage.written",
                 "stage.synced",
+                "journal.temp_written",
                 "stage.linked",
                 "replace.before_pin",
                 "replace.pinned",
@@ -2095,6 +2497,7 @@ mod tests {
                 "commit.resolved",
                 "delete.before_pin",
                 "delete.pinned",
+                "journal.started",
                 "delete.before_rename",
                 "delete.after_rename",
                 "delete.before_rehash",
@@ -2388,6 +2791,7 @@ mod tests {
                 "commit.resolved",
                 "rename.before_pin",
                 "rename.pinned",
+                "journal.started",
                 "rename.before_rename",
                 "rename.after_rename",
                 "rename.before_rehash",
@@ -2528,5 +2932,348 @@ mod tests {
         assert!(matches!(out, Err(Error::Unstable { .. })), "{out:?}");
         let mode = |p: &str| fs::symlink_metadata(fx.p(p)).unwrap().permissions().mode() & 0o7777;
         assert_eq!((mode("moved"), mode("d")), (0o700, 0o755));
+    }
+
+    // ----- T15: journal and recovery ------------------------------------------
+
+    /// The single intent the last commit recorded.
+    fn last_intent(fx: &Fx) -> Intent {
+        let open = fx.journal.take_open();
+        assert_eq!(open.len(), 1, "{open:?}");
+        let all = fx.journal.pending().unwrap();
+        all.into_iter().find(|(id, _)| *id == open[0]).unwrap().1
+    }
+
+    #[test]
+    fn commits_record_their_names_before_creating_them() {
+        for fx in [Fx::new(), Fx::named()] {
+            // Every reserved name in the directory, at every step, is one
+            // the journal already holds.
+            let checked = Rc::new(RefCell::new(0));
+            let mut guards = Vec::new();
+            for p in [
+                "stage.created",
+                "stage.written",
+                "stage.synced",
+                "stage.linked",
+                "replace.after_exchange",
+                "replace.verified",
+                "replace.quarantined",
+                "delete.after_rename",
+                "delete.quarantined",
+                "rename.after_rename",
+                "create.before_rename",
+            ] {
+                let (dir, j, n) = (
+                    fx.dir.path().to_path_buf(),
+                    fx.journal.clone(),
+                    checked.clone(),
+                );
+                guards.push(hooks::on(p, move || {
+                    let pending = j.pending().unwrap();
+                    for e in fs::read_dir(&dir).unwrap() {
+                        let name = e.unwrap().file_name();
+                        let name = name.as_encoded_bytes();
+                        if tmpname::is_reserved(name) {
+                            let known = pending
+                                .iter()
+                                .any(|(_, i)| i.tmp == name || i.old.as_deref() == Some(name));
+                            assert!(known, "{p}: {} not journaled", name.escape_ascii());
+                            *n.borrow_mut() += 1;
+                        }
+                    }
+                }));
+            }
+            let exp = fx.user_file("f", b"old");
+            let mut q = Quarantine::new(REPLICA, Duration::from_secs(3600));
+            let fp = applied(replace(&fx, &mut q, "f", &exp, b"new").unwrap());
+            let i = last_intent(&fx);
+            assert_eq!(
+                (i.op, i.state, i.path.clone()),
+                (IntentOp::Replace, IntentState::Exchanged, rp("f"))
+            );
+            assert_eq!(i.expected, Some(exp));
+            assert!(i.staged.is_some_and(|n| same_object(&n, &fp)));
+            assert!(q.holds(1));
+
+            applied(create(&fx, "g", b"g").unwrap());
+            let i = last_intent(&fx);
+            assert_eq!(i.op, IntentOp::Create);
+            // A named temp file is recorded before it exists; an O_TMPFILE
+            // with its inode, just before it is linked in.
+            let want = if fx.caps.tmpfile_usable() {
+                IntentState::TempWritten
+            } else {
+                IntentState::Started
+            };
+            assert_eq!(i.state, want);
+
+            let exp = fx.user_file("h", b"h");
+            assert_eq!(del(&fx, &mut q, "h", &exp).unwrap(), Outcome::Removed);
+            let i = last_intent(&fx);
+            assert_eq!((i.op, i.state), (IntentOp::Delete, IntentState::Exchanged));
+            assert_eq!(tmpname::parse(&i.tmp).map(|(k, _)| k), Some(TmpKind::Del));
+
+            let exp = fx.user_file("r", b"r");
+            applied(ren(&fx, "r", &exp, "r2").unwrap());
+            assert_eq!(last_intent(&fx).op, IntentOp::Rename);
+            applied(mkdir(&fx.ctx(), &rp("d"), 0o755).unwrap());
+            applied(create_symlink(&fx.ctx(), &rp("l"), b"t").unwrap());
+            assert_eq!(fx.journal.take_open().len(), 2);
+            drop(guards);
+            assert!(*checked.borrow() > 0);
+        }
+    }
+
+    const TMP: TmpId = TmpId(0x1111);
+
+    /// An intent for `path` as a crash would leave it, with fixed names.
+    fn crashed(
+        fx: &Fx,
+        op: IntentOp,
+        path: &str,
+        expected: Option<Expected>,
+        staged: Option<Fingerprint>,
+    ) -> Intent {
+        let path = rp(path);
+        Intent {
+            op,
+            parent: fx.root.stat(&path.parent().unwrap()).unwrap(),
+            path,
+            tmp: tmpname::name(
+                if op == IntentOp::Delete {
+                    TmpKind::Del
+                } else {
+                    TmpKind::Temp
+                },
+                TMP,
+            ),
+            old: matches!(op, IntentOp::Replace | IntentOp::Delete).then(|| tmpname::old(TMP)),
+            expected,
+            staged,
+            state: IntentState::Exchanged,
+        }
+    }
+
+    fn tmp_path(fx: &Fx, i: &Intent) -> PathBuf {
+        fx.dir.path().join(std::ffi::OsStr::from_bytes(&i.tmp))
+    }
+
+    fn recov(fx: &Fx, q: &mut Quarantine, i: &Intent) -> Recovered {
+        recover(&fx.ctx(), q, 7, i).unwrap()
+    }
+
+    use std::os::unix::ffi::OsStrExt;
+
+    #[test]
+    fn recover_removes_staged_objects() {
+        let fx = Fx::new();
+        let mut q = quarantine();
+        // Started: whatever is at the staging name is ours (a partial file,
+        // a symlink, an empty directory).
+        let mut i = crashed(&fx, IntentOp::Create, "f", None, None);
+        i.state = IntentState::Started;
+        for make in [
+            &(|p: &Path| fs::write(p, b"partial").unwrap()) as &dyn Fn(&Path),
+            &|p: &Path| symlink("t", p).unwrap(),
+            &|p: &Path| fs::create_dir(p).unwrap(),
+        ] {
+            make(&tmp_path(&fx, &i));
+            assert_eq!(recov(&fx, &mut q, &i).removed, 1);
+            assert!(fx.leftovers().is_empty());
+        }
+        // TempWritten: N is removed; anything else is foreign and stays.
+        fs::write(tmp_path(&fx, &i), b"staged").unwrap();
+        let n = Fingerprint::at(fx.root.fd(), &i.tmp).unwrap();
+        i.staged = Some(n);
+        i.state = IntentState::TempWritten;
+        assert_eq!(recov(&fx, &mut q, &i).removed, 1);
+        fs::write(tmp_path(&fx, &i), b"someone's").unwrap();
+        let rep = recov(&fx, &mut q, &i);
+        assert_eq!((rep.removed, rep.foreign), (0, 1));
+        assert_eq!(fs::read(tmp_path(&fx, &i)).unwrap(), b"someone's");
+        fs::remove_file(tmp_path(&fx, &i)).unwrap();
+        // Finished: nothing to do.
+        assert_eq!(recov(&fx, &mut q, &i), Recovered::default());
+
+        // A replace that never got to the exchange.
+        let exp = fx.user_file("g", b"user");
+        let mut i = crashed(&fx, IntentOp::Replace, "g", Some(exp), None);
+        i.state = IntentState::Started;
+        fs::write(tmp_path(&fx, &i), b"part").unwrap();
+        assert_eq!(recov(&fx, &mut q, &i).removed, 1);
+        assert_eq!(fs::read(fx.p("g")).unwrap(), b"user");
+        assert!(fx.leftovers().is_empty() && q.is_empty());
+    }
+
+    /// Sets up a replace that crashed right after the exchange: N at `name`,
+    /// the user's old file at the staging name.
+    fn exchanged(fx: &Fx, name: &str) -> Intent {
+        let exp = fx.user_file(name, b"old");
+        fs::write(fx.p("n"), b"new").unwrap();
+        let i = crashed(fx, IntentOp::Replace, name, Some(exp), None);
+        fs::rename(fx.p(name), tmp_path(fx, &i)).unwrap();
+        fs::rename(fx.p("n"), fx.p(name)).unwrap();
+        let n = fx.root.stat(&rp(name)).unwrap();
+        Intent {
+            staged: Some(n),
+            ..i
+        }
+    }
+
+    #[test]
+    fn recover_after_exchange_quarantines_unchanged_old_file() {
+        let fx = Fx::new();
+        let mut q = Quarantine::new(REPLICA, Duration::from_secs(3600));
+        let i = exchanged(&fx, "f");
+        let rep = recov(&fx, &mut q, &i);
+        assert_eq!((rep.quarantined, rep.removed), (1, 0));
+        assert!(q.holds(7));
+        assert_eq!(fs::read(fx.p("f")).unwrap(), b"new");
+        let old = fx
+            .dir
+            .path()
+            .join(std::ffi::OsStr::from_bytes(i.old.as_ref().unwrap()));
+        assert_eq!(fs::read(&old).unwrap(), b"old");
+        // Replaying again (another crash) changes nothing.
+        assert_eq!(recov(&fx, &mut q, &i), Recovered::default());
+        q.set_grace(Duration::ZERO);
+        let report = q.sweep();
+        assert_eq!((report.removed, report.finished.clone()), (1, vec![7]));
+        assert!(fx.leftovers().is_empty());
+
+        // A quarantined old inode (state Quarantined) after a restart: a
+        // fresh entry, and a write since becomes a conflict copy.
+        let i = exchanged(&fx, "g.txt");
+        fs::rename(
+            tmp_path(&fx, &i),
+            fx.dir
+                .path()
+                .join(std::ffi::OsStr::from_bytes(i.old.as_ref().unwrap())),
+        )
+        .unwrap();
+        let i = Intent {
+            state: IntentState::Quarantined,
+            ..i
+        };
+        let mut q = Quarantine::new(REPLICA, Duration::from_secs(3600));
+        assert_eq!(recov(&fx, &mut q, &i).quarantined, 1);
+        append(
+            &fx.dir
+                .path()
+                .join(std::ffi::OsStr::from_bytes(i.old.as_ref().unwrap())),
+            b" late",
+        );
+        let report = q.sweep();
+        assert_eq!(report.conflicts.len(), 1);
+        let name = report.conflicts[0].as_os_str().to_str().unwrap().to_owned();
+        assert!(name.starts_with("g.sync-conflict-"), "{name}");
+        assert_eq!(fs::read(fx.p(&name)).unwrap(), b"old late");
+        assert!(fx.leftovers().is_empty());
+    }
+
+    #[test]
+    fn recover_after_exchange_undoes_a_modified_old_file() {
+        let fx = Fx::new();
+        let mut q = quarantine();
+        // Modified after the check: exchanged back, N removed.
+        let i = exchanged(&fx, "f");
+        append(&tmp_path(&fx, &i), b" edited");
+        let rep = recov(&fx, &mut q, &i);
+        assert_eq!((rep.restored, rep.removed, rep.quarantined), (1, 1, 0));
+        assert_eq!(fs::read(fx.p("f")).unwrap(), b"old edited");
+        assert!(fx.leftovers().is_empty() && q.is_empty());
+
+        // The same, but the user replaced N since: both are kept.
+        let i = exchanged(&fx, "g.txt");
+        append(&tmp_path(&fx, &i), b" edited");
+        fs::remove_file(fx.p("g.txt")).unwrap();
+        fs::write(fx.p("g.txt"), b"user's newer").unwrap();
+        let rep = recov(&fx, &mut q, &i);
+        assert_eq!(rep.conflicts.len(), 1);
+        assert_eq!(fs::read(fx.p("g.txt")).unwrap(), b"user's newer");
+        assert_eq!(
+            fs::read(fx.p(rep.conflicts[0].as_os_str().to_str().unwrap())).unwrap(),
+            b"old edited"
+        );
+
+        // Another object swapped in before the exchange: it is user data.
+        let i = exchanged(&fx, "h");
+        fs::remove_file(tmp_path(&fx, &i)).unwrap();
+        fs::write(tmp_path(&fx, &i), b"swapped in").unwrap();
+        assert_eq!(recov(&fx, &mut q, &i).restored, 1);
+        assert_eq!(fs::read(fx.p("h")).unwrap(), b"swapped in");
+        assert!(fx.leftovers().is_empty(), "{:?}", fx.leftovers());
+    }
+
+    #[test]
+    fn recover_moved_aside_objects() {
+        let fx = Fx::new();
+        let mut q = Quarantine::new(REPLICA, Duration::from_secs(3600));
+        // A delete: unchanged → quarantined, as the delete would have.
+        let exp = fx.user_file("f", b"old");
+        let i = crashed(&fx, IntentOp::Delete, "f", Some(exp), None);
+        fs::rename(fx.p("f"), tmp_path(&fx, &i)).unwrap();
+        assert_eq!(recov(&fx, &mut q, &i).quarantined, 1);
+        assert!(!fx.p("f").exists());
+        q.set_grace(Duration::ZERO);
+        assert_eq!(q.sweep().removed, 1);
+
+        // Modified → back at its name; the name taken → a conflict copy.
+        let exp = fx.user_file("g.txt", b"old");
+        let i = crashed(&fx, IntentOp::Delete, "g.txt", Some(exp), None);
+        fs::rename(fx.p("g.txt"), tmp_path(&fx, &i)).unwrap();
+        append(&tmp_path(&fx, &i), b" edited");
+        assert_eq!(recov(&fx, &mut q, &i).restored, 1);
+        assert_eq!(fs::read(fx.p("g.txt")).unwrap(), b"old edited");
+        let exp = Expected::from(fx.root.stat(&rp("g.txt")).unwrap());
+        let i = crashed(&fx, IntentOp::Delete, "g.txt", Some(exp), None);
+        fs::rename(fx.p("g.txt"), tmp_path(&fx, &i)).unwrap();
+        append(&tmp_path(&fx, &i), b" again");
+        fs::write(fx.p("g.txt"), b"re-created").unwrap();
+        let rep = recov(&fx, &mut q, &i);
+        assert_eq!(rep.conflicts.len(), 1);
+        assert_eq!(fs::read(fx.p("g.txt")).unwrap(), b"re-created");
+
+        // A rename always goes back.
+        let exp = fx.user_file("r", b"loser");
+        let i = crashed(&fx, IntentOp::Rename, "r", Some(exp), None);
+        fs::rename(fx.p("r"), tmp_path(&fx, &i)).unwrap();
+        assert_eq!(recov(&fx, &mut q, &i).restored, 1);
+        assert_eq!(fs::read(fx.p("r")).unwrap(), b"loser");
+        assert!(fx.leftovers().is_empty(), "{:?}", fx.leftovers());
+    }
+
+    #[test]
+    fn recover_skips_a_moved_directory_and_foreign_quarantine_names() {
+        let fx = Fx::new();
+        let mut q = quarantine();
+        fs::create_dir(fx.p("d")).unwrap();
+        let exp = fx.user_file("d/f", b"old");
+        let i = crashed(&fx, IntentOp::Delete, "d/f", Some(exp), None);
+        let del = fx.p("d").join(std::ffi::OsStr::from_bytes(&i.tmp));
+        fs::rename(fx.p("d/f"), &del).unwrap();
+        // Moved away, and replaced by another directory.
+        fs::rename(fx.p("d"), fx.p("moved")).unwrap();
+        fs::create_dir(fx.p("d")).unwrap();
+        assert_eq!(recov(&fx, &mut q, &i).skipped, Some("directory replaced"));
+        fs::remove_dir(fx.p("d")).unwrap();
+        assert_eq!(
+            recov(&fx, &mut q, &i).skipped,
+            Some("directory moved or removed")
+        );
+        assert_eq!(fx.leftovers().len(), 1, "left alone");
+
+        // Something else at the quarantine name is not ours.
+        let exp = fx.user_file("g", b"old");
+        let i = crashed(&fx, IntentOp::Replace, "g", Some(exp), None);
+        let old = fx
+            .dir
+            .path()
+            .join(std::ffi::OsStr::from_bytes(i.old.as_ref().unwrap()));
+        fs::write(&old, b"foreign").unwrap();
+        assert_eq!(recov(&fx, &mut q, &i).foreign, 1);
+        assert_eq!(fs::read(&old).unwrap(), b"foreign");
+        assert_eq!(fs::read(fx.p("g")).unwrap(), b"old");
     }
 }

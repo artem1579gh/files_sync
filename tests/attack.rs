@@ -45,6 +45,7 @@ use files_sync::config::ReplicaId;
 use files_sync::fs::caps::Caps;
 use files_sync::fs::commit::{self, Ctx, Expected, FileMeta, Outcome, Quarantine};
 use files_sync::fs::{RelPath, Root, hooks, is_reserved};
+use files_sync::index::Journal;
 
 const REPLICA: ReplicaId = ReplicaId(0x0123456789abcdef);
 const TARGET: &str = "a/b/t";
@@ -194,6 +195,7 @@ struct World {
     away: tempfile::TempDir,
     root: Root,
     caps: Caps,
+    journal: Journal,
     expected: Option<Expected>,
     /// An fd on the user file (`t`, or `c` for `DeleteThenRmdir`).
     held: Option<fs::File>,
@@ -223,6 +225,7 @@ impl World {
             away,
             root,
             caps,
+            journal: Journal::in_memory().unwrap(),
             expected: None,
             held: None,
             tracked: Rc::default(),
@@ -275,6 +278,7 @@ impl World {
             root: &self.root,
             caps: &self.caps,
             replica: REPLICA,
+            journal: &self.journal,
         }
     }
 
@@ -629,8 +633,10 @@ fn attack_op(op: Op) -> usize {
 /// `point("…")` calls plus the rehash points passed to `verify_old`.
 fn commit_points() -> BTreeSet<&'static str> {
     const SRC: &str = include_str!("../src/fs/commit.rs");
-    const PREFIXES: [&str; 9] = [
+    // `recover.*` points are reached by replay only (tests/crash.rs).
+    const PREFIXES: [&str; 10] = [
         "commit",
+        "journal",
         "stage",
         "create",
         "replace",

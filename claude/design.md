@@ -110,7 +110,7 @@ struct LocalMeta { dev, ino, ctime_ns, mnt_id, raw_target: Option<Vec<u8>>, via_
 - **Wire vs. stored form:** `Entry`'s serde form is the wire form; `local` is `#[serde(skip)]`. The store persists `(Entry, LocalMeta)` together. `LinkInfo { ino, ctime_ns, raw_target, out_of_tree }` describes the followed link behind a `via_link` entry. `mode` keeps the sticky bit (`st_mode & 0o1777`, the same mask the commit code uses).
 - **Version vectors** are canonical: sorted by replica, no zero counters, every counter ≤ 2^62 (enforced when decoding, so `bump` cannot overflow). `compare` gives `Ord4 { Equal, Dominates, Dominated, Concurrent }`.
 - **Local change:** the replica's counter becomes `max(all counters) + 1`, as in syncthing. `bump_after(id, floor)` also lifts it above `floor`; the store keeps the largest counter ever stored (`max_counter`, a Lamport clock) for that purpose.
-- **Store (redb):** `entries` (path → postcard `(Entry, LocalMeta)`), `by_seq` (seq → path, exactly one row per entry at its current seq), `meta` (schema version, replica ID, `next_seq`, `max_counter`). Every put gets a fresh seq, starting at 1, so `changes_since(0)` returns everything.
+- **Store (redb):** `entries` (path → postcard `(Entry, LocalMeta)`), `by_seq` (seq → path, exactly one row per entry at its current seq), `meta` (schema version, replica ID, `next_seq`, `max_counter`), `intents` (the commit journal, id → postcard `Intent`, §5.8). Every put gets a fresh seq, starting at 1, so `changes_since(0)` returns everything.
 - **Rehash shortcut:** a file is not rehashed if (ino, size, mtime, ctime) are unchanged (and, for a followed link, the link is the same inode with the same target).
 - **Racily clean entries:** if ctime is within the racy window of the scan start (or later), the entry is marked `racy` and is always rehashed on the next scan. Git uses the same rule. The window defaults to 1 s (`scan::DEFAULT_RACY_WINDOW`), far above a kernel timestamp tick, to absorb the coarse clock's lag.
 - **What counts as a change (scanner):** kind, content hash or target, and mode; plus mtime for **files only**. A directory's mtime moves with every child and a symlink's is set when it is created, so for those an mtime difference alone is not a change; their stored `mtime_ns` is the one seen at the last logical change (used only to pick a conflict winner). A logical change gets `vv.bump_after(local, max_counter)` and a new seq. A change to `LocalMeta` alone (new inode with the same content, ctime, `racy`) is written **in place with the same seq** (`WriteTxn::put_local`), so peers never re-fetch it.
@@ -195,7 +195,7 @@ We port rsync 3.4.1, quirks included (`symlink/safety.rs`), and check it against
 
 ### 5.3 Write path: CAS commit (`fs/commit.rs`)
 
-**Step 1. Journal.** Append `Intent{id, op, parent, name, tmp, expected}` and commit the redb transaction (§5.8).
+**Step 1. Journal.** Before the first reserved name is created, or a user object is moved to one, record `Intent{op, path, parent (dev, ino), tmp, old, expected, staged, state}` and commit it durably (§5.8). Every reserved name the commit may use (`tmp`: the staging or move-aside name; `old`: the quarantine name) is chosen at random **up front** and recorded, so a name exists on disk only once the journal knows it (an `EEXIST` on one is an error, not a retry). A named temp file, symlink or directory is recorded before it is created; an `O_TMPFILE` only just before it is linked in, already with its inode (one commit). A replace records the staged inode N durably (`TempWritten`) before the exchange.
 
 **Step 2. Temp file.**
 - `openat(parentfd, ".", O_TMPFILE|O_WRONLY, mode)`.
@@ -235,7 +235,7 @@ We port rsync 3.4.1, quirks included (`symlink/safety.rs`), and check it against
 - `statx` the name and require ino == N with the same mtime and size. ctime will have changed because of the rename; we accept that and record it.
 - Re-resolve the parent and compare its (dev, ino) (§5.1).
 - If either check fails, the commit already happened but the name or its directory changed right after: report `Unstable` so the path is rescanned.
-- In **one** redb transaction, write the index entry (local meta = the fingerprint we produced) and mark the journal intent Done.
+- In **one** redb transaction, write the index entry (local meta = the fingerprint we produced) and mark the journal intent Done (delete it, or keep it as `Quarantined` while its old inode waits in quarantine).
 - The resulting inotify event then finds the index already up to date, so **there is no echo**.
 
 ### 5.4 Directories
@@ -268,9 +268,16 @@ We port rsync 3.4.1, quirks included (`symlink/safety.rs`), and check it against
 
 ### 5.8 Journal and crash recovery
 
-The journal is an intent log in the same redb file. At startup, replay unfinished intents:
-- `TempWritten`: unlink the temp file if it still matches the recorded ino.
-- `Exchanged`: run the §5.3 step 4(d) verification on whatever is at `tmp`, then take step (e) or (f).
+The journal is an intent log in the same redb file (`index/journal.rs`, table `intents`). One intent per commit that uses reserved names (create, replace, delete, rename to a conflict name; `rmdir` and `set_dir_mode` need none). States: `Started` (names chosen; nothing of the user's is at a reserved name yet), `TempWritten` (N recorded), `Exchanged` (the user's object is at `tmp`: after the exchange or a move-aside), `Quarantined` (committed; the old inode waits under `old`). Done means the record is deleted.
+
+- **When records are written.** The first record and `TempWritten` are durable (`Durability::Immediate`); `Exchanged`, Done for a commit that did not apply, and Done for a settled quarantine entry are not (`Durability::None`). That is safe because replay inspects the names instead of trusting the state, and replaying an intent that already finished finds its names empty (they are unique).
+- **Index transaction.** `LocalReplica::apply` checks preconditions against a read snapshot (redb has one writer, and the commit writes the journal), then writes the entries and finishes the commit's intents in one write transaction. Nothing else writes the index in between (`&mut self`, and redb locks the file to one process).
+- **Replay** (`commit::recover`, at `LocalReplica::open`, and right after a commit that returned an error) works on the recorded names, in the recorded parent (re-resolved; a parent moved, removed or replaced means the intent is skipped and its names left alone):
+  - our staged object N at `tmp` is removed. In state `Started` (N unknown) only our own object can be at `tmp`, so whatever is there is removed (a directory only if empty);
+  - the expected old object O at `tmp` (replace, after the exchange) or at the `.del.` name (delete) gets the §5.3 step 4(d) verification: unchanged → (f) quarantine it (roll forward); changed → (e) put it back: exchange back if the name still holds N unchanged (then remove N), else `RENAME_NOREPLACE` to the name, else a conflict name;
+  - any other object at `tmp` is user data and goes back the same way. A rename's moved-aside object always goes back (roll back; the next sync redoes the conflict);
+  - O at `old` is quarantined again with a fresh grace period (a writer may still hold an fd); a foreign object there is left alone;
+  - afterwards the intent is done, or kept as `Quarantined` while the quarantine holds it. The quarantine reports settled entries (`SweepReport::finished`) so their records go.
 - `.~fsync.*` names that are not in the journal: leave them alone and log them. The journal is always written first, so they are not ours.
 
 A crash between the filesystem commit and the index update is harmless. The rescan sees the same content on both sides with concurrent version vectors, and those merge silently (false-conflict suppression).
@@ -431,7 +438,7 @@ enum Outcome { Applied(Entry), PreconditionFailed(Option<Entry>), Preserved{ con
 - **Symlink matrix:**
   - policy × {safe relative, unsafe relative, absolute, dangling, directory link, loop, munged} × direction;
   - a differential test against real `rsync` (when installed) for the one-directional cases.
-- **Crash tests:** a forked child calls `abort()` at hook point N; restart and check the invariants. Sweep over every N.
+- **Crash tests** (`tests/crash.rs`, T15): a child process (the test binary re-run as `crash_child`, rather than a `fork()` of the multi-threaded test process) runs one sync cycle of a scenario and calls `abort()` at the nth hit of hook point N; sweep over every position of the cycle's trace, for 14 scenarios covering every commit op (file-staging ones under both temp strategies). The parent checks that every reserved name left is named by the journal, that reopening (replay) and a zero-grace sweep leave none, and that the next sync converges to exactly the crash-free outcome (conflict copies compared without timestamps). A late-write variant writes through a held fd at the crash point; that write must survive. A second suite crashes the replay again (`recover.done`). A process crash keeps redb's non-durable commits, so these tests cannot tell `Immediate` from `None`; the durability rules of §5.8 are argued, not tested (power loss).
 - **Stress test** (`tests/stress.rs`, `#[ignore]`).
   - *Setup:* N writer threads per tree perform read-modify-write, blind overwrite, append, delete, rename, directory↔symlink swaps and symlinks to `/tmp/outside`, while the daemon syncs. Every write is unique and logged to a ledger `(replica, path, pred_hash, new_hash)`.
   - **Invariant: no loss.** Every `new_hash` that was not superseded (never another entry's `pred_hash`, and not deleted by a logged delete) exists at the end in a tree, either at its path or as a conflict copy of it.
