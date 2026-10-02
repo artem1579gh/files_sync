@@ -143,6 +143,20 @@ impl Pair {
         }
     }
 
+    /// Overrides both replicas' quarantine grace period (zero by default,
+    /// see [`open_replica`]).
+    pub fn quarantine_grace(self, grace: Duration) -> Pair {
+        let grace = |t: Tree| Tree {
+            replica: t.replica.quarantine_grace(grace),
+            ..t
+        };
+        Pair {
+            a: grace(self.a),
+            b: grace(self.b),
+            ..self
+        }
+    }
+
     /// The roots of A and B, and the state directory.
     pub fn dirs(&self) -> [PathBuf; 3] {
         [self.a.root.clone(), self.b.root.clone(), self.state.clone()]
