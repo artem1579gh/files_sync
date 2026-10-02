@@ -243,14 +243,18 @@ Both sides use the same relative paths, so the classification is symmetric. **Se
 1. Pin the object with `O_PATH|O_NOFOLLOW` and check it against the index.
 2. `renameat2(name → .~fsync.del.<id>, RENAME_NOREPLACE)`.
 3. Verify ino, mtime and size, as in §5.3 step 4(d).
-4. If verification succeeds: unlink, or quarantine as in §5.3 step 4(f).
+4. If verification succeeds: unlink, or quarantine as in §5.3 step 4(f). (Implemented: always quarantine, renamed on to `.~fsync.old.<id>`, so a write through an fd held across the delete becomes a conflict copy.)
 5. If verification fails: rename it back with `NOREPLACE`. If the name was taken meanwhile, use a conflict name.
+6. Step 5 checks as for a commit, except that the name must be **free**: a name re-created right after the delete gives `Unstable`, so the path is rescanned.
 
 ### 5.7 Directory deletes
 
 - Delete children first, deepest first, each with its own CAS.
 - Then run `unlinkat(parentfd, name, AT_REMOVEDIR)`. **rmdir is an atomic emptiness check.**
 - `ENOTEMPTY` means a child appeared concurrently. Abort and bump the directory's version vector, which resurrects it, so the new child and its directory propagate to the peer.
+- Deleted children wait in the quarantine **inside** the directory, which would keep it non-empty. So rmdir first settles the quarantine entries of that directory without waiting for their grace period (`Quarantine::settle_dir`): unchanged ones are unlinked; ones written to since the delete become conflict copies in the directory, which then fails the rmdir and resurrects it with the conflict copy.
+- `ENOTDIR` (the name was replaced by a file or a symlink) is `PreconditionFailed` as well: `AT_REMOVEDIR` never removes or follows a non-directory.
+- rmdir has no fingerprint precondition: a directory swapped for another **empty** one just before is removed. No data is lost, only that directory's mode.
 
 ### 5.8 Journal and crash recovery
 
@@ -281,6 +285,7 @@ A crash between the filesystem commit and the index update is harmless. The resc
 | Leases need the caller to own the file (or CAP_LEASE) and a local filesystem | Fall back to the grace timer. |
 | Hardlinks | We never write in place, so other links keep the old content. Matches rsync without `-H`; `-H` may come later. |
 | A directory moved out of the root while we hold its fd | Post-commit (dev, ino) check of the parent (§5.1). |
+| A writer holding an fd to a deleted child when its directory is removed | rmdir settles the directory's quarantine early (§5.7), so the grace period is cut short; the stat → unlink window of the sweep remains (T18 leases close it). |
 
 ---
 

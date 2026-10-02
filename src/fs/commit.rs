@@ -10,11 +10,16 @@
 //! - **replace** (expected: the indexed fingerprint) pins and checks the old
 //!   inode, swaps it out with `RENAME_EXCHANGE`, verifies what came out, and
 //!   swaps back if it was modified in between. A verified old inode goes into
-//!   [`Quarantine`] rather than being unlinked at once.
+//!   [`Quarantine`] rather than being unlinked at once;
+//! - **delete** (§5.6) pins and checks the object, moves it aside to a
+//!   `.~fsync.del.` name with `RENAME_NOREPLACE`, verifies it, and quarantines
+//!   it, or moves it back if it was modified in between;
+//! - **rmdir** (§5.7) relies on `unlinkat(AT_REMOVEDIR)` as an atomic
+//!   emptiness check.
 //!
 //! After the rename, the parent is fsynced, the name must hold the inode we
-//! staged, and the parent must still resolve to the same directory (§5.3
-//! step 5). Nothing is ever written in place, and nothing is unlinked unless
+//! staged (or nothing, after a delete), and the parent must still resolve to
+//! the same directory (§5.3 step 5). Nothing is ever written in place, and nothing is unlinked unless
 //! it is verified to be ours or a verified, quarantined old inode.
 //!
 //! Every step boundary calls [`point`](crate::fs::hooks::point) so tests can inject races.
@@ -86,6 +91,8 @@ pub enum Outcome {
     /// A concurrent change could not be undone cleanly, so one of two user
     /// objects was kept under this conflict name. Nothing was lost.
     Preserved { conflict: RelPath },
+    /// The object was deleted ([`delete`], [`rmdir`]).
+    Removed,
 }
 
 /// Files below this size are always rehashed when verifying a replace
@@ -190,6 +197,62 @@ pub fn replace_symlink(
     commit_replace(ctx, quarantine, &t, staged, expected)
 }
 
+/// Deletes the file or symlink at `path`, which must match `expected` (§5.6).
+///
+/// The object is moved aside to a `.~fsync.del.` name, verified, and then
+/// quarantined like a replaced inode, so a write through an fd held across
+/// the delete becomes a conflict copy rather than being lost. If it was
+/// modified before it was moved aside, it goes back to `path` (or, if the
+/// name was taken meanwhile, to a conflict name).
+pub fn delete(
+    ctx: &Ctx<'_>,
+    quarantine: &mut Quarantine,
+    path: &RelPath,
+    expected: &Expected,
+) -> Result<Outcome> {
+    let t = Target::resolve(ctx.root, path)?;
+    if let Some(reason) = precheck(&t, expected)? {
+        return Ok(Outcome::PreconditionFailed(reason));
+    }
+    commit_delete(ctx, quarantine, &t, expected)
+}
+
+/// Removes the empty directory at `path` (§5.7).
+///
+/// `unlinkat(AT_REMOVEDIR)` is the atomic emptiness check: a child created
+/// concurrently gives [`Outcome::PreconditionFailed`] and the directory stays.
+/// Children still in `quarantine` would keep the directory non-empty, so they
+/// are settled first, without waiting for their grace period (see
+/// [`Quarantine::settle_dir`]).
+pub fn rmdir(ctx: &Ctx<'_>, quarantine: &mut Quarantine, path: &RelPath) -> Result<Outcome> {
+    let t = Target::resolve(ctx.root, path)?;
+    let dir = match t.stat(t.name)? {
+        None => return Ok(Outcome::PreconditionFailed("name missing")),
+        Some(fp) if fp.kind != FileKind::Dir => {
+            return Ok(Outcome::PreconditionFailed("not a directory"));
+        }
+        Some(fp) => fp,
+    };
+    point("rmdir.checked");
+    let settled = quarantine.settle_dir(&dir);
+    if !settled.conflicts.is_empty() {
+        tracing::warn!(path = %t.path, conflicts = ?settled.conflicts, "directory being removed holds conflict copies");
+    }
+    point("rmdir.before_rmdir");
+    match rustix::fs::unlinkat(t.parent(), t.name, AtFlags::REMOVEDIR) {
+        Ok(()) => {}
+        Err(Errno::NOTEMPTY | Errno::EXIST) => {
+            return Ok(Outcome::PreconditionFailed("directory not empty"));
+        }
+        Err(Errno::NOENT) => return Ok(Outcome::PreconditionFailed("name removed")),
+        // Replaced by a file or symlink, which rmdir never removes.
+        Err(Errno::NOTDIR) => return Ok(Outcome::PreconditionFailed("not a directory")),
+        Err(e) => return Err(t.err("rmdir", e)),
+    }
+    point("rmdir.after_rmdir");
+    t.finish_removed()
+}
+
 // ---------------------------------------------------------------------------
 // The target of a commit
 // ---------------------------------------------------------------------------
@@ -247,6 +310,28 @@ impl<'a> Target<'a> {
     /// §5.3 step 5: fsync the parent, check that the name holds the object we
     /// staged and that the parent still resolves to the same directory.
     fn finish(&self, staged: &Fingerprint) -> Result<Outcome> {
+        self.sync_parent()?;
+        let now = match self.stat(self.name)? {
+            Some(now) if same_object(staged, &now) => now,
+            _ => return Err(self.unstable("name replaced right after commit")),
+        };
+        self.check_parent()?;
+        point("commit.verified");
+        Ok(Outcome::Applied(now))
+    }
+
+    /// §5.3 step 5 after a delete: the name must be free.
+    fn finish_removed(&self) -> Result<Outcome> {
+        self.sync_parent()?;
+        if self.stat(self.name)?.is_some() {
+            return Err(self.unstable("name re-created right after delete"));
+        }
+        self.check_parent()?;
+        point("commit.verified");
+        Ok(Outcome::Removed)
+    }
+
+    fn sync_parent(&self) -> Result<()> {
         let dir = rustix::fs::openat2(
             self.parent(),
             ".",
@@ -257,21 +342,19 @@ impl<'a> Target<'a> {
         .map_err(|e| self.err("open parent for fsync", e))?;
         rustix::fs::fsync(&dir).map_err(|e| self.err("fsync parent of", e))?;
         point("commit.synced");
+        Ok(())
+    }
 
-        let now = match self.stat(self.name)? {
-            Some(now) if same_object(staged, &now) => now,
-            _ => return Err(self.unstable("name replaced right after commit")),
-        };
+    /// The parent must still resolve to the directory we committed in (§5.1).
+    fn check_parent(&self) -> Result<()> {
         let parent_now = self
             .root
             .resolve_parent(self.path)
             .and_then(|(fd, _)| Fingerprint::of_fd(fd.as_fd()));
         match parent_now {
-            Ok(p) if p.same_file(&self.parent_fp) => {}
-            _ => return Err(self.unstable("parent directory moved during commit")),
+            Ok(p) if p.same_file(&self.parent_fp) => Ok(()),
+            _ => Err(self.unstable("parent directory moved during commit")),
         }
-        point("commit.verified");
-        Ok(Outcome::Applied(now))
     }
 
     /// Renames `from` (in the parent) to a free conflict name for this
@@ -696,25 +779,13 @@ fn commit_replace(
 ) -> Result<Outcome> {
     // (a) Pin the old inode and check it against the index.
     point("replace.before_pin");
-    let pin = match rustix::fs::openat2(
-        t.parent(),
-        t.name,
-        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-        RESOLVE,
-    ) {
-        Ok(pin) => pin,
-        Err(Errno::NOENT) => {
+    let (pin, old) = match pin_expected(t, expected)? {
+        Ok(pinned) => pinned,
+        Err(reason) => {
             staged.discard()?;
-            return Ok(Outcome::PreconditionFailed("name missing"));
+            return Ok(Outcome::PreconditionFailed(reason));
         }
-        Err(e) => return Err(t.err("pin", e)),
     };
-    let old = Fingerprint::of_fd(pin.as_fd())?;
-    if !expected.fp.unchanged(&old) || !matches!(old.kind, FileKind::File | FileKind::Symlink) {
-        staged.discard()?;
-        return Ok(Outcome::PreconditionFailed("changed since scan"));
-    }
     point("replace.pinned");
 
     // (b) T18: take an F_WRLCK lease on an O_RDONLY fd for `old` here when
@@ -740,7 +811,7 @@ fn commit_replace(
     point("replace.after_exchange");
 
     // (d) Verify what came out.
-    match verify_old(t, &staged.name, &old, expected) {
+    match verify_old(t, &staged.name, &old, expected, "replace.before_rehash") {
         Verified::Unchanged => {
             point("replace.verified");
             // (f) Quarantine the old inode.
@@ -755,6 +826,30 @@ fn commit_replace(
     t.finish(&staged.fp)
 }
 
+/// §5.3 step 4(a): pins the object at the target name with `O_PATH|O_NOFOLLOW`
+/// and checks it against `expected`. `Ok(Err(reason))` if it does not match.
+fn pin_expected(
+    t: &Target<'_>,
+    expected: &Expected,
+) -> Result<std::result::Result<(OwnedFd, Fingerprint), &'static str>> {
+    let pin = match rustix::fs::openat2(
+        t.parent(),
+        t.name,
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+        RESOLVE,
+    ) {
+        Ok(pin) => pin,
+        Err(Errno::NOENT) => return Ok(Err("name missing")),
+        Err(e) => return Err(t.err("pin", e)),
+    };
+    let old = Fingerprint::of_fd(pin.as_fd())?;
+    if !expected.fp.unchanged(&old) || !matches!(old.kind, FileKind::File | FileKind::Symlink) {
+        return Ok(Err("changed since scan"));
+    }
+    Ok(Ok((pin, old)))
+}
+
 enum Verified {
     /// The old inode, unmodified since the precondition check.
     Unchanged,
@@ -765,9 +860,16 @@ enum Verified {
 }
 
 /// §5.3 step 4(d): is the object at `tmp` still the old inode, unmodified?
-/// ctime is not compared, since the exchange itself bumps it. Errors count as
-/// "changed", so the caller undoes the exchange.
-fn verify_old(t: &Target<'_>, tmp: &[u8], old: &Fingerprint, expected: &Expected) -> Verified {
+/// ctime is not compared, since the rename itself bumps it. Errors count as
+/// "changed", so the caller undoes the rename. `rehash_point` is the hook
+/// point reached before a rehash.
+fn verify_old(
+    t: &Target<'_>,
+    tmp: &[u8],
+    old: &Fingerprint,
+    expected: &Expected,
+    rehash_point: &'static str,
+) -> Verified {
     let out = match t.stat(tmp) {
         Ok(Some(out)) => out,
         Ok(None) => return Verified::Gone,
@@ -783,7 +885,7 @@ fn verify_old(t: &Target<'_>, tmp: &[u8], old: &Fingerprint, expected: &Expected
         && let Some(hash) = expected.hash
         && (expected.racy || old.size < REHASH_BELOW)
     {
-        point("replace.before_rehash");
+        point(rehash_point);
         match stable_read(t.parent(), tmp, &mut Discard) {
             Ok((fp, h)) if same_object(old, &fp) && h == hash => {}
             Ok(_) => return Verified::Changed,
@@ -830,24 +932,77 @@ fn undo(ctx: &Ctx<'_>, t: &Target<'_>, mut staged: Staged<'_>) -> Result<Outcome
             // `name` was removed after the exchange (or the temp name was):
             // move the user's object back to `name`.
             point("replace.after_undo");
-            match rustix::fs::renameat_with(
-                t.parent(),
-                staged.name.as_slice(),
-                t.parent(),
-                t.name,
-                RenameFlags::NOREPLACE,
-            ) {
-                Ok(()) | Err(Errno::NOENT) => Ok(failed),
-                Err(Errno::EXIST) => {
-                    let kind = t.stat(&staged.name)?.map_or(FileKind::File, |f| f.kind);
-                    let conflict = t.preserve(ctx.replica, &staged.name, kind)?;
-                    Ok(Outcome::Preserved { conflict })
-                }
-                Err(e) => Err(t.err("restore after failed replace of", e)),
-            }
+            restore(ctx, t, &staged.name)
         }
         Err(e) => Err(t.err("undo exchange of", e)),
     }
+}
+
+/// Moves a user object from our reserved name `from` back to the target name
+/// with `RENAME_NOREPLACE`. If the name was taken meanwhile, the object is
+/// kept under a conflict name instead; nothing is overwritten.
+fn restore(ctx: &Ctx<'_>, t: &Target<'_>, from: &[u8]) -> Result<Outcome> {
+    match rustix::fs::renameat_with(t.parent(), from, t.parent(), t.name, RenameFlags::NOREPLACE) {
+        // NOENT: it vanished from our name, so there is nothing to restore.
+        Ok(()) | Err(Errno::NOENT) => Ok(Outcome::PreconditionFailed("changed during commit")),
+        Err(Errno::EXIST) => {
+            let kind = t.stat(from)?.map_or(FileKind::File, |f| f.kind);
+            let conflict = t.preserve(ctx.replica, from, kind)?;
+            Ok(Outcome::Preserved { conflict })
+        }
+        Err(e) => Err(t.err("restore", e)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Delete (§5.6)
+// ---------------------------------------------------------------------------
+
+fn commit_delete(
+    ctx: &Ctx<'_>,
+    quarantine: &mut Quarantine,
+    t: &Target<'_>,
+    expected: &Expected,
+) -> Result<Outcome> {
+    // 1. Pin the object and check it against the index.
+    point("delete.before_pin");
+    let (pin, old) = match pin_expected(t, expected)? {
+        Ok(pinned) => pinned,
+        Err(reason) => return Ok(Outcome::PreconditionFailed(reason)),
+    };
+    point("delete.pinned");
+
+    // T18: take an F_WRLCK lease here when `ctx.caps.leases`.
+    point("delete.before_rename");
+
+    // 2. Move it aside; NOREPLACE so a reserved name is never overwritten.
+    let del = match with_fresh_name(TmpKind::Del, |del| {
+        rustix::fs::renameat_with(t.parent(), t.name, t.parent(), del, RenameFlags::NOREPLACE)
+    }) {
+        Ok(((), del)) => del,
+        Err(Errno::NOENT) => return Ok(Outcome::PreconditionFailed("name removed")),
+        Err(e) => return Err(t.err("move aside for delete", e)),
+    };
+    point("delete.after_rename");
+
+    // 3. Verify what was moved.
+    match verify_old(t, &del, &old, expected, "delete.before_rehash") {
+        Verified::Unchanged => {
+            point("delete.verified");
+            // 4. Quarantine rather than unlink, for writers holding an fd.
+            quarantine.add(t, &del, old, pin)?;
+            point("delete.quarantined");
+        }
+        Verified::Gone => {
+            tracing::warn!(path = %t.path, "deleted object vanished from its temp name");
+        }
+        Verified::Changed => {
+            // 5. Modified or replaced before it was moved: put it back.
+            point("delete.before_restore");
+            return restore(ctx, t, &del);
+        }
+    }
+    t.finish_removed()
 }
 
 /// Renames `parent/from` to a free conflict name for `orig` (§6.2), trying
@@ -905,6 +1060,8 @@ struct Pending {
     /// The directory holding it (an `O_PATH` fd, so it is found even if the
     /// directory is renamed).
     parent: OwnedFd,
+    /// That directory's identity, for [`Quarantine::settle_dir`].
+    dir_fp: Fingerprint,
     /// That directory's path when the entry was made, for conflict paths.
     dir: RelPath,
     /// The name the inode was replaced at, for conflict names.
@@ -980,6 +1137,7 @@ impl Quarantine {
                 .parent
                 .try_clone()
                 .map_err(|e| Error::io("duplicate parent fd", e))?,
+            dir_fp: t.parent_fp,
             dir: t.path.parent().unwrap_or_default(),
             orig: t.name.to_vec(),
             name,
@@ -995,13 +1153,29 @@ impl Quarantine {
     /// wait. Errors are logged and the entry is retried on the next sweep.
     pub fn sweep(&mut self) -> SweepReport {
         let now = Instant::now();
+        self.process(|p| Some(now >= p.deadline))
+    }
+
+    /// Settles every entry in the directory `dir` now, without waiting for
+    /// its grace period: unchanged ones are unlinked, modified ones become
+    /// conflict copies (in `dir`). [`rmdir`] calls this so quarantined
+    /// children don't keep a deleted directory non-empty (§5.7).
+    pub fn settle_dir(&mut self, dir: &Fingerprint) -> SweepReport {
+        self.process(|p| p.dir_fp.same_file(dir).then_some(true))
+    }
+
+    /// Sweeps the entries `due` selects (`Some(due)`), leaving the others.
+    fn process(&mut self, due: impl Fn(&Pending) -> Option<bool>) -> SweepReport {
         let mut report = SweepReport::default();
         let replica = self.replica;
-        self.pending.retain(|p| match p.sweep(now, replica, &mut report) {
-            Ok(done) => !done,
-            Err(e) => {
-                tracing::warn!(dir = %p.dir, name = %p.name.escape_ascii(), error = %e, "quarantine sweep failed");
-                true
+        self.pending.retain(|p| {
+            let Some(due) = due(p) else { return true };
+            match p.sweep(due, replica, &mut report) {
+                Ok(done) => !done,
+                Err(e) => {
+                    tracing::warn!(dir = %p.dir, name = %p.name.escape_ascii(), error = %e, "quarantine sweep failed");
+                    true
+                }
             }
         });
         report
@@ -1009,7 +1183,7 @@ impl Quarantine {
 }
 
 impl Pending {
-    fn verdict(&self, now: Instant) -> Result<Verdict> {
+    fn verdict(&self, due: bool) -> Result<Verdict> {
         let Some(fp) = Fingerprint::at_opt(self.parent.as_fd(), &self.name)? else {
             return Ok(Verdict::Drop);
         };
@@ -1020,18 +1194,14 @@ impl Pending {
             return Ok(Verdict::Conflict);
         }
         // T18: also Unlink before the deadline once a write lease can be taken.
-        Ok(if now >= self.deadline {
-            Verdict::Unlink
-        } else {
-            Verdict::Keep
-        })
+        Ok(if due { Verdict::Unlink } else { Verdict::Keep })
     }
 
     /// Returns whether the entry is finished.
-    fn sweep(&self, now: Instant, replica: ReplicaId, report: &mut SweepReport) -> Result<bool> {
+    fn sweep(&self, due: bool, replica: ReplicaId, report: &mut SweepReport) -> Result<bool> {
         let parent = self.parent.as_fd();
         let shown = || format!("{}/{}", self.dir, self.name.escape_ascii());
-        match self.verdict(now)? {
+        match self.verdict(due)? {
             Verdict::Keep => Ok(false),
             Verdict::Drop => {
                 tracing::warn!(name = %shown(), "quarantined object vanished or was replaced; forgetting it");
@@ -1745,5 +1915,301 @@ mod tests {
         let out = replace(&fx, &mut q, "d", &exp, b"x").unwrap();
         assert_eq!(out, Outcome::PreconditionFailed("not a file or symlink"));
         assert!(fx.p("d").is_dir());
+    }
+
+    // ----- T06: delete and rmdir ---------------------------------------------
+
+    fn del(fx: &Fx, q: &mut Quarantine, rel: &str, exp: &Expected) -> Result<Outcome> {
+        delete(&fx.ctx(), q, &rp(rel), exp)
+    }
+
+    #[test]
+    fn delete_normal() {
+        let fx = Fx::new();
+        let exp = fx.user_file("f", b"old");
+        symlink("target", fx.p("l")).unwrap();
+        let lexp = Expected::from(fx.root.stat(&rp("l")).unwrap());
+        let mut q = quarantine();
+        hooks::start_trace();
+        assert_eq!(del(&fx, &mut q, "f", &exp).unwrap(), Outcome::Removed);
+        assert_eq!(
+            hooks::take_trace(),
+            [
+                "commit.resolved",
+                "delete.before_pin",
+                "delete.pinned",
+                "delete.before_rename",
+                "delete.after_rename",
+                "delete.before_rehash",
+                "delete.verified",
+                "delete.quarantined",
+                "commit.synced",
+                "commit.verified",
+            ]
+        );
+        assert_eq!(del(&fx, &mut q, "l", &lexp).unwrap(), Outcome::Removed);
+        assert!(fs::symlink_metadata(fx.p("f")).is_err());
+        assert!(fs::symlink_metadata(fx.p("l")).is_err());
+        // The deleted inodes wait in quarantine until swept.
+        assert_eq!(q.len(), 2);
+        assert_eq!(fx.leftovers().len(), 2);
+        assert_eq!(q.sweep().removed, 2);
+        assert!(fx.leftovers().is_empty());
+    }
+
+    #[test]
+    fn delete_with_stale_expectation_fails() {
+        let fx = Fx::new();
+        let exp = fx.user_file("f", b"old");
+        append(&fx.p("f"), b" edited");
+        let mut q = quarantine();
+        let out = del(&fx, &mut q, "f", &exp).unwrap();
+        assert_eq!(out, Outcome::PreconditionFailed("changed since scan"));
+        assert_eq!(fs::read(fx.p("f")).unwrap(), b"old edited");
+
+        fs::remove_file(fx.p("f")).unwrap();
+        let out = del(&fx, &mut q, "f", &exp).unwrap();
+        assert_eq!(out, Outcome::PreconditionFailed("name missing"));
+
+        // Directories are rmdir's job.
+        fs::create_dir(fx.p("d")).unwrap();
+        let exp = Expected::from(fx.root.stat(&rp("d")).unwrap());
+        let out = del(&fx, &mut q, "d", &exp).unwrap();
+        assert_eq!(out, Outcome::PreconditionFailed("not a file or symlink"));
+        assert!(fx.p("d").is_dir());
+        assert!(q.is_empty());
+        assert!(fx.leftovers().is_empty());
+    }
+
+    #[test]
+    fn delete_modification_before_rename_is_restored() {
+        let fx = Fx::new();
+        let exp = fx.user_file("f", b"old");
+        let user = fx.p("f");
+        let _g = hooks::once("delete.before_rename", move || append(&user, b" edited"));
+        let mut q = quarantine();
+        let out = del(&fx, &mut q, "f", &exp).unwrap();
+        assert_eq!(out, Outcome::PreconditionFailed("changed during commit"));
+        assert_eq!(fs::read(fx.p("f")).unwrap(), b"old edited");
+        assert_eq!(fs::symlink_metadata(fx.p("f")).unwrap().ino(), exp.fp.ino);
+        assert!(q.is_empty());
+        assert!(fx.leftovers().is_empty(), "{:?}", fx.leftovers());
+    }
+
+    /// Same size, mtime restored: only the rehash catches it.
+    #[test]
+    fn delete_mtime_preserving_write_is_restored() {
+        let fx = Fx::new();
+        let exp = fx.user_file("f", b"old");
+        let user = fx.p("f");
+        let _g = hooks::once("delete.before_rename", move || {
+            let f = fs::File::options().write(true).open(&user).unwrap();
+            (&f).write_all(b"OLD").unwrap();
+            f.set_modified(SystemTime::UNIX_EPOCH + OLD_MTIME).unwrap();
+        });
+        let mut q = quarantine();
+        let out = del(&fx, &mut q, "f", &exp).unwrap();
+        assert_eq!(out, Outcome::PreconditionFailed("changed during commit"));
+        assert_eq!(fs::read(fx.p("f")).unwrap(), b"OLD");
+        assert!(fx.leftovers().is_empty());
+    }
+
+    #[test]
+    fn delete_new_inode_before_rename_is_restored() {
+        let fx = Fx::new();
+        let exp = fx.user_file("f", b"old");
+        let user = fx.p("f");
+        let _g = hooks::once("delete.before_rename", move || {
+            fs::remove_file(&user).unwrap();
+            fs::create_dir(&user).unwrap();
+            fs::write(user.join("child"), b"user").unwrap();
+        });
+        let mut q = quarantine();
+        let out = del(&fx, &mut q, "f", &exp).unwrap();
+        assert_eq!(out, Outcome::PreconditionFailed("changed during commit"));
+        assert_eq!(fs::read(fx.p("f/child")).unwrap(), b"user");
+        assert!(fx.leftovers().is_empty(), "{:?}", fx.leftovers());
+    }
+
+    /// The modified file cannot go back because the user re-created the name
+    /// after our rename: it is kept under a conflict name, and both survive.
+    #[test]
+    fn delete_restore_onto_recreated_name_keeps_conflict_copy() {
+        let fx = Fx::new();
+        let exp = fx.user_file("f.txt", b"old");
+        let user = fx.p("f.txt");
+        let _g1 = hooks::once("delete.before_rename", move || append(&user, b" edited"));
+        let user = fx.p("f.txt");
+        let _g2 = hooks::once("delete.after_rename", move || {
+            fs::write(&user, b"re-created").unwrap()
+        });
+        let mut q = quarantine();
+        let out = del(&fx, &mut q, "f.txt", &exp).unwrap();
+        let Outcome::Preserved { conflict } = out else {
+            panic!("expected Preserved, got {out:?}");
+        };
+        let name = conflict.as_os_str().to_str().unwrap();
+        assert!(
+            name.starts_with("f.sync-conflict-") && name.ends_with("-abcdef0.txt"),
+            "{name}"
+        );
+        assert_eq!(fs::read(fx.p(name)).unwrap(), b"old edited");
+        assert_eq!(fs::read(fx.p("f.txt")).unwrap(), b"re-created");
+        assert!(q.is_empty());
+        assert!(fx.leftovers().is_empty(), "{:?}", fx.leftovers());
+    }
+
+    /// The delete itself was valid, but the name is taken again right after:
+    /// reported as unstable so the path is rescanned.
+    #[test]
+    fn delete_then_recreated_name_is_unstable() {
+        let fx = Fx::new();
+        let exp = fx.user_file("f", b"old");
+        let user = fx.p("f");
+        let _g = hooks::once("delete.quarantined", move || {
+            fs::write(&user, b"re-created").unwrap()
+        });
+        let mut q = quarantine();
+        let res = del(&fx, &mut q, "f", &exp);
+        assert!(matches!(res, Err(Error::Unstable { .. })), "{res:?}");
+        assert_eq!(fs::read(fx.p("f")).unwrap(), b"re-created");
+        assert_eq!(q.sweep().removed, 1);
+        assert!(fx.leftovers().is_empty());
+    }
+
+    #[test]
+    fn delete_write_through_held_fd_becomes_conflict_copy() {
+        let fx = Fx::new();
+        let exp = fx.user_file("f", b"old");
+        let mut held = fs::File::options().append(true).open(fx.p("f")).unwrap();
+        let mut q = quarantine();
+        assert_eq!(del(&fx, &mut q, "f", &exp).unwrap(), Outcome::Removed);
+        held.write_all(b" late write").unwrap();
+        let report = q.sweep();
+        assert_eq!((report.removed, report.conflicts.len()), (0, 1));
+        let name = report.conflicts[0].as_os_str().to_str().unwrap().to_owned();
+        assert!(name.starts_with("f.sync-conflict-"), "{name}");
+        assert_eq!(fs::read(fx.p(&name)).unwrap(), b"old late write");
+        assert!(fs::symlink_metadata(fx.p("f")).is_err());
+        assert!(fx.leftovers().is_empty());
+    }
+
+    #[test]
+    fn rmdir_cases() {
+        let fx = Fx::new();
+        let mut q = quarantine();
+        fs::create_dir_all(fx.p("d/e")).unwrap();
+        fs::write(fx.p("f"), b"user").unwrap();
+        symlink("d", fx.p("l")).unwrap();
+
+        // Normal, with the exact trace.
+        hooks::start_trace();
+        assert_eq!(
+            rmdir(&fx.ctx(), &mut q, &rp("d/e")).unwrap(),
+            Outcome::Removed
+        );
+        assert_eq!(
+            hooks::take_trace(),
+            [
+                "commit.resolved",
+                "rmdir.checked",
+                "rmdir.before_rmdir",
+                "rmdir.after_rmdir",
+                "commit.synced",
+                "commit.verified",
+            ]
+        );
+        assert!(!fx.p("d/e").exists());
+
+        // Not a directory (a symlink to one is not followed), missing, not empty.
+        for (p, why) in [
+            ("f", "not a directory"),
+            ("l", "not a directory"),
+            ("nope", "name missing"),
+        ] {
+            let out = rmdir(&fx.ctx(), &mut q, &rp(p)).unwrap();
+            assert_eq!(out, Outcome::PreconditionFailed(why), "{p}");
+        }
+        assert!(fx.p("d").is_dir() && fx.p("f").is_file());
+        fs::write(fx.p("d/child"), b"x").unwrap();
+        let out = rmdir(&fx.ctx(), &mut q, &rp("d")).unwrap();
+        assert_eq!(out, Outcome::PreconditionFailed("directory not empty"));
+        assert!(fx.leftovers().is_empty());
+    }
+
+    #[test]
+    fn rmdir_with_child_created_just_before_fails() {
+        let fx = Fx::new();
+        fs::create_dir(fx.p("d")).unwrap();
+        let user = fx.p("d/child");
+        let _g = hooks::once("rmdir.before_rmdir", move || {
+            fs::write(&user, b"user").unwrap()
+        });
+        let mut q = quarantine();
+        let out = rmdir(&fx.ctx(), &mut q, &rp("d")).unwrap();
+        assert_eq!(out, Outcome::PreconditionFailed("directory not empty"));
+        assert_eq!(fs::read(fx.p("d/child")).unwrap(), b"user");
+
+        // Replaced by a file just before: rmdir never removes it.
+        fs::create_dir(fx.p("e")).unwrap();
+        let user = fx.p("e");
+        let _g = hooks::once("rmdir.before_rmdir", move || {
+            fs::remove_dir(&user).unwrap();
+            fs::write(&user, b"user").unwrap();
+        });
+        let out = rmdir(&fx.ctx(), &mut q, &rp("e")).unwrap();
+        assert_eq!(out, Outcome::PreconditionFailed("not a directory"));
+        assert_eq!(fs::read(fx.p("e")).unwrap(), b"user");
+    }
+
+    /// Children deleted just before are still in quarantine (a long grace
+    /// period here); rmdir settles them first.
+    #[test]
+    fn rmdir_settles_quarantined_children() {
+        let fx = Fx::new();
+        fs::create_dir_all(fx.p("d/sub")).unwrap();
+        fs::create_dir(fx.p("other")).unwrap();
+        let a = fx.user_file("d/a", b"a");
+        let b = fx.user_file("d/b.txt", b"b");
+        let o = fx.user_file("other/o", b"o");
+        let mut q = Quarantine::new(REPLICA, Duration::from_secs(3600));
+        let mut held = fs::File::options()
+            .append(true)
+            .open(fx.p("d/b.txt"))
+            .unwrap();
+        for (p, exp) in [("d/a", &a), ("d/b.txt", &b), ("other/o", &o)] {
+            assert_eq!(del(&fx, &mut q, p, exp).unwrap(), Outcome::Removed);
+        }
+        assert_eq!(
+            rmdir(&fx.ctx(), &mut q, &rp("d/sub")).unwrap(),
+            Outcome::Removed
+        );
+
+        // A write through a held fd after the delete: the settled child
+        // becomes a conflict copy, which keeps the directory alive.
+        held.write_all(b" late").unwrap();
+        let out = rmdir(&fx.ctx(), &mut q, &rp("d")).unwrap();
+        assert_eq!(out, Outcome::PreconditionFailed("directory not empty"));
+        let names: Vec<_> = fs::read_dir(fx.p("d"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names.len(), 1, "{names:?}");
+        assert!(names[0].starts_with("b.sync-conflict-"), "{names:?}");
+        assert_eq!(fs::read(fx.p("d").join(&names[0])).unwrap(), b"b late");
+        // Entries in other directories keep waiting.
+        assert_eq!(q.len(), 1);
+
+        // Unchanged children are unlinked at once, and the rmdir succeeds.
+        fs::remove_file(fx.p("d").join(&names[0])).unwrap();
+        let c = fx.user_file("d/c", b"c");
+        assert_eq!(del(&fx, &mut q, "d/c", &c).unwrap(), Outcome::Removed);
+        assert_eq!(
+            rmdir(&fx.ctx(), &mut q, &rp("d")).unwrap(),
+            Outcome::Removed
+        );
+        assert!(!fx.p("d").exists());
+        assert_eq!(q.len(), 1);
+        assert_eq!(fx.leftovers().len(), 1);
     }
 }

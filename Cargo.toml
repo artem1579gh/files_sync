@@ -23,6 +23,10 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # Race-injection points in fs::hooks for integration tests (tests/attack.rs, crash.rs).
 hooks = []
 
+[[test]]
+name = "attack"
+required-features = ["hooks"]
+
 [dev-dependencies]
 proptest = "1.11.0"
 tempfile = "3.27.0"
