@@ -5,15 +5,14 @@ mod harness;
 use files_sync::config::SymlinkPolicy;
 use files_sync::engine::Side;
 use files_sync::index::Kind;
-use harness::{ID_A, ID_B, Pair, When, id7};
+use harness::{ID_A, ID_B, Mode, Pair, When, id7};
 
-fn pair() -> Pair {
-    Pair::new(SymlinkPolicy::Links)
+fn pair(m: Mode) -> Pair {
+    Pair::new(SymlinkPolicy::Links).over(m)
 }
 
-#[test]
-fn create_on_each_side() {
-    let mut p = pair();
+fn create_on_each_side(m: Mode) {
+    let mut p = pair(m);
     p.a.write("a.txt", "from a");
     p.b.write("b.txt", "from b");
     p.a.mkdir("empty_a");
@@ -32,9 +31,8 @@ fn create_on_each_side() {
     assert_eq!((r.applied, r.rounds), (0, 0));
 }
 
-#[test]
-fn modify_on_each_side() {
-    let mut p = pair();
+fn modify_on_each_side(m: Mode) {
+    let mut p = pair(m);
     p.a.write("x", "1");
     p.sync();
     p.a.write("x", "2 from a");
@@ -57,9 +55,8 @@ fn modify_on_each_side() {
     assert_eq!(p.b.read("x"), "3 from b");
 }
 
-#[test]
-fn delete_on_each_side() {
-    let mut p = pair();
+fn delete_on_each_side(m: Mode) {
+    let mut p = pair(m);
     p.a.write("x", "x");
     p.b.write("y", "y");
     p.sync();
@@ -73,11 +70,10 @@ fn delete_on_each_side() {
     }
 }
 
-#[test]
-fn concurrent_modification_makes_conflict_copies() {
+fn concurrent_modification_makes_conflict_copies(m: Mode) {
     // Either side can win: the newer mtime does.
     for winner in [Side::A, Side::B] {
-        let mut p = pair();
+        let mut p = pair(m);
         p.a.write("doc.txt", "base");
         p.sync();
         let (ta, tb) = match winner {
@@ -108,9 +104,8 @@ fn concurrent_modification_makes_conflict_copies() {
     }
 }
 
-#[test]
-fn concurrent_identical_change_is_not_a_conflict() {
-    let mut p = pair();
+fn concurrent_identical_change_is_not_a_conflict(m: Mode) {
+    let mut p = pair(m);
     p.a.write("x", "base");
     p.sync();
     p.a.write_at("x", "same", 1_000_000_000);
@@ -126,10 +121,9 @@ fn concurrent_identical_change_is_not_a_conflict() {
     );
 }
 
-#[test]
-fn concurrent_delete_vs_modification_keeps_modification() {
+fn concurrent_delete_vs_modification_keeps_modification(m: Mode) {
     for deleter in [Side::A, Side::B] {
-        let mut p = pair();
+        let mut p = pair(m);
         p.a.write("x", "base");
         p.sync();
         let (del, edit) = match deleter {
@@ -147,9 +141,8 @@ fn concurrent_delete_vs_modification_keeps_modification() {
     }
 }
 
-#[test]
-fn directory_delete_vs_new_child_resurrects() {
-    let mut p = pair();
+fn directory_delete_vs_new_child_resurrects(m: Mode) {
+    let mut p = pair(m);
     p.a.write("d/old", "old");
     p.sync();
     p.a.rm("d");
@@ -164,9 +157,8 @@ fn directory_delete_vs_new_child_resurrects() {
     }
 }
 
-#[test]
-fn type_changes() {
-    let mut p = pair();
+fn type_changes(m: Mode) {
+    let mut p = pair(m);
     p.a.write("t", "file");
     p.sync();
 
@@ -205,9 +197,8 @@ fn type_changes() {
     assert_eq!(p.b.read("t"), "last");
 }
 
-#[test]
-fn nested_directories() {
-    let mut p = pair();
+fn nested_directories(m: Mode) {
+    let mut p = pair(m);
     p.a.write("d1/d2/d3/f", "deep");
     p.a.write("d1/g", "g");
     p.a.mkdir("d1/d2/empty");
@@ -232,9 +223,8 @@ fn nested_directories() {
     assert!(p.a.ls().is_empty());
 }
 
-#[test]
-fn symlinks_under_links() {
-    let mut p = pair();
+fn symlinks_under_links(m: Mode) {
+    let mut p = pair(m);
     p.a.write("dir/file", "content");
     p.a.symlink("rel", "dir/file");
     p.a.symlink("dirlink", "dir");
@@ -275,9 +265,8 @@ fn symlinks_under_links() {
 /// Found by `tests/model.rs` (T14), where the model got it wrong: a symlink
 /// re-created with the same target (new inode and mtime) is no change, so a
 /// concurrent retarget on the other side wins without a conflict.
-#[test]
-fn recreated_symlink_with_same_target_is_not_a_change() {
-    let mut p = pair();
+fn recreated_symlink_with_same_target_is_not_a_change(m: Mode) {
+    let mut p = pair(m);
     p.a.symlink("l", "t");
     p.sync();
     p.a.symlink("l", "t");
@@ -289,9 +278,8 @@ fn recreated_symlink_with_same_target_is_not_a_change() {
     assert_eq!(p.a.ls(), ["l"]);
 }
 
-#[test]
-fn symlinks_under_skip_are_left_alone() {
-    let mut p = Pair::new(SymlinkPolicy::Skip);
+fn symlinks_under_skip_are_left_alone(m: Mode) {
+    let mut p = Pair::new(SymlinkPolicy::Skip).over(m);
     p.a.write("f", "f");
     p.a.symlink("l", "f");
     p.b.symlink("l", "other");
@@ -314,9 +302,8 @@ fn symlinks_under_skip_are_left_alone() {
     assert_eq!(p.b.readlink("g"), "elsewhere");
 }
 
-#[test]
-fn version_vectors_record_both_replicas() {
-    let mut p = pair();
+fn version_vectors_record_both_replicas(m: Mode) {
+    let mut p = pair(m);
     p.a.write("x", "1");
     p.sync();
     p.b.write("x", "2");
@@ -326,9 +313,8 @@ fn version_vectors_record_both_replicas() {
     assert_eq!(vv, p.b.entry("x").unwrap().vv);
 }
 
-#[test]
-fn destination_edited_during_sync_becomes_conflict() {
-    let mut p = pair();
+fn destination_edited_during_sync_becomes_conflict(m: Mode) {
+    let mut p = pair(m);
     p.a.write("x", "base");
     p.sync();
     p.a.write_at("x", "from a", 1_000_000_000);
@@ -349,9 +335,8 @@ fn destination_edited_during_sync_becomes_conflict() {
     }
 }
 
-#[test]
-fn source_edited_during_sync_is_resent() {
-    let mut p = pair();
+fn source_edited_during_sync_is_resent(m: Mode) {
+    let mut p = pair(m);
     p.a.write("x", "first");
     // A's user rewrites the file just as B reads it from A: the read fails
     // its stability check, the path is rescanned, and the new content goes.
@@ -365,9 +350,8 @@ fn source_edited_during_sync_is_resent() {
     assert!(p.b.conflicts("").is_empty());
 }
 
-#[test]
-fn directory_filled_during_delete_is_kept() {
-    let mut p = pair();
+fn directory_filled_during_delete_is_kept(m: Mode) {
+    let mut p = pair(m);
     p.a.write("d/f", "f");
     p.sync();
     p.a.rm("d");
@@ -387,9 +371,8 @@ fn directory_filled_during_delete_is_kept() {
 /// T18: a tombstone is collected on both sides once both held the deletion
 /// for the retention period; a later create syncs as a new file, and
 /// nothing deleted comes back.
-#[test]
-fn tombstones_are_collected_after_the_retention_period() {
-    let mut p = pair();
+fn tombstones_are_collected_after_the_retention_period(m: Mode) {
+    let mut p = pair(m);
     p.a.write("f", "x");
     p.a.mkdir("d");
     p.a.write("d/g", "y");
@@ -433,9 +416,8 @@ fn tombstones_are_collected_after_the_retention_period() {
 
 /// Independent deletes on both sides leave concurrent tombstones, which
 /// reconcile never equalises (§6.1); they are collected all the same.
-#[test]
-fn concurrent_tombstones_are_collected() {
-    let mut p = pair();
+fn concurrent_tombstones_are_collected(m: Mode) {
+    let mut p = pair(m);
     p.a.write("f", "x");
     p.sync();
     p.a.write("f", "a's edit");
@@ -449,4 +431,25 @@ fn concurrent_tombstones_are_collected() {
     assert_eq!(r.collected, [1, 1]);
     assert_eq!((p.a.entry("f"), p.b.entry("f")), (None, None));
     p.assert_converged();
+}
+
+both_modes! {
+    create_on_each_side,
+    modify_on_each_side,
+    delete_on_each_side,
+    concurrent_modification_makes_conflict_copies,
+    concurrent_identical_change_is_not_a_conflict,
+    concurrent_delete_vs_modification_keeps_modification,
+    directory_delete_vs_new_child_resurrects,
+    type_changes,
+    nested_directories,
+    symlinks_under_links,
+    recreated_symlink_with_same_target_is_not_a_change,
+    symlinks_under_skip_are_left_alone,
+    version_vectors_record_both_replicas,
+    destination_edited_during_sync_becomes_conflict,
+    source_edited_during_sync_is_resent,
+    directory_filled_during_delete_is_kept,
+    tombstones_are_collected_after_the_retention_period,
+    concurrent_tombstones_are_collected,
 }

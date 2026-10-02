@@ -337,8 +337,8 @@ fn crash_child() {
 // ---------------------------------------------------------------------------
 
 fn force_named(p: &mut Pair) {
-    p.a.replica.caps_mut().o_tmpfile = false;
-    p.b.replica.caps_mut().o_tmpfile = false;
+    p.a.replica.local_mut().caps_mut().o_tmpfile = false;
+    p.b.replica.local_mut().caps_mut().o_tmpfile = false;
 }
 
 /// The cycle that crashes: one sync, then a sweep of both quarantines.

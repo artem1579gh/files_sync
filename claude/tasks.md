@@ -676,13 +676,38 @@ The design lives in [`design.md`](design.md); §N.M below refers to its sections
     - Mutation-checked by hand: a verifier that accepts any certificate fails both `wrong_certificates_are_rejected` and the two-process test. 15 consecutive runs of `remote` + `net`: no flake.
   - **Follow-ups (T22 / later):** the harness can serve a replica in-process with `Server::new(..).spawn(TcpListener::bind("127.0.0.1:0"))` and `ServerHandle::into_replica`; the crash/attack hooks are not reachable through a remote replica's process boundary unless the server runs in-process. No retry of a request on a connection that dies mid-request (the cycle fails and is retried as a whole). Block-level delta transfer (§7.1) → **T24**. The pre-existing `crash` flake noted under T20 was not looked at → **T23**.
 
-### [ ] T22: Network test parity
+### [x] T22: Network test parity
 - **Depends on:** T21, T14, T17, T19
 - **Read:** §9
 - **Files:** `tests/harness/mod.rs`, the existing test files
 - **Do:** make the harness generic over a `ReplicaFactory` (local or loopback-remote), then run the sync_once, model, symlink_matrix and stress suites in both modes.
 - **Done when:** every suite passes in both modes.
 - **Notes:**
+  - **Design:** §9 "Harness" describes the modes; §9 stress test, "Both modes".
+  - **Harness API:**
+    - **`ReplicaFactory` is the enum `Mode { Local, Remote }`** with `Mode::wrap(LocalReplica, peer) -> TestReplica`. Two variants and no state, so a trait with two impls would add nothing.
+    - Every pair is opened locally, as before. `Pair::over(mode)` then serves it. `Pair::mode()`, and `reopen_after` and `quarantine_grace` keep the mode (a served replica is taken back with `ServerHandle::into_replica`, changed, and served anew).
+    - `Tree::replica` is now a `TestReplica`: `Local(LocalReplica)` or `Remote { client: RemoteReplica, server: ServerHandle }`. It implements `Replica` and `Housekeeping`.
+      - `local()`/`local_mut()` give the `LocalReplica` (`Held`: a borrow, or the server's lock) for observations and local-only settings: index entries, config, quarantine, `caps_mut`, `set_event_source`.
+      - `into_local()`, `map(peer, f)`, `sweep_quarantine()`.
+    - Remote mode serves **both** replicas, so every engine call on either side crosses the protocol. One cached identity pair is shared by all loopback servers and clients (each pins the other), so a pair costs no key generation.
+    - `Housekeeping` for a served replica emulates `serve`: `next_sweep` is the server's next deadline, and `sweep` is `ServerHandle::sweep`.
+    - `Racing` wraps a `&mut dyn Replica`. In remote mode the edit runs before the client sends the request.
+    - `both_modes! { #[attr]* name, … }` (`#[macro_export]`) turns each `fn name(Mode)` into the tests `local::name` and `remote::name`. A function left out of the list is dead code, so clippy fails.
+  - **Suites:**
+    - `sync_once`: 18 × 2.
+    - `symlink_matrix`: 11 × 2. The rsync differential runs in both modes.
+    - `model`: `local::` and `remote::sync_matches_reference_model`, 256 cases each. `proptest!` sits inside the two modules, not the macro.
+    - `stress`: `local::` and `remote::writers_race_the_daemon`, both `#[ignore]`. A static lock makes them take turns.
+      - In remote mode the servers are spawned from a landlocked thread (`Pair::over` on a sandboxed helper thread), because a served replica commits on the server's connection threads and those threads inherit the accept thread's domain. The daemon thread is restricted as before.
+      - The initial sync now also runs in the chosen mode.
+    - `crash`, `attack`, `daemon` stay local-only, and only their two local-only calls changed (`local_mut()`). Their hooks and event sources live in the replica's process, and the remote paths are covered by the suites above and `tests/remote.rs`.
+  - **Results:**
+    - `sync_once` (36) and `symlink_matrix` (22) pass in both modes. The model test passes in both modes (~47 s for both together, debug).
+    - Stress: 3 consecutive runs of both tests at the defaults passed (~71 s per pair of runs), plus one earlier remote run. Remote runs look like local ones: ~18 700 writes, 37–40 cycles, ~2 900 applied steps, ~950 conflict copies made, ~4 000 retried steps, 4–8 blocked `EACCES` commits (local: 0–6), and the first final full cycle always applied nothing. The `EACCES` in remote mode come from the server threads, which confirms they are sandboxed.
+    - No engine, server or protocol change was needed: every scenario behaved the same over loopback.
+  - **Mutation check (by hand, not committed):** a server that answers every `Delete` with `PreconditionFailed` fails remote-mode tests (`remote::copy_links_write_back`, `remote::keep_dirlinks_adopts_and_writes_through`, …) while the local ones pass. So remote mode really goes through the server.
+  - **Not covered remotely:** crash and attack hooks across the connection (they would need the in-process server's threads to run the hooked commits; possible now, not done). There is also no retry of a request on a connection that dies mid-request (T21).
 
 ## M9: follow-ups
 

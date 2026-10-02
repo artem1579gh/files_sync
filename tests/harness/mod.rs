@@ -9,32 +9,68 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
+use std::net::TcpListener;
+use std::ops::{Deref, DerefMut};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::sync::{Arc, MutexGuard, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 
 use crossbeam_channel::Receiver;
 use files_sync::config::{FollowedWrite, ReplicaConfig, ReplicaId, SymlinkPolicy};
 use files_sync::engine::{Engine, Side, SyncReport};
 use files_sync::fs::{FileKind, RelPath, is_reserved};
 use files_sync::index::{Entry, Kind, PeerState, VersionVector};
-use files_sync::replica::{ContentReader, LocalReplica, Op, Outcome, Precondition, Replica};
+use files_sync::replica::{
+    ContentReader, Housekeeping, LocalReplica, Op, Outcome, Precondition, RemoteReplica, Replica,
+};
 use files_sync::scan::{ScanStats, Scope};
+use files_sync::server::{Server, ServerHandle};
+use files_sync::status::ReplicaStatus;
 use files_sync::symlink::{Treatment, classify, unmunge};
+use files_sync::tls::Identity;
 use files_sync::watch::Hint;
+
+/// Defines each listed test function, a `fn(Mode)`, as two tests:
+/// `local::name` and `remote::name` (design §9: every suite runs in both
+/// modes). Attributes before a name (e.g. `#[ignore]`) go to both tests.
+#[macro_export]
+macro_rules! both_modes {
+    ($($(#[$attr:meta])* $name:ident),* $(,)?) => {
+        mod local {
+            $(
+                #[test]
+                $(#[$attr])*
+                fn $name() {
+                    super::$name($crate::harness::Mode::Local)
+                }
+            )*
+        }
+        mod remote {
+            $(
+                #[test]
+                $(#[$attr])*
+                fn $name() {
+                    super::$name($crate::harness::Mode::Remote)
+                }
+            )*
+        }
+    };
+}
 
 /// Fixed replica IDs, so conflict names are predictable.
 pub const ID_A: ReplicaId = ReplicaId(0x1111_aaaa_0000_0001);
 pub const ID_B: ReplicaId = ReplicaId(0x2222_bbbb_0000_0002);
 
-/// One replica: its directory (the user's view) and the `LocalReplica`.
+/// One replica: its directory (the user's view) and the replica the engine
+/// syncs it through.
 pub struct Tree {
     root: PathBuf,
     /// Removes the directory on drop, unless the pair was opened at
     /// existing directories.
     _dir: Option<tempfile::TempDir>,
-    pub replica: LocalReplica,
+    pub replica: TestReplica,
 }
 
 /// Two replicas of one pair, sharing a state directory.
@@ -42,8 +78,238 @@ pub struct Pair {
     pub a: Tree,
     pub b: Tree,
     pub engine: Engine,
+    mode: Mode,
     state: PathBuf,
     _state: Option<tempfile::TempDir>,
+}
+
+/// How the engine reaches the replicas: the harness's replica factory
+/// (design §9). Every pair is opened locally; [`Pair::over`] then serves it
+/// in the chosen mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Mode {
+    /// The engine calls the `LocalReplica`s directly.
+    #[default]
+    Local,
+    /// Loopback-remote: each `LocalReplica` is served by an in-process
+    /// [`Server`] on 127.0.0.1, and the engine reaches it through a
+    /// [`RemoteReplica`] (TLS, wire protocol), as `sync` reaches a replica
+    /// on another host.
+    Remote,
+}
+
+impl Mode {
+    /// `replica` as the engine reaches it in this mode; `peer` is the other
+    /// replica's ID (the client acts for it).
+    pub fn wrap(self, replica: LocalReplica, peer: ReplicaId) -> TestReplica {
+        match self {
+            Mode::Local => TestReplica::Local(replica),
+            Mode::Remote => {
+                let (server_tls, client_tls) = loopback_tls();
+                let id = replica.id();
+                let server = Server::new(replica, peer, server_tls.clone())
+                    .spawn(TcpListener::bind("127.0.0.1:0").unwrap())
+                    .unwrap();
+                let addr = server.local_addr().to_string();
+                let client = RemoteReplica::with_tls(addr, peer, id, client_tls.clone()).unwrap();
+                TestReplica::Remote { client, server }
+            }
+        }
+    }
+}
+
+type LoopbackTls = (Arc<rustls::ServerConfig>, Arc<rustls::ClientConfig>);
+
+/// TLS configs for every loopback server and client: one identity for all
+/// servers, one for all clients, each pinning the other.
+fn loopback_tls() -> &'static LoopbackTls {
+    static TLS: OnceLock<LoopbackTls> = OnceLock::new();
+    TLS.get_or_init(|| {
+        let server = Identity::generate(ID_A).unwrap();
+        let client = Identity::generate(ID_B).unwrap();
+        (
+            server.server_config(client.device()).unwrap(),
+            client.client_config(server.device()).unwrap(),
+        )
+    })
+}
+
+/// A replica as the harness holds it: local, or served over loopback
+/// ([`Mode`]). The engine sees it through [`Replica`] (and the daemon
+/// through [`Housekeeping`]); the harness's own observations (index,
+/// config, quarantine) go to the `LocalReplica` directly, also when it is
+/// served ([`TestReplica::local`]).
+// A pair holds two of them; boxing would buy nothing.
+#[allow(clippy::large_enum_variant)]
+pub enum TestReplica {
+    Local(LocalReplica),
+    /// The client is dropped first, then the server.
+    Remote {
+        client: RemoteReplica,
+        server: ServerHandle,
+    },
+}
+
+/// The `LocalReplica` behind a [`TestReplica`]: borrowed, or locked in its
+/// server (which holds up every request meanwhile).
+pub enum Held<'a, R> {
+    Direct(R),
+    Served(MutexGuard<'a, LocalReplica>),
+}
+
+impl<R: Deref<Target = LocalReplica>> Deref for Held<'_, R> {
+    type Target = LocalReplica;
+
+    fn deref(&self) -> &LocalReplica {
+        match self {
+            Held::Direct(r) => r,
+            Held::Served(g) => g,
+        }
+    }
+}
+
+impl<R: DerefMut<Target = LocalReplica>> DerefMut for Held<'_, R> {
+    fn deref_mut(&mut self) -> &mut LocalReplica {
+        match self {
+            Held::Direct(r) => r,
+            Held::Served(g) => g,
+        }
+    }
+}
+
+impl TestReplica {
+    pub fn mode(&self) -> Mode {
+        match self {
+            TestReplica::Local(_) => Mode::Local,
+            TestReplica::Remote { .. } => Mode::Remote,
+        }
+    }
+
+    /// The `LocalReplica`, for observations the protocol does not offer.
+    pub fn local(&self) -> Held<'_, &LocalReplica> {
+        match self {
+            TestReplica::Local(r) => Held::Direct(r),
+            TestReplica::Remote { server, .. } => Held::Served(server.replica()),
+        }
+    }
+
+    /// The `LocalReplica`, for settings the protocol does not offer.
+    pub fn local_mut(&mut self) -> Held<'_, &mut LocalReplica> {
+        match self {
+            TestReplica::Local(r) => Held::Direct(r),
+            TestReplica::Remote { server, .. } => Held::Served(server.replica()),
+        }
+    }
+
+    /// The `LocalReplica`, closed for any server: a served one is taken
+    /// back once its server has stopped.
+    pub fn into_local(self) -> LocalReplica {
+        match self {
+            TestReplica::Local(r) => r,
+            TestReplica::Remote { client, server } => {
+                drop(client);
+                server.into_replica()
+            }
+        }
+    }
+
+    /// Changes the `LocalReplica` (which `f` takes by value), keeping the
+    /// mode; a served replica is served anew.
+    pub fn map(self, peer: ReplicaId, f: impl FnOnce(LocalReplica) -> LocalReplica) -> Self {
+        let mode = self.mode();
+        mode.wrap(f(self.into_local()), peer)
+    }
+
+    pub fn sweep_quarantine(&mut self) {
+        self.local_mut().sweep_quarantine();
+    }
+
+    fn get(&self) -> &dyn Replica {
+        match self {
+            TestReplica::Local(r) => r,
+            TestReplica::Remote { client, .. } => client,
+        }
+    }
+
+    fn get_mut(&mut self) -> &mut dyn Replica {
+        match self {
+            TestReplica::Local(r) => r,
+            TestReplica::Remote { client, .. } => client,
+        }
+    }
+}
+
+impl Replica for TestReplica {
+    fn id(&self) -> ReplicaId {
+        self.get().id()
+    }
+
+    fn scan(&mut self, scope: Scope) -> files_sync::Result<ScanStats> {
+        self.get_mut().scan(scope)
+    }
+
+    fn changes_since(&self, seq: u64) -> files_sync::Result<Vec<(RelPath, Entry)>> {
+        self.get().changes_since(seq)
+    }
+
+    fn open_read(
+        &self,
+        path: &RelPath,
+        expect: &Entry,
+    ) -> files_sync::Result<Box<dyn ContentReader>> {
+        self.get().open_read(path, expect)
+    }
+
+    fn apply(
+        &mut self,
+        path: &RelPath,
+        op: Op,
+        pre: Precondition,
+        content: Option<&mut dyn Read>,
+    ) -> files_sync::Result<Outcome> {
+        self.get_mut().apply(path, op, pre, content)
+    }
+
+    fn watch(&mut self) -> Option<Receiver<Hint>> {
+        self.get_mut().watch()
+    }
+
+    fn adopt(&mut self, path: &RelPath) -> files_sync::Result<bool> {
+        self.get_mut().adopt(path)
+    }
+
+    fn record_sync(
+        &mut self,
+        peer: ReplicaId,
+        tombstones: Vec<(RelPath, VersionVector, PeerState)>,
+        retention: Duration,
+    ) -> files_sync::Result<Vec<RelPath>> {
+        self.get_mut().record_sync(peer, tombstones, retention)
+    }
+}
+
+/// A served replica is swept as `serve` sweeps it: when its grace periods
+/// end (and by the server itself after every `RecordSync`).
+impl Housekeeping for TestReplica {
+    fn next_sweep(&self) -> Option<Instant> {
+        self.local().quarantine().next_deadline()
+    }
+
+    fn sweep(&mut self) {
+        match self {
+            TestReplica::Local(r) => r.sweep(),
+            TestReplica::Remote { server, .. } => {
+                server.sweep();
+            }
+        }
+    }
+
+    fn status(&self, peer: ReplicaId) -> files_sync::Result<ReplicaStatus> {
+        match self {
+            TestReplica::Local(r) => r.status(peer),
+            TestReplica::Remote { client, .. } => client.status(peer),
+        }
+    }
 }
 
 /// A replica's symlink settings (design §4.3).
@@ -102,13 +368,14 @@ impl Pair {
             Tree {
                 root: dir.path().to_path_buf(),
                 _dir: Some(dir),
-                replica,
+                replica: TestReplica::Local(replica),
             }
         };
         Pair {
             a: tree(ID_A, a.into()),
             b: tree(ID_B, b.into()),
             engine: Engine::new(),
+            mode: Mode::Local,
             state: state.path().to_path_buf(),
             _state: Some(state),
         }
@@ -132,29 +399,58 @@ impl Pair {
         let tree = |root: &Path, id, opts: Opts| Tree {
             root: root.to_path_buf(),
             _dir: None,
-            replica: open_replica(root, state, id, opts),
+            replica: TestReplica::Local(open_replica(root, state, id, opts)),
         };
         Pair {
             a: tree(a, ID_A, opts_a.into()),
             b: tree(b, ID_B, opts_b.into()),
             engine: Engine::new(),
+            mode: Mode::Local,
             state: state.to_path_buf(),
             _state: None,
+        }
+    }
+
+    /// The pair with its replicas reached in `mode`: the engine syncs
+    /// them directly, or through a server each, over loopback TLS.
+    pub fn over(self, mode: Mode) -> Pair {
+        let (ida, idb) = (self.a.id(), self.b.id());
+        let wrap = |t: Tree, peer| Tree {
+            replica: mode.wrap(t.replica.into_local(), peer),
+            ..t
+        };
+        Pair {
+            a: wrap(self.a, idb),
+            b: wrap(self.b, ida),
+            mode,
+            ..self
+        }
+    }
+
+    /// How the engine reaches the replicas.
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    /// Changes both `LocalReplica`s (`f` takes each by value), keeping the
+    /// mode.
+    fn map(self, f: impl Fn(LocalReplica) -> LocalReplica) -> Pair {
+        let (ida, idb) = (self.a.id(), self.b.id());
+        let map = |t: Tree, peer| Tree {
+            replica: t.replica.map(peer, &f),
+            ..t
+        };
+        Pair {
+            a: map(self.a, idb),
+            b: map(self.b, ida),
+            ..self
         }
     }
 
     /// Overrides both replicas' quarantine grace period (zero by default,
     /// see [`open_replica`]).
     pub fn quarantine_grace(self, grace: Duration) -> Pair {
-        let grace = |t: Tree| Tree {
-            replica: t.replica.quarantine_grace(grace),
-            ..t
-        };
-        Pair {
-            a: grace(self.a),
-            b: grace(self.b),
-            ..self
-        }
+        self.map(|r| r.quarantine_grace(grace))
     }
 
     /// The roots of A and B, and the state directory.
@@ -169,23 +465,28 @@ impl Pair {
             a,
             b,
             engine,
+            mode,
             state,
             _state,
         } = self;
         let (ida, idb) = (a.replica.id(), b.replica.id());
         let (oa, ob) = (a.opts(), b.opts());
-        let close = |t: Tree| (t.root, t._dir);
+        let close = |t: Tree| {
+            drop(t.replica.into_local());
+            (t.root, t._dir)
+        };
         let (a, b) = (close(a), close(b));
         f();
-        let open = |(root, dir): (PathBuf, Option<tempfile::TempDir>), id, opts| Tree {
-            replica: open_replica(&root, &state, id, opts),
+        let open = |(root, dir): (PathBuf, Option<tempfile::TempDir>), id, peer, opts| Tree {
+            replica: mode.wrap(open_replica(&root, &state, id, opts), peer),
             root,
             _dir: dir,
         };
         Pair {
-            a: open(a, ida, oa),
-            b: open(b, idb, ob),
+            a: open(a, ida, idb, oa),
+            b: open(b, idb, ida, ob),
             engine,
+            mode,
             state,
             _state,
         }
@@ -252,7 +553,10 @@ impl Pair {
     pub fn assert_converged(&mut self) {
         for t in [&mut self.a, &mut self.b] {
             t.replica.sweep_quarantine();
-            assert!(t.replica.quarantine().is_empty(), "quarantine not empty");
+            assert!(
+                t.replica.local().quarantine().is_empty(),
+                "quarantine not empty"
+            );
         }
         let (ta, tb) = (self.a.synced(), self.b.synced());
         assert_eq!(ta, tb, "trees differ (left: A, right: B)");
@@ -298,14 +602,15 @@ impl Race {
     }
 }
 
-/// A replica that runs a user edit at one chosen moment of a sync.
+/// A replica that runs a user edit at one chosen moment of a sync (in
+/// remote mode, before the client sends the request).
 struct Racing<'r> {
-    inner: &'r mut LocalReplica,
+    inner: &'r mut dyn Replica,
     race: Option<Race>,
 }
 
 impl<'r> Racing<'r> {
-    fn new(inner: &'r mut LocalReplica) -> Racing<'r> {
+    fn new(inner: &'r mut dyn Replica) -> Racing<'r> {
         Racing { inner, race: None }
     }
 
@@ -361,7 +666,7 @@ impl Replica for Racing<'_> {
         &mut self,
         peer: ReplicaId,
         tombstones: Vec<(RelPath, VersionVector, PeerState)>,
-        retention: std::time::Duration,
+        retention: Duration,
     ) -> files_sync::Result<Vec<RelPath>> {
         self.inner.record_sync(peer, tombstones, retention)
     }
@@ -615,12 +920,13 @@ impl Tree {
 
     /// The index entry at `rel`.
     pub fn entry(&self, rel: &str) -> Option<Entry> {
-        self.replica.index().get(&rp(rel)).unwrap()
+        self.replica.local().index().get(&rp(rel)).unwrap()
     }
 
     /// This replica's symlink settings.
     pub fn opts(&self) -> Opts {
-        let c = self.replica.config();
+        let replica = self.replica.local();
+        let c = replica.config();
         Opts {
             policy: c.symlinks,
             munge_links: c.munge_links,

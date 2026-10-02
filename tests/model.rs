@@ -38,7 +38,7 @@ use std::io::Write as _;
 
 use files_sync::config::{ReplicaId, SymlinkPolicy};
 use files_sync::engine::Side;
-use harness::{ID_A, ID_B, Pair, Tree, id7};
+use harness::{ID_A, ID_B, Mode, Pair, Tree, id7};
 use proptest::prelude::*;
 use rustix::fs::{AtFlags, CWD, Timespec, Timestamps, utimensat};
 
@@ -497,9 +497,9 @@ struct Run {
 }
 
 impl Run {
-    fn new() -> Run {
+    fn new(m: Mode) -> Run {
         Run {
-            pair: Pair::new(SymlinkPolicy::Links),
+            pair: Pair::new(SymlinkPolicy::Links).over(m),
             model: Model::default(),
             clock: EPOCH,
             writes: 0,
@@ -670,20 +670,38 @@ impl Run {
     }
 }
 
-/// Runs `ops`, then a final sync.
-fn run(ops: &[Op]) -> Result<(), String> {
-    let mut r = Run::new();
+/// Runs `ops`, then a final sync, with the replicas reached in `m`.
+fn run(m: Mode, ops: &[Op]) -> Result<(), String> {
+    let mut r = Run::new(m);
     for op in ops.iter().chain([&Op::Sync]) {
         r.step(op)?;
     }
     Ok(())
 }
 
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(256))]
+mod local {
+    use super::*;
 
-    #[test]
-    fn sync_matches_reference_model(ops in prop::collection::vec(arb_op(), 1..40)) {
-        run(&ops).map_err(TestCaseError::fail)?;
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn sync_matches_reference_model(ops in prop::collection::vec(arb_op(), 1..40)) {
+            run(Mode::Local, &ops).map_err(TestCaseError::fail)?;
+        }
+    }
+}
+
+/// The same over loopback-remote replicas (design §9).
+mod remote {
+    use super::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn sync_matches_reference_model(ops in prop::collection::vec(arb_op(), 1..40)) {
+            run(Mode::Remote, &ops).map_err(TestCaseError::fail)?;
+        }
     }
 }

@@ -43,6 +43,13 @@
 //!   of a writer (uniformly random);
 //! - `FSYNC_STRESS_SEED` (from the clock): the writers' random seed;
 //! - `FSYNC_STRESS_SANDBOX` (1): 0 runs the daemon without landlock.
+//!
+//! The test runs in both harness modes (T22): `local::writers_race_the_daemon`
+//! syncs the `LocalReplica`s directly, `remote::writers_race_the_daemon`
+//! through loopback servers. A served replica commits on its server's
+//! connection threads, so in remote mode the servers are started from a
+//! sandboxed thread too, and inherit its landlock domain. The two runs take
+//! turns (a lock), so each has the machine to itself.
 
 mod harness;
 
@@ -914,11 +921,11 @@ fn unconflict(path: &str) -> String {
     p
 }
 
-#[test]
-#[ignore = "long; cargo test --release --test stress -- --ignored"]
-fn writers_race_the_daemon() {
+fn writers_race_the_daemon(mode: harness::Mode) {
+    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let cfg = Config::from_env();
-    eprintln!("stress: {cfg:?}");
+    eprintln!("stress: {mode:?}, {cfg:?}");
     let base = tempfile::tempdir().unwrap();
     let dir = |name: &str| {
         let p = base.path().join(name);
@@ -943,14 +950,29 @@ fn writers_race_the_daemon() {
         User::new('B', &b, &scratch[1], &outside, cfg.slots),
     ];
     let mut logs = vec![seed(&users[0], cfg.slots)];
-    let mut pair = Pair::open_at(&a, &b, &state, SymlinkPolicy::Links)
-        .quarantine_grace(Quarantine::DEFAULT_GRACE);
-    pair.sync();
-
     let sandboxed = cfg.sandbox && sandbox::abi().is_some();
     if cfg.sandbox && !sandboxed {
         eprintln!("stress: landlock is not supported here; the daemon runs without a sandbox");
     }
+    let writable = [a.clone(), b.clone(), state.clone()];
+    let restrict = move || {
+        if sandboxed {
+            let dirs: Vec<&Path> = writable.iter().map(|p| p.as_path()).collect();
+            sandbox::restrict(&dirs).expect("landlock");
+        }
+    };
+    let pair = Pair::open_at(&a, &b, &state, SymlinkPolicy::Links)
+        .quarantine_grace(Quarantine::DEFAULT_GRACE);
+    // Served replicas commit on their servers' threads: start the servers
+    // from a sandboxed thread.
+    let restrict_servers = restrict.clone();
+    let mut pair = std::thread::spawn(move || {
+        restrict_servers();
+        pair.over(mode)
+    })
+    .join()
+    .unwrap();
+    pair.sync();
     let (tx, reports) = crossbeam_channel::unbounded();
     let daemon = Daemon::new().reports(tx);
     let t0 = Instant::now();
@@ -959,12 +981,8 @@ fn writers_race_the_daemon() {
     let stats = std::thread::scope(|s| {
         let (stop, stopped) = crossbeam_channel::bounded::<()>(1);
         let (ra, rb) = (&mut pair.a.replica, &mut pair.b.replica);
-        let writable = [a.clone(), b.clone(), state.clone()];
         let running = s.spawn(move || {
-            if sandboxed {
-                let dirs: Vec<&Path> = writable.iter().map(|p| p.as_path()).collect();
-                sandbox::restrict(&dirs).expect("landlock");
-            }
+            restrict();
             daemon.run(ra, rb, &stopped)
         });
         let pause_ms = cfg.pause_ms;
@@ -1166,4 +1184,9 @@ fn writers_race_the_daemon() {
         }
         panic!("{} of {live} live writes were lost", lost.len());
     }
+}
+
+both_modes! {
+    #[ignore = "long; cargo test --release --test stress -- --ignored"]
+    writers_race_the_daemon,
 }

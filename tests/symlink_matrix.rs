@@ -162,7 +162,7 @@ struct World {
 }
 
 impl World {
-    fn new(a: impl Into<Opts>, b: impl Into<Opts>) -> World {
+    fn new(m: Mode, a: impl Into<Opts>, b: impl Into<Opts>) -> World {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path();
         for d in ["a", "b", "state", "outside/od"] {
@@ -173,7 +173,7 @@ impl World {
         for f in ["outside/of", "outside/od/ox"] {
             set_mtime(&p.join(f), NEW);
         }
-        let pair = Pair::open_at_with(&p.join("a"), &p.join("b"), &p.join("state"), a, b);
+        let pair = Pair::open_at_with(&p.join("a"), &p.join("b"), &p.join("state"), a, b).over(m);
         World { dir, pair }
     }
 
@@ -317,9 +317,9 @@ fn rsync_into_c(w: &World, src: Side, opts: &[&str]) -> Option<BTreeMap<String, 
 
 /// The link is made on `from`; one sync must give the other side the
 /// matrix's result, and rsync must agree.
-fn one_way(policy: SymlinkPolicy, case: Case, from: Side) {
+fn one_way(m: Mode, policy: SymlinkPolicy, case: Case, from: Side) {
     let ctx = format!("{policy:?} {case:?} from {from:?}");
-    let mut w = World::new(policy, policy);
+    let mut w = World::new(m, policy, policy);
     w.base(from);
     let to = if from == Side::A { Side::B } else { Side::A };
     let target = case.target(&w.p());
@@ -345,9 +345,9 @@ fn one_way(policy: SymlinkPolicy, case: Case, from: Side) {
 }
 
 /// A makes the link while B writes an older plain file at the same path.
-fn both_changed(policy: SymlinkPolicy, case: Case) {
+fn both_changed(m: Mode, policy: SymlinkPolicy, case: Case) {
     let ctx = format!("{policy:?} {case:?} both changed");
-    let mut w = World::new(policy, policy);
+    let mut w = World::new(m, policy, policy);
     w.base(Side::A);
     let (at, target) = (case.link(), case.target(&w.p()));
     w.pair.a.symlink(at, &target);
@@ -382,56 +382,49 @@ fn both_changed(policy: SymlinkPolicy, case: Case) {
     }
 }
 
-fn matrix(policy: SymlinkPolicy) {
+fn matrix(m: Mode, policy: SymlinkPolicy) {
     for case in CASES {
-        one_way(policy, case, Side::A);
-        one_way(policy, case, Side::B);
-        both_changed(policy, case);
+        one_way(m, policy, case, Side::A);
+        one_way(m, policy, case, Side::B);
+        both_changed(m, policy, case);
     }
 }
 
-#[test]
-fn matrix_skip() {
-    matrix(Skip);
+fn matrix_skip(m: Mode) {
+    matrix(m, Skip);
 }
 
-#[test]
-fn matrix_links() {
-    matrix(Links);
+fn matrix_links(m: Mode) {
+    matrix(m, Links);
 }
 
-#[test]
-fn matrix_copy_links() {
-    matrix(CopyLinks);
+fn matrix_copy_links(m: Mode) {
+    matrix(m, CopyLinks);
 }
 
-#[test]
-fn matrix_copy_unsafe_links() {
-    matrix(CopyUnsafeLinks);
+fn matrix_copy_unsafe_links(m: Mode) {
+    matrix(m, CopyUnsafeLinks);
 }
 
-#[test]
-fn matrix_safe_links() {
-    matrix(SafeLinks);
+fn matrix_safe_links(m: Mode) {
+    matrix(m, SafeLinks);
 }
 
-#[test]
-fn matrix_copy_dirlinks() {
-    matrix(CopyDirlinks);
+fn matrix_copy_dirlinks(m: Mode) {
+    matrix(m, CopyDirlinks);
 }
 
 /// `--munge-links` on the sending replica: what it stores munged arrives
 /// unmunged, and what the user made unmunged arrives as it is. rsync's
 /// sender unmunges the same way.
-#[test]
-fn munged_sender() {
+fn munged_sender(m: Mode) {
     for policy in [Links, SafeLinks, CopyUnsafeLinks] {
         let munged = Opts {
             policy,
             munge_links: true,
             ..Opts::default()
         };
-        let mut w = World::new(munged, policy);
+        let mut w = World::new(m, munged, policy);
         w.base(Side::A);
         let a = &w.pair.a;
         symlink("/rsyncd-munged/f", a.path("m")).unwrap();
@@ -481,9 +474,8 @@ fn munged_sender() {
 /// `-L`: a change from the peer replaces the followed link by a real object,
 /// as rsync's receiver does; a change beneath a followed directory first
 /// turns it into a real copy. What the links pointed to is never written.
-#[test]
-fn copy_links_write_back() {
-    let mut w = World::new(CopyLinks, CopyLinks);
+fn copy_links_write_back(m: Mode) {
+    let mut w = World::new(m, CopyLinks, CopyLinks);
     let a = &w.pair.a;
     a.write_at("f", "F", NEW);
     a.write_at("d/x", "X", NEW);
@@ -515,14 +507,13 @@ fn copy_links_write_back() {
 
 /// `followed_write = conflict`: the links stay; incoming versions become
 /// conflict copies beside them, and the local version goes back.
-#[test]
-fn followed_write_conflict_keeps_links() {
+fn followed_write_conflict_keeps_links(m: Mode) {
     let opts = Opts {
         policy: CopyLinks,
         followed_write: files_sync::config::FollowedWrite::Conflict,
         ..Opts::default()
     };
-    let mut w = World::new(opts, opts);
+    let mut w = World::new(m, opts, opts);
     let a = &w.pair.a;
     a.write_at("f", "F", NEW);
     a.write_at("d/x", "X", NEW);
@@ -556,13 +547,12 @@ fn followed_write_conflict_keeps_links() {
 
 /// `-K`: B's link to a directory, where A has a real directory, is adopted;
 /// A's files are written through it. rsync `-K` agrees.
-#[test]
-fn keep_dirlinks_adopts_and_writes_through() {
+fn keep_dirlinks_adopts_and_writes_through(m: Mode) {
     let kept = Opts {
         keep_dirlinks: true,
         ..Opts::default()
     };
-    let mut w = World::new(Links, kept);
+    let mut w = World::new(m, Links, kept);
     w.pair.a.mkdir("real");
     w.pair.sync();
     w.pair.b.symlink("k", "real");
@@ -607,15 +597,14 @@ fn keep_dirlinks_adopts_and_writes_through() {
 
 /// `-K` with a directory outside the root: adopted only with
 /// `--keep-dirlinks-unsafe`; otherwise A's directory wins the type conflict.
-#[test]
-fn keep_dirlinks_outside_the_root() {
+fn keep_dirlinks_outside_the_root(m: Mode) {
     for unsafe_ok in [false, true] {
         let kept = Opts {
             keep_dirlinks: true,
             keep_dirlinks_unsafe: unsafe_ok,
             ..Opts::default()
         };
-        let mut w = World::new(Links, kept);
+        let mut w = World::new(m, Links, kept);
         w.pair.b.symlink("k", "../outside/od");
         w.pair.a.write_at("k/y", "Y", NEW);
         w.pair.sync();
@@ -633,4 +622,18 @@ fn keep_dirlinks_outside_the_root() {
         }
         w.pair.assert_converged();
     }
+}
+
+both_modes! {
+    matrix_skip,
+    matrix_links,
+    matrix_copy_links,
+    matrix_copy_unsafe_links,
+    matrix_safe_links,
+    matrix_copy_dirlinks,
+    munged_sender,
+    copy_links_write_back,
+    followed_write_conflict_keeps_links,
+    keep_dirlinks_adopts_and_writes_through,
+    keep_dirlinks_outside_the_root,
 }

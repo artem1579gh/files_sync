@@ -206,7 +206,7 @@ fn injected_overflow_triggers_a_full_rescan() {
     let mut p = Pair::new(SymlinkPolicy::Links);
     // A's watcher reads only what the test injects: its edits go unseen.
     let (inject, source) = ChannelSource::new();
-    p.a.replica.set_event_source(Box::new(source));
+    p.a.replica.local_mut().set_event_source(Box::new(source));
     p.a.write("old.txt", "old");
     let ((), stats) = with_daemon(&mut p, Daemon::new(), |c| {
         assert!(c.next_cycle(START).full);
@@ -234,9 +234,9 @@ fn injected_overflow_triggers_a_full_rescan() {
 fn periodic_rescan_catches_what_the_watchers_miss() {
     let mut p = Pair::new(SymlinkPolicy::Links);
     let (_quiet_a, source) = ChannelSource::new();
-    p.a.replica.set_event_source(Box::new(source));
+    p.a.replica.local_mut().set_event_source(Box::new(source));
     let (_quiet_b, source) = ChannelSource::new();
-    p.b.replica.set_event_source(Box::new(source));
+    p.b.replica.local_mut().set_event_source(Box::new(source));
     let daemon = Daemon::new().rescan_every(Duration::from_secs(1));
     with_daemon(&mut p, daemon, |c| {
         assert!(c.next_cycle(START).full);
