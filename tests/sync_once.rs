@@ -272,6 +272,23 @@ fn symlinks_under_links() {
     assert!(kept.contains(&"from-a".to_owned()) && kept.contains(&"from-b".to_owned()));
 }
 
+/// Found by `tests/model.rs` (T14), where the model got it wrong: a symlink
+/// re-created with the same target (new inode and mtime) is no change, so a
+/// concurrent retarget on the other side wins without a conflict.
+#[test]
+fn recreated_symlink_with_same_target_is_not_a_change() {
+    let mut p = pair();
+    p.a.symlink("l", "t");
+    p.sync();
+    p.a.symlink("l", "t");
+    p.b.symlink("l", "u");
+    let r = p.sync();
+    p.assert_converged();
+    assert!(r.conflicts.is_empty(), "{r:#?}");
+    assert_eq!(p.a.readlink("l"), "u");
+    assert_eq!(p.a.ls(), ["l"]);
+}
+
 #[test]
 fn symlinks_under_skip_are_left_alone() {
     let mut p = Pair::new(SymlinkPolicy::Skip);

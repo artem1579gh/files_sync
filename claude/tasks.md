@@ -417,7 +417,7 @@ The design lives in [`design.md`](design.md); §N.M below refers to its sections
     - races: destination edited before `apply` → retry → conflict; source rewritten before `open_read` → `Unstable` → resent; directory filled just before `Rmdir` → kept.
   - Mutation-checked: skipping conflict renames, or not rescanning dirty paths, makes tests fail.
 
-### [ ] T14: Model-based property test
+### [x] T14: Model-based property test
 - **Depends on:** T13
 - **Read:** §9
 - **Files:** `tests/model.rs`
@@ -427,6 +427,13 @@ The design lives in [`design.md`](design.md); §N.M below refers to its sections
   - After a final sync, compare the model with the real trees: equal paths, and the content sets including conflict copies.
 - **Done when:** 256 cases pass. Every shrunk failure found along the way gets fixed and added as a regression scenario in `tests/sync_once.rs`.
 - **Notes:**
+  - **Model** (`tests/model.rs`, design §9 updated): independent of the engine. Causal history per path is a set of event IDs, not a vv. Events are recorded at sync time, like the scanner: only when a path differs from its record (kind, content, target; mtime for files only). Per-path resolution, then a deepest-first resurrection pass. Conflict copies are predicted as (dir, origin name, loser's ID7, content) and their real names adopted from disk; everything else must match exactly after **every** sync, on top of `Pair::assert_converged`.
+  - **Ops** (on A or B, paths of 1–3 components over `{a, b}`): write (unique content and mtime; replaces a dir or link, creates parents), append, recursive delete, mkdir (replaces a file or link), rmdir (empty only), symlink (5 targets: relative, nested, `../`, absolute dangling, `.`), rename (to a free path in an existing dir), sync. An op whose precondition does not hold (e.g. a file ancestor) is a no-op in both model and tree. Mode changes are not generated (dir-vs-dir mode conflicts stay covered by `engine/sim.rs`).
+  - **Symlink mtimes:** a symlink's recorded mtime decides symlink-vs-symlink conflicts. A synced link's on-disk mtime is the commit time, so the user op gives every created or moved (renamed, or inside a renamed dir) link a fresh mtime via `utimensat(AT_SYMLINK_NOFOLLOW)`.
+  - **Results:** 256 cases (~35 s debug) pass; 5000 cases in release passed too. Per 256 cases about 200 conflict copies and 100 resurrections (a third over a type change) are predicted and checked.
+  - **Shrunk failures:** one, a model bug (a symlink re-created with the same target is no change; the model compared its mtime). Added as `recreated_symlink_with_same_target_is_not_a_change` in `tests/sync_once.rs`. No engine bug found.
+  - Mutation-checked: inverting the §6.2 winner or disabling resurrection in `reconcile` fails within a few cases.
+  - Not covered: user edits *during* a sync (the `Racing` scenarios in `sync_once.rs`, and T19's stress test), policies other than `Links` (T17).
 
 ## M4: durability
 
