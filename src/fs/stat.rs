@@ -353,17 +353,7 @@ impl StableReader {
         size: u64,
         hash: [u8; 32],
     ) -> Result<StableReader> {
-        validate_name(name)?;
-        let fd = open_for_read(parent.as_fd(), name).map_err(|e| open_err(what, e))?;
-        let name = name.to_vec();
-        let recheck: Recheck =
-            Box::new(
-                move |f2| match Fingerprint::at_opt(parent.as_fd(), &name)? {
-                    Some(f3) if f2.same_file(&f3) => Ok(None),
-                    Some(_) => Ok(Some("name replaced during read")),
-                    None => Ok(Some("name removed during read")),
-                },
-            );
+        let (fd, recheck) = open_checked(what, parent, name)?;
         StableReader::new(what, fd, size, hash, recheck)
     }
 
@@ -473,6 +463,89 @@ impl Read for StableReader {
         }
         self.hasher.update(&buf[..n]);
         Ok(n)
+    }
+}
+
+/// Opens the file `parent/name` for reading (not following a symlink at
+/// `name`), with the [`Recheck`] that `name` is still the same inode at the
+/// end. `what` names the file in errors.
+pub fn open_checked(what: &[u8], parent: OwnedFd, name: &[u8]) -> Result<(OwnedFd, Recheck)> {
+    validate_name(name)?;
+    let fd = open_for_read(parent.as_fd(), name).map_err(|e| open_err(what, e))?;
+    let name = name.to_vec();
+    let recheck: Recheck = Box::new(
+        move |f2| match Fingerprint::at_opt(parent.as_fd(), &name)? {
+            Some(f3) if f2.same_file(&f3) => Ok(None),
+            Some(_) => Ok(Some("name replaced during read")),
+            None => Ok(Some("name removed during read")),
+        },
+    );
+    Ok((fd, recheck))
+}
+
+/// A regular file open for reads at chosen offsets (block-level delta
+/// transfer, design §7.1), checked like a [`StableReader`] when done: the
+/// caller compares [`PinnedFile::fingerprint`] with what it expects, reads
+/// with [`PinnedFile::read_at`], and finally calls [`PinnedFile::verify`],
+/// which closes the file.
+pub struct PinnedFile {
+    what: Vec<u8>,
+    fd: OwnedFd,
+    f1: Fingerprint,
+    recheck: Recheck,
+}
+
+impl PinnedFile {
+    /// Takes the file open at `fd`; `recheck` runs in [`PinnedFile::verify`].
+    pub fn new(what: &[u8], fd: OwnedFd, recheck: Recheck) -> Result<PinnedFile> {
+        let f1 = Fingerprint::of_fd(fd.as_fd())?;
+        if f1.kind != FileKind::File {
+            return Err(Error::Unstable {
+                path: what.to_vec(),
+                reason: "not a regular file",
+            });
+        }
+        Ok(PinnedFile {
+            what: what.to_vec(),
+            fd,
+            f1,
+            recheck,
+        })
+    }
+
+    /// The fingerprint when the file was opened.
+    pub fn fingerprint(&self) -> &Fingerprint {
+        &self.f1
+    }
+
+    /// Fills `buf` from `offset`; `Ok(false)` if the file ends first.
+    pub fn read_at(&self, mut buf: &mut [u8], mut offset: u64) -> Result<bool> {
+        while !buf.is_empty() {
+            match rustix::io::pread(&self.fd, &mut *buf, offset) {
+                Ok(0) => return Ok(false),
+                Ok(n) => {
+                    buf = &mut buf[n..];
+                    offset += n as u64;
+                }
+                Err(Errno::INTR) => {}
+                Err(e) => {
+                    let what = self.what.escape_ascii();
+                    return Err(Error::io(format!("read {what}"), e.into()));
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// The checks at the end, as a [`StableReader`]'s at EOF: the file is
+    /// unchanged since it was opened, and still reachable the way it was
+    /// opened. `Ok(Some(reason))` if not. Closes the file.
+    pub fn verify(mut self) -> Result<Option<&'static str>> {
+        let f2 = Fingerprint::of_fd(self.fd.as_fd())?;
+        if !self.f1.unchanged(&f2) {
+            return Ok(Some("file changed during read"));
+        }
+        (self.recheck)(&f2)
     }
 }
 

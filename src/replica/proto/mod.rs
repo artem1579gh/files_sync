@@ -31,8 +31,12 @@ use crate::error::{Error, Result};
 /// The first bytes of every [`Hello`] and [`HelloReply`].
 pub const MAGIC: [u8; 8] = *b"fsync\x00wp";
 
-/// The protocol version this build speaks best.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// The protocol version this build speaks best. Version 2 added the
+/// block-level delta transfer (`Blocks`, `ReadBlocks`, `ApplyDelta`).
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// The first version with block-level delta transfer.
+pub const DELTA_VERSION: u32 = 2;
 
 /// The oldest protocol version this build still speaks.
 pub const MIN_PROTOCOL_VERSION: u32 = 1;
@@ -72,10 +76,22 @@ pub fn client_handshake<S: Read + Write + ?Sized>(
     local: ReplicaId,
     expect_peer: ReplicaId,
 ) -> Result<Session> {
+    client_handshake_upto(stream, local, expect_peer, PROTOCOL_VERSION)
+}
+
+/// [`client_handshake`], offering versions up to `max_version` only (at
+/// most [`PROTOCOL_VERSION`]; tests force older sessions with it).
+pub fn client_handshake_upto<S: Read + Write + ?Sized>(
+    stream: &mut S,
+    local: ReplicaId,
+    expect_peer: ReplicaId,
+    max_version: u32,
+) -> Result<Session> {
+    let max_version = max_version.clamp(MIN_PROTOCOL_VERSION, PROTOCOL_VERSION);
     let hello = Hello {
         magic: MAGIC,
         min_version: MIN_PROTOCOL_VERSION,
-        max_version: PROTOCOL_VERSION,
+        max_version,
         replica: local,
     };
     write_frame(stream, &hello)?;
@@ -89,11 +105,11 @@ pub fn client_handshake<S: Read + Write + ?Sized>(
             Err(refused(format!("server refused the session: {reason}")))
         }
         HelloReply::Welcome { version, .. }
-            if !(MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&version) =>
+            if !(MIN_PROTOCOL_VERSION..=max_version).contains(&version) =>
         {
             Err(refused(format!(
                 "server chose protocol version {version}, we speak \
-                 {MIN_PROTOCOL_VERSION}..={PROTOCOL_VERSION}"
+                 {MIN_PROTOCOL_VERSION}..={max_version}"
             )))
         }
         HelloReply::Welcome { replica, .. } if replica != expect_peer => Err(refused(format!(
@@ -118,12 +134,24 @@ pub fn server_handshake<S: Read + Write + ?Sized>(
     local: ReplicaId,
     expect_peer: ReplicaId,
 ) -> Result<Session> {
+    server_handshake_upto(stream, local, expect_peer, PROTOCOL_VERSION)
+}
+
+/// [`server_handshake`], speaking versions up to `max_version` only (at
+/// most [`PROTOCOL_VERSION`]; tests force older sessions with it).
+pub fn server_handshake_upto<S: Read + Write + ?Sized>(
+    stream: &mut S,
+    local: ReplicaId,
+    expect_peer: ReplicaId,
+    max_version: u32,
+) -> Result<Session> {
+    let max_version = max_version.clamp(MIN_PROTOCOL_VERSION, PROTOCOL_VERSION);
     let hello = read_frame::<_, Hello>(stream)?
         .ok_or_else(|| refused("connection closed before the handshake"))?;
     if hello.magic != MAGIC {
         return Err(refused("not a files_sync client (bad magic)"));
     }
-    let version = PROTOCOL_VERSION.min(hello.max_version);
+    let version = max_version.min(hello.max_version);
     let problem = if hello.min_version > hello.max_version {
         Some(format!(
             "empty version range {}..={}",
@@ -132,7 +160,7 @@ pub fn server_handshake<S: Read + Write + ?Sized>(
     } else if version < MIN_PROTOCOL_VERSION.max(hello.min_version) {
         Some(format!(
             "no common protocol version: client speaks {}..={}, server \
-             {MIN_PROTOCOL_VERSION}..={PROTOCOL_VERSION}",
+             {MIN_PROTOCOL_VERSION}..={max_version}",
             hello.min_version, hello.max_version
         ))
     } else if hello.replica != expect_peer {
@@ -180,7 +208,7 @@ mod tests {
     use crate::fs::RelPath;
     use crate::fs::commit::FileMeta;
     use crate::index::{Entry, Kind, LocalMeta, PeerState, UnmanagedReason, VersionVector};
-    use crate::replica::{Op, Outcome, Precondition};
+    use crate::replica::{Blocks, Delta, Op, Outcome, Precondition};
     use crate::scan::{ScanStats, Scope};
     use crate::watch::Hint;
 
@@ -335,7 +363,35 @@ mod tests {
             });
         }
         out.extend(contents().into_iter().map(Request::Content));
+        out.push(Request::Blocks {
+            path: p(b"big"),
+            expect: kinds().remove(0),
+        });
+        out.push(Request::ReadBlocks {
+            path: p(b"big"),
+            expect: kinds().remove(0),
+            blocks: vec![0, 7, u32::MAX],
+        });
+        out.push(Request::ApplyDelta {
+            path: p(b"big"),
+            op: ops().remove(0),
+            pre: Precondition::Matches {
+                kind: kinds().remove(0),
+                vv: vv(&[(1, 1)]),
+            },
+            delta: Delta {
+                blocks: block_list(),
+                reuse: vec![Some(1), None, Some(u32::MAX)],
+            },
+        });
         out
+    }
+
+    fn block_list() -> Blocks {
+        Blocks {
+            size: 300 << 10,
+            hashes: vec![[1; 32], [2; 32], [0xFF; 32]],
+        }
     }
 
     fn responses() -> Vec<Response> {
@@ -380,6 +436,8 @@ mod tests {
         ];
         out.extend(wire_errors().into_iter().map(Response::Error));
         out.extend(contents().into_iter().map(Response::Content));
+        out.push(Response::Blocks(None));
+        out.push(Response::Blocks(Some(block_list())));
         out
     }
 
@@ -395,6 +453,9 @@ mod tests {
             Request::Adopt { .. } => "Adopt",
             Request::RecordSync { .. } => "RecordSync",
             Request::Content(_) => "Content",
+            Request::Blocks { .. } => "Blocks",
+            Request::ReadBlocks { .. } => "ReadBlocks",
+            Request::ApplyDelta { .. } => "ApplyDelta",
         }
     }
 
@@ -412,6 +473,7 @@ mod tests {
             Response::Error(_) => "Error",
             Response::Content(_) => "Content",
             Response::Hint(_) => "Hint",
+            Response::Blocks(_) => "Blocks",
         }
     }
 
@@ -471,9 +533,12 @@ mod tests {
             [
                 "Adopt",
                 "Apply",
+                "ApplyDelta",
+                "Blocks",
                 "ChangesSince",
                 "Content",
                 "OpenRead",
+                "ReadBlocks",
                 "RecordSync",
                 "Scan",
                 "Watch"
@@ -492,7 +557,7 @@ mod tests {
         let resps = responses();
         assert_eq!(
             variants(&resps, response_variant).len(),
-            12,
+            13,
             "every Response"
         );
         assert_eq!(through_pipe(resps.clone()), resps);
@@ -517,6 +582,28 @@ mod tests {
             },
         ];
         assert_eq!(through_pipe(replies.clone()), replies);
+    }
+
+    /// Version 2 only appended variants, so every v1 message encodes as it
+    /// did (postcard: the variant index comes first).
+    #[test]
+    fn v2_variants_are_appended() {
+        let tag = |body: Vec<u8>| body[0];
+        let req = |r: &Request| tag(postcard::to_stdvec(r).unwrap());
+        let resp = |r: &Response| tag(postcard::to_stdvec(r).unwrap());
+        assert_eq!(req(&Request::Scan { scope: Scope::Full }), 0);
+        assert_eq!(req(&Request::Content(Content::Chunk(Vec::new()))), 7);
+        for (r, n) in requests().iter().filter_map(|r| match r {
+            Request::Blocks { .. } => Some((r, 8)),
+            Request::ReadBlocks { .. } => Some((r, 9)),
+            Request::ApplyDelta { .. } => Some((r, 10)),
+            _ => None,
+        }) {
+            assert_eq!(req(r), n);
+        }
+        assert_eq!(resp(&Response::Scanned(ScanStats::default())), 0);
+        assert_eq!(resp(&Response::Hint(Hint::FullRescan)), 9);
+        assert_eq!(resp(&Response::Blocks(None)), 10);
     }
 
     #[test]
@@ -613,6 +700,38 @@ mod tests {
             }
         );
         assert_eq!(s.unwrap().version, PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn handshake_versions_can_be_capped() {
+        // An old client (or one capped at v1) gets a v1 session.
+        let (c, s) = handshake(
+            |c| client_handshake_upto(c, A, B, 1),
+            |s| server_handshake(s, B, A),
+        );
+        assert_eq!(c.unwrap().version, 1);
+        assert_eq!(s.unwrap().version, 1);
+        // So does any client of a server capped at v1.
+        let (c, s) = handshake(
+            |c| client_handshake(c, A, B),
+            |s| server_handshake_upto(s, B, A, 1),
+        );
+        assert_eq!(c.unwrap().version, 1);
+        assert_eq!(s.unwrap().version, 1);
+        // A client capped at v1 refuses a server that answers v2.
+        let (c, _) = handshake(
+            |c| client_handshake_upto(c, A, B, 1),
+            |s| {
+                read_frame::<_, Hello>(s).unwrap().unwrap();
+                let reply = HelloReply::Welcome {
+                    magic: MAGIC,
+                    version: 2,
+                    replica: B,
+                };
+                write_frame(s, &reply).unwrap();
+            },
+        );
+        assert!(reason(c.unwrap_err()).contains("server chose protocol version 2"));
     }
 
     #[test]

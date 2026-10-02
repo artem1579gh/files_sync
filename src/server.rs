@@ -30,12 +30,13 @@ use rustls::{ServerConfig, ServerConnection, StreamOwned};
 
 use crate::config::{PairConfig, ReplicaId};
 use crate::error::{Error, Result};
+use crate::fs::RelPath;
 use crate::replica::proto::{
-    BATCH_BYTES, Content, ContentStream, Request, Response, WireError, batches, read_frame,
-    send_content, server_handshake, write_frame,
+    BATCH_BYTES, Content, ContentStream, DELTA_VERSION, PROTOCOL_VERSION, Request, Response,
+    WireError, batches, read_frame, send_content, server_handshake_upto, write_frame,
 };
 use crate::replica::remote::{HANDSHAKE_TIMEOUT, tune_socket};
-use crate::replica::{LocalReplica, Replica};
+use crate::replica::{ContentReader, LocalReplica, Replica};
 use crate::tls::Identity;
 use crate::watch::Hint;
 
@@ -46,13 +47,26 @@ pub struct Server {
     replica: LocalReplica,
     peer: ReplicaId,
     tls: Arc<ServerConfig>,
+    max_version: u32,
 }
 
 impl Server {
     /// Serves `replica` to the replica `peer` with the TLS config `tls`
     /// (which decides which client certificate is accepted).
     pub fn new(replica: LocalReplica, peer: ReplicaId, tls: Arc<ServerConfig>) -> Server {
-        Server { replica, peer, tls }
+        Server {
+            replica,
+            peer,
+            tls,
+            max_version: PROTOCOL_VERSION,
+        }
+    }
+
+    /// Speaks protocol versions up to `version` only (tests force older
+    /// sessions with it).
+    pub fn max_protocol(mut self, version: u32) -> Server {
+        self.max_version = version;
+        self
     }
 
     /// Opens replica `side` (0 = A, 1 = B) of `cfg` and its identity from
@@ -76,6 +90,7 @@ impl Server {
             peer: self.peer,
             replica: Mutex::new(self.replica),
             tls: self.tls,
+            max_version: self.max_version,
             subscribers: Arc::new(Mutex::new(Vec::new())),
             fanout: AtomicBool::new(false),
             conns: Mutex::new(BTreeMap::new()),
@@ -189,6 +204,8 @@ struct Shared {
     peer: ReplicaId,
     replica: Mutex<LocalReplica>,
     tls: Arc<ServerConfig>,
+    /// The highest protocol version spoken.
+    max_version: u32,
     /// The hint connections' channels.
     subscribers: Arc<Mutex<Vec<Sender<Hint>>>>,
     /// The fan-out thread runs.
@@ -280,11 +297,11 @@ fn handle(shared: &Shared, tcp: TcpStream, peer: &str) -> Result<()> {
             });
         }
     }
-    server_handshake(&mut tls, shared.id, shared.peer)?;
+    let session = server_handshake_upto(&mut tls, shared.id, shared.peer, shared.max_version)?;
     timeouts(&tls.sock, None)?;
-    tracing::debug!(%peer, "client connected");
+    tracing::debug!(%peer, version = session.version, "client connected");
     while let Some(req) = read_frame::<_, Request>(&mut tls)? {
-        if !serve(shared, &mut tls, req)? {
+        if !serve(shared, &mut tls, session.version, req)? {
             break;
         }
     }
@@ -306,9 +323,18 @@ fn content_only(msg: Request) -> Result<Option<Content>> {
     }
 }
 
-/// Answers one request. Returns whether the connection goes on with more
-/// requests (not after `Watch`).
-fn serve(shared: &Shared, tls: &mut Tls, req: Request) -> Result<bool> {
+/// Answers one request on a session of protocol `version`. Returns whether
+/// the connection goes on with more requests (not after `Watch`).
+fn serve(shared: &Shared, tls: &mut Tls, version: u32, req: Request) -> Result<bool> {
+    let v2 = matches!(
+        req,
+        Request::Blocks { .. } | Request::ReadBlocks { .. } | Request::ApplyDelta { .. }
+    );
+    if v2 && version < DELTA_VERSION {
+        return Err(Error::Protocol {
+            reason: format!("a delta request on a protocol v{version} session"),
+        });
+    }
     match req {
         Request::Scan { scope } => {
             let r = shared.replica().scan(scope);
@@ -330,17 +356,34 @@ fn serve(shared: &Shared, tls: &mut Tls, req: Request) -> Result<bool> {
         }
         Request::OpenRead { path, expect } => {
             let reader = shared.replica().open_read(&path, &expect);
-            match reader {
-                Ok(mut reader) => {
-                    write_frame(tls, &Response::Reading)?;
-                    // A source failure ended the stream with `Abort`: the
-                    // client has the error, the connection is in step.
-                    if let Err(e) = send_content(tls, &mut reader, Response::Content)? {
-                        tracing::debug!(%path, error = %e, "read aborted");
-                    }
-                }
-                Err(e) => answer(tls, Err(e))?,
+            send_read(tls, &path, reader)?;
+        }
+        Request::Blocks { path, expect } => {
+            let r = shared.replica().blocks(&path, &expect);
+            answer(tls, r.map(Response::Blocks))?;
+        }
+        Request::ReadBlocks {
+            path,
+            expect,
+            blocks,
+        } => {
+            let reader = shared.replica().read_blocks(&path, &expect, &blocks);
+            send_read(tls, &path, reader)?;
+        }
+        Request::ApplyDelta {
+            path,
+            op,
+            pre,
+            delta,
+        } => {
+            let mut stream = ContentStream::new(&mut *tls, content_only);
+            let result = shared
+                .replica()
+                .apply_delta(&path, op, pre, &delta, &mut stream);
+            if !stream.is_finished() {
+                stream.drain()?;
             }
+            answer(tls, result.map(Response::Applied))?;
         }
         Request::Apply {
             path,
@@ -425,6 +468,23 @@ fn serve(shared: &Shared, tls: &mut Tls, req: Request) -> Result<bool> {
         }
     }
     Ok(true)
+}
+
+/// Answers a read (`OpenRead`, `ReadBlocks`): `Reading` and the content,
+/// or the error.
+fn send_read(tls: &mut Tls, path: &RelPath, reader: Result<Box<dyn ContentReader>>) -> Result<()> {
+    match reader {
+        Ok(mut reader) => {
+            write_frame(tls, &Response::Reading)?;
+            // A source failure ended the stream with `Abort`: the client has
+            // the error, the connection is in step.
+            if let Err(e) = send_content(tls, &mut reader, Response::Content)? {
+                tracing::debug!(%path, error = %e, "read aborted");
+            }
+            Ok(())
+        }
+        Err(e) => answer(tls, Err(e)),
+    }
 }
 
 /// Answers `Watch`, then pushes hints until the client goes or the server

@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 use crate::config::ReplicaId;
 use crate::error::{Error, RemoteKind};
 use crate::fs::RelPath;
-use crate::index::{Entry, PeerState, VersionVector};
-use crate::replica::{Op, Outcome, Precondition};
+use crate::index::{Entry, Kind, PeerState, VersionVector};
+use crate::replica::{Blocks, Delta, Op, Outcome, Precondition};
 use crate::scan::{ScanStats, Scope};
 use crate::watch::Hint;
 
@@ -47,8 +47,12 @@ pub enum HelloReply {
 }
 
 /// Client to server: one variant per [`Replica`](crate::replica::Replica)
-/// call (`id` is answered by the handshake), plus the content of an
-/// [`Request::Apply`].
+/// call (`id` and `is_remote` need none), plus the content of an
+/// [`Request::Apply`] or [`Request::ApplyDelta`].
+///
+/// Variants are only ever appended, so that the messages of an older
+/// version encode as they did; those marked "v2" need a session of protocol
+/// version 2 or later (a server refuses them on an older session).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Request {
     /// → [`Response::Scanned`].
@@ -79,12 +83,31 @@ pub enum Request {
         retention: Duration,
         more: bool,
     },
-    /// Part of an [`Request::Apply`]'s content.
+    /// Part of an [`Request::Apply`]'s or [`Request::ApplyDelta`]'s content.
     Content(Content),
+    /// v2. → [`Response::Blocks`].
+    Blocks { path: RelPath, expect: Kind },
+    /// v2. → [`Response::Reading`] followed by the content (the blocks, in
+    /// this order), or an error.
+    ReadBlocks {
+        path: RelPath,
+        expect: Kind,
+        blocks: Vec<u32>,
+    },
+    /// v2. Always followed by a content stream: the blocks `delta` does not
+    /// reuse, in order (which the server consumes in full, even when it
+    /// does not need it). → [`Response::Applied`].
+    ApplyDelta {
+        path: RelPath,
+        op: Op,
+        pre: Precondition,
+        delta: Delta,
+    },
 }
 
 /// Server to client: the answer to each [`Request`], in order, plus watch
-/// hints pushed at any time after [`Response::Watching`]`(true)`.
+/// hints pushed at any time after [`Response::Watching`]`(true)`. Variants
+/// are only ever appended (see [`Request`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Response {
     Scanned(ScanStats),
@@ -112,6 +135,8 @@ pub enum Response {
     Content(Content),
     /// Pushed by the server's watcher (not an answer to a request).
     Hint(Hint),
+    /// v2. The answer to [`Request::Blocks`].
+    Blocks(Option<Blocks>),
 }
 
 /// File content on the wire: any number of chunks, then `End` or `Abort`.

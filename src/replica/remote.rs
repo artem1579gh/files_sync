@@ -28,7 +28,7 @@
 //! [`Hint::FullRescan`], since changes may have been missed meanwhile.
 
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -39,10 +39,10 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use rustls::{ClientConfig, ClientConnection, StreamOwned};
 
 use super::proto::{
-    BATCH_BYTES, Content, ContentStream, Request, Response, batches, client_handshake, read_frame,
-    send_content, write_frame,
+    BATCH_BYTES, Content, ContentStream, DELTA_VERSION, PROTOCOL_VERSION, Request, Response,
+    batches, client_handshake_upto, read_frame, send_content, write_frame,
 };
-use super::{ContentReader, Op, Outcome, Precondition, Replica};
+use super::{BLOCK_SIZE, Blocks, ContentReader, Delta, Op, Outcome, Precondition, Replica};
 use crate::config::{ReplicaConfig, ReplicaId};
 use crate::error::{Error, Result};
 use crate::fs::RelPath;
@@ -66,7 +66,41 @@ const RECONNECT_MIN: Duration = Duration::from_millis(500);
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
 
 /// A TLS connection to a server.
-type Tls = StreamOwned<ClientConnection, TcpStream>;
+type Tls = StreamOwned<ClientConnection, Counted>;
+
+/// Bytes sent and received on a replica's connections, TLS records
+/// included.
+#[derive(Debug, Default)]
+struct Traffic {
+    sent: AtomicU64,
+    received: AtomicU64,
+}
+
+/// A TCP connection that counts its bytes.
+struct Counted {
+    tcp: TcpStream,
+    traffic: Arc<Traffic>,
+}
+
+impl Read for Counted {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.tcp.read(buf)?;
+        self.traffic.received.fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
+    }
+}
+
+impl Write for Counted {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.tcp.write(buf)?;
+        self.traffic.sent.fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.tcp.flush()
+    }
+}
 
 /// The filter of a content stream on the client: only content belongs there.
 type Filter = fn(Response) -> Result<Option<Content>>;
@@ -96,6 +130,7 @@ fn response_name(msg: &Response) -> &'static str {
         Response::Error(_) => "Error",
         Response::Content(_) => "Content",
         Response::Hint(_) => "Hint",
+        Response::Blocks(_) => "Blocks",
     }
 }
 
@@ -129,15 +164,20 @@ struct Link {
     /// The replica the server runs.
     remote: ReplicaId,
     tls: Arc<ClientConfig>,
+    /// The highest protocol version offered.
+    max_version: u32,
     idle: Mutex<Option<Conn>>,
     /// Numbers connections, so the mirror notices a new one.
     sessions: AtomicU64,
+    traffic: Arc<Traffic>,
 }
 
 /// An established connection.
 struct Conn {
     tls: Tls,
     session: u64,
+    /// The protocol version it speaks.
+    version: u32,
 }
 
 impl Link {
@@ -149,8 +189,9 @@ impl Link {
     }
 
     /// Opens a connection: TCP, TLS (both sides check the pinned
-    /// certificates), then the protocol handshake.
-    fn connect(&self) -> Result<Tls> {
+    /// certificates), then the protocol handshake. Returns it with the
+    /// protocol version it speaks.
+    fn connect(&self) -> Result<(Tls, u32)> {
         let addrs = self
             .addr
             .to_socket_addrs()
@@ -179,6 +220,10 @@ impl Link {
         timeouts(Some(HANDSHAKE_TIMEOUT))?;
         let conn = ClientConnection::new(self.tls.clone(), server_name())
             .map_err(|e| self.lost(format!("TLS: {e}")))?;
+        let tcp = Counted {
+            tcp,
+            traffic: self.traffic.clone(),
+        };
         let mut tls = StreamOwned::new(conn, tcp);
         while tls.conn.is_handshaking() {
             tls.conn
@@ -187,28 +232,32 @@ impl Link {
         }
         // TLS 1.3: the server checks our certificate after we finished, so
         // a rejection shows up here, as an alert.
-        client_handshake(&mut tls, self.local, self.remote)
+        let session = client_handshake_upto(&mut tls, self.local, self.remote, self.max_version)
             .map_err(|e| self.lost(format!("handshake failed: {e}")))?;
-        let tcp = &tls.sock;
+        let tcp = &tls.sock.tcp;
         tcp.set_read_timeout(None)
             .and_then(|()| tcp.set_write_timeout(None))
             .map_err(|e| self.lost(e))?;
-        Ok(tls)
+        Ok((tls, session.version))
     }
 
     /// The idle connection, or a new one.
     fn take(&self) -> Result<Conn> {
         let idle = lock(&self.idle).take();
         if let Some(conn) = idle {
-            if is_idle(&conn.tls.sock) {
+            if is_idle(&conn.tls.sock.tcp) {
                 return Ok(conn);
             }
             tracing::debug!(addr = %self.addr, "idle connection closed by the server; reconnecting");
         }
-        let tls = self.connect()?;
+        let (tls, version) = self.connect()?;
         let session = self.sessions.fetch_add(1, Ordering::Relaxed) + 1;
-        tracing::debug!(addr = %self.addr, session, "connected");
-        Ok(Conn { tls, session })
+        tracing::debug!(addr = %self.addr, session, version, "connected");
+        Ok(Conn {
+            tls,
+            session,
+            version,
+        })
     }
 
     /// Makes `conn` the idle connection, unless there is one already.
@@ -221,7 +270,7 @@ impl Link {
 
     /// Opens a hint connection: `None` if the server has no watcher.
     fn watch(&self) -> Result<Option<Tls>> {
-        let mut tls = self.connect()?;
+        let (mut tls, _) = self.connect()?;
         let answer = write_frame(&mut tls, &Request::Watch).and_then(|()| recv(&mut tls));
         match answer.map_err(|e| self.lost(e))? {
             Response::Watching(true) => Ok(Some(tls)),
@@ -320,13 +369,27 @@ impl RemoteReplica {
         remote: ReplicaId,
         tls: Arc<ClientConfig>,
     ) -> Result<RemoteReplica> {
+        RemoteReplica::with_protocol(addr, local, remote, tls, PROTOCOL_VERSION)
+    }
+
+    /// [`RemoteReplica::with_tls`], offering protocol versions up to
+    /// `max_version` only (tests force older sessions with it).
+    pub fn with_protocol(
+        addr: impl Into<String>,
+        local: ReplicaId,
+        remote: ReplicaId,
+        tls: Arc<ClientConfig>,
+        max_version: u32,
+    ) -> Result<RemoteReplica> {
         let link = Arc::new(Link {
             addr: addr.into(),
             local,
             remote,
             tls,
+            max_version,
             idle: Mutex::new(None),
             sessions: AtomicU64::new(0),
+            traffic: Arc::default(),
         });
         let conn = link.take()?;
         link.put(conn);
@@ -351,6 +414,26 @@ impl RemoteReplica {
     /// Connections opened so far.
     pub fn connections(&self) -> u64 {
         self.link.sessions.load(Ordering::Relaxed)
+    }
+
+    /// Bytes sent and received so far on all connections (TLS records
+    /// included).
+    pub fn traffic(&self) -> (u64, u64) {
+        let t = &self.link.traffic;
+        (
+            t.sent.load(Ordering::Relaxed),
+            t.received.load(Ordering::Relaxed),
+        )
+    }
+
+    /// The error for a delta request on a connection to a server that no
+    /// longer speaks protocol v2 (it was replaced by an older one since
+    /// [`Replica::blocks`]): the cycle fails, the next one sends whole files.
+    fn no_delta(&self, conn: &Conn) -> Error {
+        self.link.lost(format!(
+            "the server now speaks protocol v{}, without delta transfer",
+            conn.version
+        ))
     }
 
     /// Runs one exchange over a connection. `f`'s outer error is the
@@ -388,6 +471,30 @@ impl RemoteReplica {
                 }
             }
         })
+    }
+}
+
+impl RemoteReplica {
+    /// Sends the read request `req` (`OpenRead`, `ReadBlocks`) over `conn`;
+    /// the reader takes the connection along. `size` bounds the content (to
+    /// decide whether a reader dropped early drains it).
+    fn read(&self, mut conn: Conn, req: &Request, size: u64) -> Result<Box<dyn ContentReader>> {
+        let answer = write_frame(&mut conn.tls, req).and_then(|()| recv(&mut conn.tls));
+        match answer {
+            Ok(Response::Reading) => Ok(Box::new(RemoteReader {
+                link: self.link.clone(),
+                session: conn.session,
+                version: conn.version,
+                drain: size <= DRAIN_LIMIT,
+                stream: Some(ContentStream::new(conn.tls, content_only as Filter)),
+            })),
+            Ok(Response::Error(e)) => {
+                self.link.put(conn);
+                Err(e.into())
+            }
+            Ok(other) => Err(self.link.lost(unexpected(&other))),
+            Err(e) => Err(self.link.lost(e)),
+        }
     }
 }
 
@@ -443,32 +550,16 @@ impl Replica for RemoteReplica {
     }
 
     fn open_read(&self, path: &RelPath, expect: &Entry) -> Result<Box<dyn ContentReader>> {
-        let mut conn = self.link.take()?;
         let req = Request::OpenRead {
             path: path.clone(),
             expect: expect.clone(),
         };
-        let answer = write_frame(&mut conn.tls, &req).and_then(|()| recv(&mut conn.tls));
-        match answer {
-            Ok(Response::Reading) => {
-                let size = match expect.kind {
-                    Kind::File { size, .. } => size,
-                    _ => u64::MAX,
-                };
-                Ok(Box::new(RemoteReader {
-                    link: self.link.clone(),
-                    session: conn.session,
-                    drain: size <= DRAIN_LIMIT,
-                    stream: Some(ContentStream::new(conn.tls, content_only as Filter)),
-                }))
-            }
-            Ok(Response::Error(e)) => {
-                self.link.put(conn);
-                Err(e.into())
-            }
-            Ok(other) => Err(self.link.lost(unexpected(&other))),
-            Err(e) => Err(self.link.lost(e)),
-        }
+        let size = match expect.kind {
+            Kind::File { size, .. } => size,
+            _ => u64::MAX,
+        };
+        let conn = self.link.take()?;
+        self.read(conn, &req, size)
     }
 
     fn apply(
@@ -484,24 +575,66 @@ impl Replica for RemoteReplica {
             pre,
             content: content.is_some(),
         };
+        self.send_apply(&req, content)
+    }
+
+    fn is_remote(&self) -> bool {
+        true
+    }
+
+    /// `None` on a protocol v1 session: the server cannot do deltas.
+    fn blocks(&self, path: &RelPath, expect: &Kind) -> Result<Option<Blocks>> {
+        let req = Request::Blocks {
+            path: path.clone(),
+            expect: expect.clone(),
+        };
         self.call(|conn| {
-            write_frame(&mut conn.tls, &req)?;
-            let mut source = Ok(());
-            if let Some(src) = content {
-                source = send_content(&mut conn.tls, src, Request::Content)?.map(|_| ());
+            if conn.version < DELTA_VERSION {
+                return Ok(Ok(None));
             }
-            let answer = match recv(&mut conn.tls)? {
-                Response::Applied(outcome) => Ok(outcome),
-                Response::Error(e) => Err(Error::from(e)),
-                other => return Err(unexpected(&other)),
-            };
-            // A source that failed mid-stream (e.g. `Unstable`) is the
-            // reason the server failed; report it as it is.
-            Ok(match (answer, source) {
-                (Err(_), Err(e)) => Err(e),
-                (answer, _) => answer,
-            })
+            write_frame(&mut conn.tls, &req)?;
+            match recv(&mut conn.tls)? {
+                Response::Blocks(blocks) => Ok(Ok(blocks)),
+                Response::Error(e) => Ok(Err(e.into())),
+                other => Err(unexpected(&other)),
+            }
         })
+    }
+
+    fn read_blocks(
+        &self,
+        path: &RelPath,
+        expect: &Kind,
+        blocks: &[u32],
+    ) -> Result<Box<dyn ContentReader>> {
+        let conn = self.link.take()?;
+        if conn.version < DELTA_VERSION {
+            return Err(self.no_delta(&conn));
+        }
+        let req = Request::ReadBlocks {
+            path: path.clone(),
+            expect: expect.clone(),
+            blocks: blocks.to_vec(),
+        };
+        let size = (blocks.len() as u64).saturating_mul(BLOCK_SIZE);
+        self.read(conn, &req, size)
+    }
+
+    fn apply_delta(
+        &mut self,
+        path: &RelPath,
+        op: Op,
+        pre: Precondition,
+        delta: &Delta,
+        data: &mut dyn Read,
+    ) -> Result<Outcome> {
+        let req = Request::ApplyDelta {
+            path: path.clone(),
+            op,
+            pre,
+            delta: delta.clone(),
+        };
+        self.send_apply(&req, Some(data))
     }
 
     fn watch(&mut self) -> Option<Receiver<Hint>> {
@@ -600,6 +733,34 @@ impl Replica for RemoteReplica {
     }
 }
 
+impl RemoteReplica {
+    /// Sends `req` and the content `data` after it, and reads the outcome
+    /// (`Apply`, `ApplyDelta`).
+    fn send_apply(&self, req: &Request, data: Option<&mut dyn Read>) -> Result<Outcome> {
+        self.call(|conn| {
+            if matches!(req, Request::ApplyDelta { .. }) && conn.version < DELTA_VERSION {
+                return Ok(Err(self.no_delta(conn)));
+            }
+            write_frame(&mut conn.tls, req)?;
+            let mut source = Ok(());
+            if let Some(src) = data {
+                source = send_content(&mut conn.tls, src, Request::Content)?.map(|_| ());
+            }
+            let answer = match recv(&mut conn.tls)? {
+                Response::Applied(outcome) => Ok(outcome),
+                Response::Error(e) => Err(Error::from(e)),
+                other => return Err(unexpected(&other)),
+            };
+            // A source that failed mid-stream (e.g. `Unstable`) is the
+            // reason the server failed; report it as it is.
+            Ok(match (answer, source) {
+                (Err(_), Err(e)) => Err(e),
+                (answer, _) => answer,
+            })
+        })
+    }
+}
+
 impl Drop for RemoteReplica {
     fn drop(&mut self) {
         // A clean close, so the server does not see a torn connection.
@@ -620,6 +781,7 @@ impl Drop for RemoteReplica {
 struct RemoteReader {
     link: Arc<Link>,
     session: u64,
+    version: u32,
     /// Drain the rest if dropped early (the file is small).
     drain: bool,
     stream: Option<ContentStream<Tls, Response, Filter>>,
@@ -643,6 +805,7 @@ impl Drop for RemoteReader {
             self.link.put(Conn {
                 tls: stream.into_inner(),
                 session: self.session,
+                version: self.version,
             });
         }
     }
@@ -697,7 +860,7 @@ impl HintThread {
     /// Forwards hints until the connection ends. Returns whether to go on
     /// (false: the replica is gone).
     fn forward(&self, mut tls: Tls) -> bool {
-        match tls.sock.try_clone() {
+        match tls.sock.tcp.try_clone() {
             Ok(s) => *lock(&self.socket) = Some(s),
             Err(e) => tracing::debug!(error = %e, "cannot clone the hint socket"),
         }

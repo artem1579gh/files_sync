@@ -6,6 +6,11 @@
 //! I/O itself: every check that matters (the CAS precondition, the source
 //! content's stability and hash) runs inside the replicas.
 //!
+//! A file that the destination already holds goes as a block-level delta
+//! when one side is remote and both files are large enough (design §7.1):
+//! the engine matches the two block lists and passes only the missing
+//! blocks; the replicas check everything.
+//!
 //! A step that does not apply (`PreconditionFailed`, `Preserved`, or an
 //! unstable source or destination) marks its path **dirty**: the path's
 //! later steps in the round are skipped, and before the next round the dirty
@@ -29,17 +34,21 @@ use crate::engine::{
 use crate::error::{Error, RemoteKind, Result};
 use crate::fs::RelPath;
 use crate::index::{DEFAULT_TOMBSTONE_RETENTION, Entry, Kind, PeerState, UnmanagedReason};
-use crate::replica::{Op, Outcome, Replica};
+use crate::replica::{Delta, Op, Outcome, Precondition, Replica};
 use crate::scan::{ScanStats, Scope};
 
 /// Rounds per sync cycle (§6.4).
 pub const MAX_ROUNDS: usize = 5;
+
+/// Files smaller than this (old or new) are always sent whole (§7.1).
+pub const DELTA_MIN_SIZE: u64 = 1 << 20;
 
 /// Runs sync cycles between two replicas.
 #[derive(Clone, Debug)]
 pub struct Engine {
     max_rounds: usize,
     tombstone_retention: Duration,
+    delta_min_size: u64,
 }
 
 impl Default for Engine {
@@ -47,6 +56,7 @@ impl Default for Engine {
         Engine {
             max_rounds: MAX_ROUNDS,
             tombstone_retention: DEFAULT_TOMBSTONE_RETENTION,
+            delta_min_size: DELTA_MIN_SIZE,
         }
     }
 }
@@ -76,6 +86,8 @@ pub struct SyncReport {
     /// Tombstones garbage-collected at the end of the cycle (design §3), on
     /// A and on B.
     pub collected: [usize; 2],
+    /// Files written as a block-level delta (§7.1), among `applied`.
+    pub deltas: usize,
 }
 
 impl SyncReport {
@@ -104,6 +116,14 @@ impl Engine {
         self
     }
 
+    /// Overrides [`DELTA_MIN_SIZE`]: a file is sent as a block-level delta
+    /// only if its old and new sizes are both at least this (and one side
+    /// is remote).
+    pub fn delta_min_size(mut self, size: u64) -> Engine {
+        self.delta_min_size = size;
+        self
+    }
+
     /// A full sync cycle: scans both replicas completely, then syncs.
     pub fn sync_once(&self, a: &mut dyn Replica, b: &mut dyn Replica) -> Result<SyncReport> {
         self.sync(a, b, Scope::Full)
@@ -129,6 +149,7 @@ impl Engine {
             unmanaged: BTreeSet::new(),
             adopt_asked: BTreeSet::new(),
             last: None,
+            delta_min_size: self.delta_min_size,
         };
         cycle.scan(&scope)?;
         let mut round = 0;
@@ -202,11 +223,14 @@ struct Cycle<'r> {
     /// The snapshots the last reconcile compared: the state the cycle ends
     /// in, since nothing ran after it.
     last: Option<(Snapshot, Snapshot)>,
+    /// See [`Engine::delta_min_size`].
+    delta_min_size: u64,
 }
 
 /// How a step went.
 enum Done {
-    Applied,
+    /// Whether it went as a delta.
+    Applied { delta: bool },
     /// Raced with a change: rescan and retry.
     Dirty,
     /// Another error; leave the path alone.
@@ -365,8 +389,9 @@ impl Cycle<'_> {
                     _ => None,
                 };
                 match self.run(step)? {
-                    Done::Applied => {
+                    Done::Applied { delta } => {
                         self.report.applied += 1;
+                        self.report.deltas += usize::from(delta);
                         if let Some((side, copy)) = rename {
                             self.report.conflicts.push(ConflictCopy {
                                 side,
@@ -405,15 +430,22 @@ impl Cycle<'_> {
             Side::B => (&mut *self.b, &*self.a),
         };
         tracing::debug!(%path, ?side, ?op, "apply");
+        let mut delta = false;
         let result = match (&op, source) {
-            (Op::WriteFile { .. }, Some(source)) => match src.open_read(&path, &source) {
-                Ok(mut reader) => dst.apply(&path, op, pre, Some(&mut reader as &mut dyn Read)),
-                Err(e) => Err(e),
-            },
+            (Op::WriteFile { .. }, Some(source)) => write_file(
+                dst,
+                src,
+                &path,
+                op,
+                pre,
+                &source,
+                self.delta_min_size,
+                &mut delta,
+            ),
             _ => dst.apply(&path, op, pre, None),
         };
         match result {
-            Ok(Outcome::Applied(_)) => Ok(Done::Applied),
+            Ok(Outcome::Applied(_)) => Ok(Done::Applied { delta }),
             Ok(Outcome::PreconditionFailed(_)) => {
                 tracing::debug!(%path, ?side, "precondition failed; rescanning");
                 Ok(Done::Dirty)
@@ -433,6 +465,79 @@ impl Cycle<'_> {
             }
         }
     }
+}
+
+/// Writes the file `source` of `src` at `path` on `dst`: as a block-level
+/// delta if that can pay off (design §7.1; sets `delta`), else whole.
+#[allow(clippy::too_many_arguments)]
+fn write_file(
+    dst: &mut dyn Replica,
+    src: &dyn Replica,
+    path: &RelPath,
+    op: Op,
+    pre: Precondition,
+    source: &Entry,
+    min_size: u64,
+    delta: &mut bool,
+) -> Result<Outcome> {
+    if let Some(plan) = plan_delta(dst, src, path, &pre, source, min_size)? {
+        let needed = plan.needed();
+        tracing::debug!(
+            %path,
+            blocks = plan.reuse.len(),
+            sent = needed.len(),
+            "delta transfer"
+        );
+        *delta = true;
+        // Every block is at the destination already: the source need not
+        // be read (the destination checks each block and the whole hash).
+        let mut data: Box<dyn Read> = if needed.is_empty() {
+            Box::new(std::io::empty())
+        } else {
+            src.read_blocks(path, &source.kind, &needed)?
+        };
+        return dst.apply_delta(path, op, pre, &plan, &mut data);
+    }
+    let mut reader = src.open_read(path, source)?;
+    dst.apply(path, op, pre, Some(&mut reader as &mut dyn Read))
+}
+
+/// The delta for writing `source` over `dst`'s file at `path`, if one side
+/// is remote, both files are at least `min_size`, and both replicas give a
+/// block list.
+fn plan_delta(
+    dst: &dyn Replica,
+    src: &dyn Replica,
+    path: &RelPath,
+    pre: &Precondition,
+    source: &Entry,
+    min_size: u64,
+) -> Result<Option<Delta>> {
+    if !(dst.is_remote() || src.is_remote()) {
+        return Ok(None);
+    }
+    let Precondition::Matches {
+        kind: old @ Kind::File { size: old_size, .. },
+        ..
+    } = pre
+    else {
+        return Ok(None);
+    };
+    let Kind::File { size, .. } = source.kind else {
+        return Ok(None);
+    };
+    if size < min_size || *old_size < min_size {
+        return Ok(None);
+    }
+    let Some(new) = src.blocks(path, &source.kind)? else {
+        return Ok(None);
+    };
+    let Some(have) = dst.blocks(path, old)? else {
+        return Ok(None);
+    };
+    // Even if no block can be reused: the block lists cost 0.025 % of the
+    // file, and every replaced file takes the same path.
+    Ok(Some(Delta::plan(&have, new)))
 }
 
 /// Errors that are not about one path: the replica itself, or the

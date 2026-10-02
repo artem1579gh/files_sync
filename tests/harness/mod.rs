@@ -22,8 +22,10 @@ use files_sync::config::{FollowedWrite, ReplicaConfig, ReplicaId, SymlinkPolicy}
 use files_sync::engine::{Engine, Side, SyncReport};
 use files_sync::fs::{FileKind, RelPath, is_reserved};
 use files_sync::index::{Entry, Kind, PeerState, VersionVector};
+use files_sync::replica::proto::PROTOCOL_VERSION;
 use files_sync::replica::{
-    ContentReader, Housekeeping, LocalReplica, Op, Outcome, Precondition, RemoteReplica, Replica,
+    Blocks, ContentReader, Delta, Housekeeping, LocalReplica, Op, Outcome, Precondition,
+    RemoteReplica, Replica,
 };
 use files_sync::scan::{ScanStats, Scope};
 use files_sync::server::{Server, ServerHandle};
@@ -102,16 +104,31 @@ impl Mode {
     /// `replica` as the engine reaches it in this mode; `peer` is the other
     /// replica's ID (the client acts for it).
     pub fn wrap(self, replica: LocalReplica, peer: ReplicaId) -> TestReplica {
+        self.wrap_with(replica, peer, PROTOCOL_VERSION, PROTOCOL_VERSION)
+    }
+
+    /// [`Mode::wrap`], with (in remote mode) the server speaking protocol
+    /// versions up to `server` and the client offering up to `client`.
+    pub fn wrap_with(
+        self,
+        replica: LocalReplica,
+        peer: ReplicaId,
+        server: u32,
+        client: u32,
+    ) -> TestReplica {
         match self {
             Mode::Local => TestReplica::Local(replica),
             Mode::Remote => {
                 let (server_tls, client_tls) = loopback_tls();
                 let id = replica.id();
                 let server = Server::new(replica, peer, server_tls.clone())
+                    .max_protocol(server)
                     .spawn(TcpListener::bind("127.0.0.1:0").unwrap())
                     .unwrap();
                 let addr = server.local_addr().to_string();
-                let client = RemoteReplica::with_tls(addr, peer, id, client_tls.clone()).unwrap();
+                let client =
+                    RemoteReplica::with_protocol(addr, peer, id, client_tls.clone(), client)
+                        .unwrap();
                 TestReplica::Remote { client, server }
             }
         }
@@ -286,6 +303,34 @@ impl Replica for TestReplica {
     ) -> files_sync::Result<Vec<RelPath>> {
         self.get_mut().record_sync(peer, tombstones, retention)
     }
+
+    fn is_remote(&self) -> bool {
+        self.get().is_remote()
+    }
+
+    fn blocks(&self, path: &RelPath, expect: &Kind) -> files_sync::Result<Option<Blocks>> {
+        self.get().blocks(path, expect)
+    }
+
+    fn read_blocks(
+        &self,
+        path: &RelPath,
+        expect: &Kind,
+        blocks: &[u32],
+    ) -> files_sync::Result<Box<dyn ContentReader>> {
+        self.get().read_blocks(path, expect, blocks)
+    }
+
+    fn apply_delta(
+        &mut self,
+        path: &RelPath,
+        op: Op,
+        pre: Precondition,
+        delta: &Delta,
+        data: &mut dyn Read,
+    ) -> files_sync::Result<Outcome> {
+        self.get_mut().apply_delta(path, op, pre, delta, data)
+    }
 }
 
 /// A served replica is swept as `serve` sweeps it: when its grace periods
@@ -412,19 +457,61 @@ impl Pair {
     }
 
     /// The pair with its replicas reached in `mode`: the engine syncs
-    /// them directly, or through a server each, over loopback TLS.
+    /// them directly, or through a server each, over loopback TLS. In
+    /// remote mode the engine sends every replaced file as a block-level
+    /// delta (whatever its size), so the suites cover delta transfer.
     pub fn over(self, mode: Mode) -> Pair {
-        let (ida, idb) = (self.a.id(), self.b.id());
-        let wrap = |t: Tree, peer| Tree {
-            replica: mode.wrap(t.replica.into_local(), peer),
-            ..t
+        let v = PROTOCOL_VERSION;
+        let engine = match mode {
+            Mode::Local => self.engine.clone(),
+            Mode::Remote => self.engine.clone().delta_min_size(0),
         };
         Pair {
-            a: wrap(self.a, idb),
-            b: wrap(self.b, ida),
+            engine,
+            ..self.over_each([mode, mode], [(v, v), (v, v)])
+        }
+    }
+
+    /// The pair with A reached in `modes[0]` and B in `modes[1]`; a served
+    /// replica's server speaks protocol versions up to `versions[_].0`, its
+    /// client offers up to `versions[_].1`. The engine is left as it is.
+    /// (A pair with a remote replica counts as remote: [`Pair::reopen_after`]
+    /// serves both.)
+    pub fn over_each(self, modes: [Mode; 2], versions: [(u32, u32); 2]) -> Pair {
+        let (ida, idb) = (self.a.id(), self.b.id());
+        let wrap = |t: Tree, peer, side: usize| {
+            let (server, client) = versions[side];
+            Tree {
+                replica: modes[side].wrap_with(t.replica.into_local(), peer, server, client),
+                ..t
+            }
+        };
+        let mode = if modes.contains(&Mode::Remote) {
+            Mode::Remote
+        } else {
+            Mode::Local
+        };
+        Pair {
+            a: wrap(self.a, idb, 0),
+            b: wrap(self.b, ida, 1),
             mode,
             ..self
         }
+    }
+
+    /// Bytes sent and received by the clients of both replicas (none for a
+    /// local replica), TLS records included.
+    pub fn traffic(&self) -> u64 {
+        [&self.a.replica, &self.b.replica]
+            .into_iter()
+            .map(|r| match r {
+                TestReplica::Local(_) => 0,
+                TestReplica::Remote { client, .. } => {
+                    let (sent, received) = client.traffic();
+                    sent + received
+                }
+            })
+            .sum()
     }
 
     /// How the engine reaches the replicas.
@@ -669,6 +756,36 @@ impl Replica for Racing<'_> {
         retention: Duration,
     ) -> files_sync::Result<Vec<RelPath>> {
         self.inner.record_sync(peer, tombstones, retention)
+    }
+
+    fn is_remote(&self) -> bool {
+        self.inner.is_remote()
+    }
+
+    fn blocks(&self, path: &RelPath, expect: &Kind) -> files_sync::Result<Option<Blocks>> {
+        self.inner.blocks(path, expect)
+    }
+
+    fn read_blocks(
+        &self,
+        path: &RelPath,
+        expect: &Kind,
+        blocks: &[u32],
+    ) -> files_sync::Result<Box<dyn ContentReader>> {
+        self.fire(When::Read, path);
+        self.inner.read_blocks(path, expect, blocks)
+    }
+
+    fn apply_delta(
+        &mut self,
+        path: &RelPath,
+        op: Op,
+        pre: Precondition,
+        delta: &Delta,
+        data: &mut dyn Read,
+    ) -> files_sync::Result<Outcome> {
+        self.fire(When::Apply, path);
+        self.inner.apply_delta(path, op, pre, delta, data)
     }
 }
 

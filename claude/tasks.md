@@ -736,7 +736,7 @@ The design lives in [`design.md`](design.md); §N.M below refers to its sections
   - **Design:** §4.5 (in-tree referents: the `EAGAIN` retry) and §9 (fault points).
   - **Results:** after the fix, 30 runs of `materialize` alone showed no unstable lookup or read at all (the debug prints stayed silent); then 3 consecutive runs of the whole `--test crash` (~30 s each), and `cargo test --features hooks` and clippy (with and without `hooks`) pass. Before the fix, the same materialize-only loop failed 3 of 30 times. **The "50 consecutive runs" criterion was cut short at the user's request** (too long, ~25 min), so it is not met as written → **T25**. The statistical evidence is the 30 + 3 clean runs, plus a debug trace that showed no `EAGAIN` at all after the fix. The deterministic tests above carry the regression.
 
-### [ ] T24: Block-level delta transfer
+### [x] T24: Block-level delta transfer
 - **Depends on:** T22
 - **Read:** §3, §5.2, §5.3, §7, §7.1
 - **Files:** `src/replica/proto/messages.rs`, `src/replica/proto/mod.rs`, `src/replica/{mod,local,remote}.rs`, `src/server.rs`, `src/engine/executor.rs`, `src/scan/hasher.rs`, and the index if block lists are stored
@@ -757,6 +757,33 @@ The design lives in [`design.md`](design.md); §N.M below refers to its sections
   - a forced v1 session still syncs correctly with full transfers.
   - the T22 suites pass in both modes, and so do the attack suite and clippy.
 - **Notes:**
+  - **Design:** §7.1 "Block-level delta transfer (T24)" (blocks, trait, who decides, assembly, protocol v2, the storage decision, traffic); §7 trait listing; §2 layout; §9 harness and hook points.
+  - **Scheme:** fixed, aligned 128 KiB blake3 blocks (`replica::delta`: `BLOCK_SIZE`, `Blocks`, `Delta::plan`, `BlockReader`, `Assembler`); files over `MAX_BLOCKS` (2^19, i.e. 64 GiB) always go whole, so a block list (16 MiB) and a delta fit one frame (no batching needed).
+  - **Trait:** four methods with defaults that mean "whole files only": `is_remote()` (false), `blocks(path, &Kind) -> Option<Blocks>` (None), `read_blocks(path, &Kind, &[u32])`, `apply_delta(path, op, pre, &Delta, data)` (both `InvalidOp` by default; only called after `blocks` gave a list). `PairReplica`, the harness's `TestReplica` and `Racing` forward them.
+  - **Engine:** a `WriteFile` goes as a delta iff one side `is_remote()`, `pre` is `Matches { File }`, old and new size are both ≥ `Engine::delta_min_size` (default `DELTA_MIN_SIZE` = 1 MiB), and both `blocks()` give a list. `SyncReport::deltas` counts them. If no block is needed, the source is not read at all.
+    - **Deviation from a first draft:** I first fell back to a whole transfer when nothing could be reused. Dropped: it only saved the block lists (0.025 %), and with it the T22 suites (single-block files) never reached the delta path. Now every replaced file above the threshold takes one path.
+  - **Race-freedom:** `LocalReplica::apply_delta` checks the logical precondition and the delta's shape (`InvalidOp` otherwise), pins the current file through the read route (`Disk::open_pinned`, refactored out of `open_file`; followed links work) and requires its fingerprint to be the indexed one (else `PreconditionFailed`). It then runs the ordinary `apply` with an `Assembler` as content, so `commit.rs` is unchanged: new temp file, whole-file hash against the op's, CAS replace. The assembler checks every block (reused ones against the **new** hash), and at the end that the old file is unchanged and still at its name, then closes it (so the commit's lease works). Any failure is `Unstable` with nothing committed. The source's `BlockReader` requires the indexed fingerprint up front and an unchanged, still-reachable file at the end. New fs primitive: `fs::PinnedFile` (pread at offsets + the `StableReader` end checks); `fs::open_checked` is shared with `StableReader::open_at`.
+  - **Block lists are computed on demand, not stored** (trade-off in §7.1): no index schema change. The cost is an extra read of each side's file per delta transfer, only above the threshold and only over a network.
+  - **Protocol:** `PROTOCOL_VERSION` = 2 (`DELTA_VERSION`), `MIN_PROTOCOL_VERSION` = 1. The new variants are appended (`Request::Blocks/ReadBlocks/ApplyDelta`, `Response::Blocks`), so v1 encodings are unchanged (a test freezes the variant indices). Each client connection remembers its version: on v1, `blocks()` is `None`, so files go whole. A server refuses v2 requests on a v1 session (protocol error). If the server is replaced by a v1 one between `blocks` and the transfer, the client fails the cycle with `Connection`, and the next cycle goes whole. Caps for tests: `client_handshake_upto`/`server_handshake_upto`, `Server::max_protocol`, `RemoteReplica::with_protocol`.
+  - **Traffic counter:** the client's TCP stream is wrapped in a byte-counting `Counted` (TLS records included); `RemoteReplica::traffic() -> (sent, received)`.
+  - **Tests:**
+    - `tests/delta.rs`:
+      - `one_byte_in_64_mib_moves_a_few_blocks`: both replicas served, default threshold. The create moves > 128 MiB; changing 1 byte then moves **314 519 bytes** in all (limit asserted: 2 blocks + 192 KiB; the block crosses twice in loopback-remote mode). Then a block is dropped at the front and one appended on B, and that also goes back as a delta.
+      - `v1_sessions_send_whole_files`: v1 server, v1 client, and one v1 replica of two (each way). Files sync correctly with `deltas == 0` and whole-file traffic; a v2/v2 control sends the same changes as 2 deltas under 1 MiB.
+      - `destination_changed_mid_assembly_commits_nothing` (`hooks` feature): A served, B local (the hook runs on the test thread). A user write lands in B's file at `delta.block`. The step is retried, the next round makes one conflict copy, both versions survive, and `assert_converged` finds no leftovers.
+    - Unit tests (`replica::local`, `replica::delta`):
+      - block lists, `read_blocks` (order, a bad index, a change mid-read, a stale file);
+      - `apply_delta` rebuilding a changed, inserted and kept block;
+      - a mid-assembly change at `delta.block` (reused block) and at `delta.assembled` (final check): `Err(Unstable)`, file = the user's, index unchanged, no leftovers, no open intents;
+      - a stale precondition, misfit deltas, a wrong reused block, a bad received block, short or long data, the file changed since the scan.
+    - Mutation-checked by hand (not committed): without the reused-block hash check, or without the final old-file check, a unit test fails.
+  - **Harness:** in remote mode `Pair::over` sets `delta_min_size(0)`, so the T22 suites send every replaced file as a delta, races included (`Racing` fires `Read` at `read_blocks`, `Apply` at `apply_delta`). Counted once by hand: 58 sync cycles of the model test used deltas. New: `Pair::over_each(modes, versions)`, `Mode::wrap_with`, `Pair::traffic()`.
+  - **Results:** `cargo test`, `cargo test --features hooks` (attack 15, crash 3, delta 3, model 2 × 256 cases, sync_once 36, symlink_matrix 22, …) and clippy (with and without `hooks`) pass; stress (`--release -- --ignored`) passes in both modes (72 s). Its daemon keeps the default 1 MiB threshold and its files are small, so the stress run sends no deltas; the delta races are covered by the suites above.
+  - **Not done / follow-ups:**
+    - No rolling hash: an insertion that is not a whole block shifts every later block, and they are all sent (as in syncthing).
+    - Repeated blocks within the new file are each sent; the source's blocks are not deduplicated.
+    - The delta request carries the full new block list (needed to verify reused blocks), so a 1-byte change in a 64 GiB file still costs about 3 × 16 MiB of lists.
+    - `serve` and `sync` use v2 automatically; there is no CLI switch to force v1 (only the test API).
 
 ### [ ] T25: Confirm the T23 fix with 50 crash-suite runs
 - **Depends on:** T23

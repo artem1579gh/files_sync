@@ -13,6 +13,7 @@ pub mod tmpname;
 
 pub use root::{DirEntry, RelPath, Root};
 pub use stat::{
-    Discard, FileKind, Fingerprint, Recheck, Sink, StableReader, stable_read, stable_read_with,
+    Discard, FileKind, Fingerprint, PinnedFile, Recheck, Sink, StableReader, open_checked,
+    stable_read, stable_read_with,
 };
 pub use tmpname::{conflict_name, is_conflict_name, is_reserved};

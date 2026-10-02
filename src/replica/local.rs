@@ -38,11 +38,14 @@ use crate::fs::commit::{
     self, CopyNode, Ctx, Expected, FileMeta, Quarantine, Recovered, SweepReport,
 };
 use crate::fs::root::{follow_at, path_err};
-use crate::fs::{FileKind, Fingerprint, Recheck, RelPath, Root, StableReader, tmpname};
+use crate::fs::{
+    FileKind, Fingerprint, PinnedFile, Recheck, RelPath, Root, StableReader, open_checked, tmpname,
+};
 use crate::index::{
     Entry, IndexStore, Intent, IntentId, Kind, LinkInfo, LocalMeta, PeerState, ReadTxn,
     UnmanagedReason, VersionVector, sync_mode,
 };
+use crate::replica::delta::{Assembler, BlockReader, Blocks, Delta};
 use crate::replica::{ContentReader, Op, Outcome, Precondition, Replica, wire};
 use crate::scan::{DEFAULT_RACY_WINDOW, ScanStats, Scanner, Scope};
 use crate::symlink::munge;
@@ -959,13 +962,92 @@ impl Replica for LocalReplica {
             return Err(invalid(path, "open_read of an entry that is not a file"));
         }
         let snap = self.index.read()?;
-        let Some(cur) = snap.get(path)?.filter(|cur| cur.kind == expect.kind) else {
+        let cur = indexed_as(&snap, path, &expect.kind)?;
+        Ok(Box::new(self.disk().open_file(&snap, path, &cur)?))
+    }
+
+    fn blocks(&self, path: &RelPath, expect: &Kind) -> Result<Option<Blocks>> {
+        let Kind::File { size, .. } = *expect else {
+            return Err(invalid(path, "blocks of an entry that is not a file"));
+        };
+        if !Blocks::fits(size) {
+            return Ok(None);
+        }
+        let snap = self.index.read()?;
+        let cur = indexed_as(&snap, path, expect)?;
+        let mut reader = self.disk().open_file(&snap, path, &cur)?;
+        drop(snap);
+        Blocks::read(&mut reader, size).map(Some)
+    }
+
+    fn read_blocks(
+        &self,
+        path: &RelPath,
+        expect: &Kind,
+        blocks: &[u32],
+    ) -> Result<Box<dyn ContentReader>> {
+        let Kind::File { size, .. } = *expect else {
+            return Err(invalid(path, "read_blocks of an entry that is not a file"));
+        };
+        if blocks.iter().any(|&i| u64::from(i) >= Blocks::count(size)) {
+            return Err(invalid(
+                path,
+                "read_blocks of a block the file does not have",
+            ));
+        }
+        let snap = self.index.read()?;
+        let cur = indexed_as(&snap, path, expect)?;
+        let Some(file) = self.disk().open_pinned(&snap, path, &cur)? else {
             return Err(Error::Unstable {
                 path: path.as_bytes().to_vec(),
-                reason: "index entry differs from the expected entry",
+                reason: "file changed since scan",
             });
         };
-        Ok(Box::new(self.disk().open_file(&snap, path, &cur)?))
+        Ok(Box::new(BlockReader::new(
+            path.as_bytes(),
+            file,
+            size,
+            blocks.to_vec(),
+        )))
+    }
+
+    /// Checks the precondition and the delta, pins the current file, and
+    /// then applies `op` with the assembled content (design §7.1): the
+    /// commit is an ordinary `WriteFile`, so the whole-file hash and the CAS
+    /// replace are checked as for any other content.
+    fn apply_delta(
+        &mut self,
+        path: &RelPath,
+        op: Op,
+        pre: Precondition,
+        delta: &Delta,
+        data: &mut dyn Read,
+    ) -> Result<Outcome> {
+        if !matches!(op, Op::WriteFile { .. }) {
+            return Err(invalid(path, "apply_delta needs WriteFile"));
+        }
+        let snap = self.index.read()?;
+        let cur = snap.get(path)?;
+        if let Some(reason) = check(cur.as_ref(), &pre) {
+            tracing::debug!(%path, reason, "precondition failed");
+            return Ok(Outcome::PreconditionFailed(cur.map(wire)));
+        }
+        let Some(cur) = cur else {
+            return Err(invalid(path, "apply_delta needs a file at the path"));
+        };
+        let Kind::File { size, .. } = cur.kind else {
+            return Err(invalid(path, "apply_delta needs a file at the path"));
+        };
+        if let Some(reason) = delta.misfit(size) {
+            return Err(invalid(path, reason));
+        }
+        let Some(old) = self.disk().open_pinned(&snap, path, &cur)? else {
+            tracing::debug!(%path, "precondition failed: file changed since scan");
+            return Ok(Outcome::PreconditionFailed(Some(wire(cur))));
+        };
+        drop(snap);
+        let mut content = Assembler::new(path.as_bytes(), old, delta, data);
+        self.apply(path, op, pre, Some(&mut content))
     }
 
     fn apply(
@@ -1298,6 +1380,41 @@ impl Disk<'_> {
         let Kind::File { size, hash } = e.kind else {
             return Err(invalid(path, "not a file"));
         };
+        let (fd, recheck) = self.open_indexed(snap, path, e)?;
+        StableReader::new(path.as_bytes(), fd, size, hash, recheck)
+    }
+
+    /// The indexed file `e` at `path`, pinned for reads at chosen offsets
+    /// (delta transfer, design §7.1); `None` if it is not the indexed inode
+    /// as indexed (ino, size, mtime, ctime) any more.
+    fn open_pinned(&self, snap: &ReadTxn, path: &RelPath, e: &Entry) -> Result<Option<PinnedFile>> {
+        let Kind::File { size, .. } = e.kind else {
+            return Err(invalid(path, "not a file"));
+        };
+        let (fd, recheck) = self.open_indexed(snap, path, e)?;
+        let file = PinnedFile::new(path.as_bytes(), fd, recheck)?;
+        let l = &e.local;
+        let indexed = Fingerprint {
+            dev: l.dev,
+            ino: l.ino,
+            size,
+            mtime_ns: e.mtime_ns,
+            ctime_ns: l.ctime_ns,
+            mode: e.mode,
+            kind: FileKind::File,
+        };
+        Ok(file.fingerprint().unchanged(&indexed).then_some(file))
+    }
+
+    /// Opens the indexed file `e` at `path` for reading, through any
+    /// followed links on the way (and of a followed file, its referent),
+    /// with the check that it is still reachable that way at the end.
+    fn open_indexed(
+        &self,
+        snap: &ReadTxn,
+        path: &RelPath,
+        e: &Entry,
+    ) -> Result<(OwnedFd, Recheck)> {
         let base = match self.route(snap, path, false)? {
             Route::At(base) => base,
             Route::Refused(reason) => {
@@ -1312,7 +1429,7 @@ impl Disk<'_> {
         let rel = base.rel(path);
         let (parent, name) = root.resolve_parent(&rel)?;
         match &e.local.via_link {
-            None => StableReader::open_at(path.as_bytes(), parent, name, size, hash),
+            None => open_checked(path.as_bytes(), parent, name),
             Some(link) => {
                 let flags = OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC;
                 let fd =
@@ -1322,13 +1439,7 @@ impl Disk<'_> {
                     }
                     .map_err(|e| path_err(e, path, "open symlink referent"))?
                     .0;
-                StableReader::new(
-                    path.as_bytes(),
-                    fd,
-                    size,
-                    hash,
-                    link_recheck(parent, name, link.clone()),
-                )
+                Ok((fd, link_recheck(parent, name, link.clone())))
             }
         }
     }
@@ -1340,6 +1451,17 @@ fn link_is(parent: BorrowedFd<'_>, name: &[u8], v: &LinkInfo) -> Result<bool> {
     Ok(Fingerprint::at_opt(parent, name)?.is_some_and(|fp| {
         fp.kind == FileKind::Symlink && fp.ino == v.ino && fp.ctime_ns == v.ctime_ns
     }))
+}
+
+/// The index entry at `path`, which must be of kind `expect` (a read of
+/// content the peer saw); `Unstable` if it is not (any more).
+fn indexed_as(snap: &ReadTxn, path: &RelPath, expect: &Kind) -> Result<Entry> {
+    snap.get(path)?
+        .filter(|cur| cur.kind == *expect)
+        .ok_or_else(|| Error::Unstable {
+            path: path.as_bytes().to_vec(),
+            reason: "index entry differs from the expected entry",
+        })
 }
 
 /// Whether `op` changes anything on disk at the path whose entry is `cur`.
@@ -2498,5 +2620,267 @@ mod tests {
         let hint = again.recv_timeout(Duration::from_secs(3)).unwrap();
         assert_eq!(hint, Hint::Paths(vec![RelPath::new("h").unwrap()]));
         assert!(hints.is_empty());
+    }
+
+    // ---- block-level delta transfer (§7.1) ----
+
+    use crate::replica::BLOCK_SIZE;
+
+    /// `n` bytes that differ in every block.
+    fn blob(n: usize, seed: u8) -> Vec<u8> {
+        (0..n)
+            .map(|i| (i as u8).wrapping_mul(29).wrapping_add(seed) ^ (i >> 12) as u8)
+            .collect()
+    }
+
+    fn blocks_of(data: &[u8]) -> Blocks {
+        Blocks::read(&mut &data[..], data.len() as u64).unwrap()
+    }
+
+    /// The delta from `old` to `new`, and the bytes it needs sent.
+    fn delta(old: &[u8], new: &[u8]) -> (Delta, Vec<u8>) {
+        let d = Delta::plan(&blocks_of(old), blocks_of(new));
+        let bs = BLOCK_SIZE as usize;
+        let data = d
+            .needed()
+            .iter()
+            .flat_map(|&i| new[i as usize * bs..new.len().min((i as usize + 1) * bs)].to_vec())
+            .collect();
+        (d, data)
+    }
+
+    /// An indexed user file `f` holding `old` (settled, so not racy).
+    fn indexed_file(fx: &mut Fx, old: &[u8]) -> Entry {
+        user_file(fx, "f", old);
+        fx.settled_scan();
+        fx.get("f")
+    }
+
+    /// `vv` after a change on the peer.
+    fn bumped(vv: &VersionVector) -> VersionVector {
+        let mut vv = vv.clone();
+        vv.bump(PEER);
+        vv
+    }
+
+    fn write_op(new: &[u8], vv: VersionVector) -> Op {
+        Op::WriteFile {
+            meta: META,
+            hash: hash(new),
+            vv,
+        }
+    }
+
+    #[test]
+    fn blocks_and_read_blocks_of_the_indexed_file() {
+        let mut fx = Fx::new();
+        let bs = BLOCK_SIZE as usize;
+        let data = blob(3 * bs + 100, 1);
+        let e = indexed_file(&mut fx, &data);
+        assert_eq!(
+            fx.r.blocks(&rp("f"), &e.kind).unwrap(),
+            Some(blocks_of(&data))
+        );
+
+        let mut out = Vec::new();
+        fx.r.read_blocks(&rp("f"), &e.kind, &[3, 1])
+            .unwrap()
+            .read_to_end(&mut out)
+            .unwrap();
+        assert_eq!(out, [&data[3 * bs..], &data[bs..2 * bs]].concat());
+
+        // Not a block of the file; not the indexed kind.
+        let err = fx.r.read_blocks(&rp("f"), &e.kind, &[4]).err().unwrap();
+        assert!(matches!(err, Error::InvalidOp { .. }), "{err:?}");
+        let other = Kind::File {
+            size: 1,
+            hash: [0; 32],
+        };
+        assert!(fx.r.blocks(&rp("f"), &other).unwrap_err().is_unstable());
+
+        // A file that changes while its blocks are read: the stream fails.
+        let mut reader = fx.r.read_blocks(&rp("f"), &e.kind, &[0, 1]).unwrap();
+        let mut first = vec![0u8; bs];
+        reader.read_exact(&mut first).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(fx.p("f"))
+            .unwrap()
+            .write_all(b"X")
+            .unwrap();
+        let err = reader.read_to_end(&mut Vec::new()).unwrap_err();
+        assert!(Error::from_stream("read", err).is_unstable());
+        // Changed since the scan: refused up front, both reads.
+        assert!(
+            fx.r.read_blocks(&rp("f"), &e.kind, &[0])
+                .err()
+                .unwrap()
+                .is_unstable()
+        );
+        assert!(fx.r.blocks(&rp("f"), &e.kind).unwrap_err().is_unstable());
+    }
+
+    #[test]
+    fn apply_delta_rebuilds_from_the_current_file() {
+        let mut fx = Fx::new();
+        let bs = BLOCK_SIZE as usize;
+        let old = blob(4 * bs + 7, 1);
+        let e = indexed_file(&mut fx, &old);
+        // One byte changed in block 1, a new block inserted after block 2
+        // (aligned blocks: an insertion of a whole block shifts nothing).
+        let mut new = old[..3 * bs].to_vec();
+        new[bs + 5] ^= 0xFF;
+        new.extend(blob(bs, 9));
+        new.extend(&old[3 * bs..]);
+        let (d, data) = delta(&old, &new);
+        assert_eq!(d.reuse, [Some(0), None, Some(2), None, Some(3), Some(4)]);
+        let vv = bumped(&e.vv);
+        let pre = Precondition::matching(&e);
+        let out = fx.r.apply_delta(
+            &rp("f"),
+            write_op(&new, vv.clone()),
+            pre,
+            &d,
+            &mut &data[..],
+        );
+        let got = applied(out);
+        assert_eq!(fs::read(fx.p("f")).unwrap(), new);
+        assert_eq!(
+            got.kind,
+            Kind::File {
+                size: new.len() as u64,
+                hash: hash(&new)
+            }
+        );
+        assert_eq!(got.vv, vv);
+        assert!(fx.leftovers().is_empty());
+        // Nothing to rescan: the index already has it.
+        fx.settled_scan();
+        assert_eq!(fx.get("f").vv, vv);
+    }
+
+    #[test]
+    fn apply_delta_with_the_current_file_changed_mid_assembly_commits_nothing() {
+        let mut fx = Fx::new();
+        let bs = BLOCK_SIZE as usize;
+        let old = blob(3 * bs, 1);
+        let e = indexed_file(&mut fx, &old);
+        let mut new = old.clone();
+        new[0] ^= 1;
+        let (d, data) = delta(&old, &new);
+        assert_eq!(d.needed(), [0]);
+
+        // The user writes into block 2 (still to be reused) while block 0
+        // is assembled: the reused block no longer hashes as listed.
+        let path = fx.p("f");
+        let _hook = hooks::once("delta.block", move || {
+            let f = fs::File::options().write(true).open(&path).unwrap();
+            std::os::unix::fs::FileExt::write_at(&f, b"user", 2 * BLOCK_SIZE + 3).unwrap();
+        });
+        let pre = Precondition::matching(&e);
+        let out = fx.r.apply_delta(
+            &rp("f"),
+            write_op(&new, bumped(&e.vv)),
+            pre.clone(),
+            &d,
+            &mut &data[..],
+        );
+        assert!(matches!(&out, Err(e) if e.is_unstable()), "{out:?}");
+        let mut user = old.clone();
+        user[2 * bs + 3..2 * bs + 7].copy_from_slice(b"user");
+        assert_eq!(fs::read(fx.p("f")).unwrap(), user);
+        assert_eq!(fx.get("f"), e, "the index is unchanged");
+        assert!(fx.leftovers().is_empty());
+        assert!(fx.r.index().journal().take_open().is_empty());
+
+        // A change to a block that is not reused, after it was read: only
+        // the final check of the current file sees it.
+        let mut fx = Fx::new();
+        let e = indexed_file(&mut fx, &old);
+        let path = fx.p("f");
+        let _hook = hooks::once("delta.assembled", move || {
+            let f = fs::File::options().write(true).open(&path).unwrap();
+            std::os::unix::fs::FileExt::write_at(&f, b"late", 1).unwrap();
+        });
+        let out = fx.r.apply_delta(
+            &rp("f"),
+            write_op(&new, bumped(&e.vv)),
+            Precondition::matching(&e),
+            &d,
+            &mut &data[..],
+        );
+        assert!(matches!(&out, Err(e) if e.is_unstable()), "{out:?}");
+        assert_eq!(&fs::read(fx.p("f")).unwrap()[1..5], b"late");
+        assert_eq!(fx.get("f"), e);
+        assert!(fx.leftovers().is_empty());
+    }
+
+    #[test]
+    fn apply_delta_checks_the_precondition_and_the_delta() {
+        let mut fx = Fx::new();
+        let bs = BLOCK_SIZE as usize;
+        let old = blob(2 * bs, 1);
+        let e = indexed_file(&mut fx, &old);
+        let mut new = old.clone();
+        new[bs] ^= 1;
+        let (d, data) = delta(&old, &new);
+        let op = || write_op(&new, bumped(&e.vv));
+        let pre = Precondition::matching(&e);
+        let apply = |fx: &mut Fx, pre: Precondition, d: &Delta, data: &[u8]| {
+            fx.r.apply_delta(&rp("f"), op(), pre, d, &mut &data[..])
+        };
+
+        // A stale precondition.
+        let stale = Precondition::Matches {
+            kind: e.kind.clone(),
+            vv: peer(9),
+        };
+        assert_eq!(
+            failed(apply(&mut fx, stale, &d, &data)),
+            Some(wire(e.clone()))
+        );
+        // Deltas that do not fit.
+        let mut far = d.clone();
+        far.reuse[0] = Some(2);
+        invalid_op(apply(&mut fx, pre.clone(), &far, &data));
+        let mut short = d.clone();
+        short.reuse.pop();
+        invalid_op(apply(&mut fx, pre.clone(), &short, &data));
+        invalid_op(fx.r.apply_delta(
+            &rp("f"),
+            Op::Delete { vv: peer(1) },
+            pre.clone(),
+            &d,
+            &mut &data[..],
+        ));
+        // A reused block that does not hash as listed (the file did not
+        // change: the delta is wrong).
+        let mut wrong = d.clone();
+        wrong.reuse[0] = Some(1);
+        let out = apply(&mut fx, pre.clone(), &wrong, &data);
+        assert!(matches!(&out, Err(e) if e.is_unstable()), "{out:?}");
+        // A received block that is not the listed one.
+        let mut bad = data.clone();
+        bad[0] ^= 1;
+        let out = apply(&mut fx, pre.clone(), &d, &bad);
+        assert!(matches!(&out, Err(e) if e.is_unstable()), "{out:?}");
+        // Too little or too much data.
+        let out = apply(&mut fx, pre.clone(), &d, &data[1..]);
+        assert!(matches!(&out, Err(e) if e.is_unstable()), "{out:?}");
+        let out = apply(&mut fx, pre.clone(), &d, &[&data[..], b"+"].concat());
+        assert!(matches!(&out, Err(e) if e.is_unstable()), "{out:?}");
+        assert_eq!(fs::read(fx.p("f")).unwrap(), old);
+        assert!(fx.leftovers().is_empty());
+
+        // The file changed since the scan (same size, new mtime).
+        let mut user = old.clone();
+        user[0] ^= 1;
+        fs::write(fx.p("f"), &user).unwrap();
+        assert_eq!(
+            failed(apply(&mut fx, pre.clone(), &d, &data)),
+            Some(wire(e.clone()))
+        );
+        assert_eq!(fs::read(fx.p("f")).unwrap(), user);
+        assert!(fx.leftovers().is_empty());
     }
 }

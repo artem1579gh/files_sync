@@ -5,10 +5,12 @@
 //! so a remote replica (T21) is race-free in exactly the same way: the engine
 //! says what it expects in logical terms ([`Precondition`]), and the replica
 //! maps that to its own physical fingerprint.
+pub mod delta;
 pub mod local;
 pub mod proto;
 pub mod remote;
 
+pub use delta::{BLOCK_SIZE, Blocks, Delta};
 pub use local::LocalReplica;
 pub use remote::RemoteReplica;
 
@@ -98,6 +100,61 @@ pub trait Replica {
     ) -> Result<Vec<RelPath>> {
         let _ = (peer, tombstones, retention);
         Ok(Vec::new())
+    }
+
+    /// Whether reaching this replica crosses a network, so that sending
+    /// less content pays off (block-level delta transfer, design §7.1).
+    fn is_remote(&self) -> bool {
+        false
+    }
+
+    /// The block list of the file `path`, which must be the indexed file of
+    /// kind `expect` (size and hash, checked at the end of a stable read).
+    /// `None` if this replica takes part in no delta transfer of it (the
+    /// default; a protocol v1 session; a file of too many blocks), so the
+    /// file is sent whole.
+    fn blocks(&self, path: &RelPath, expect: &Kind) -> Result<Option<Blocks>> {
+        let _ = (path, expect);
+        Ok(None)
+    }
+
+    /// Streams the blocks `blocks` (in this order) of the file `path`, which
+    /// must be the indexed file of kind `expect` and stay unchanged while it
+    /// is read (else the read fails with `Unstable`). Only called after
+    /// [`Replica::blocks`] gave a list.
+    fn read_blocks(
+        &self,
+        path: &RelPath,
+        expect: &Kind,
+        blocks: &[u32],
+    ) -> Result<Box<dyn ContentReader>> {
+        let _ = (expect, blocks);
+        Err(delta_unsupported(path))
+    }
+
+    /// [`Replica::apply`] of an [`Op::WriteFile`] whose content is
+    /// assembled from the file now at `path` and the blocks in `data`, as
+    /// `delta` says. Every check of `apply` holds, plus: every block must
+    /// hash as `delta` lists it, and the current file must not change
+    /// during assembly (else `Err(Unstable)`, nothing committed). Only
+    /// called after [`Replica::blocks`] gave a list.
+    fn apply_delta(
+        &mut self,
+        path: &RelPath,
+        op: Op,
+        pre: Precondition,
+        delta: &Delta,
+        data: &mut dyn Read,
+    ) -> Result<Outcome> {
+        let _ = (op, pre, delta, data);
+        Err(delta_unsupported(path))
+    }
+}
+
+fn delta_unsupported(path: &RelPath) -> crate::Error {
+    crate::Error::InvalidOp {
+        path: path.as_bytes().to_vec(),
+        reason: "this replica does not take part in delta transfers",
     }
 }
 
@@ -224,6 +281,34 @@ impl Replica for PairReplica {
         retention: Duration,
     ) -> Result<Vec<RelPath>> {
         self.get_mut().record_sync(peer, tombstones, retention)
+    }
+
+    fn is_remote(&self) -> bool {
+        self.get().is_remote()
+    }
+
+    fn blocks(&self, path: &RelPath, expect: &Kind) -> Result<Option<Blocks>> {
+        self.get().blocks(path, expect)
+    }
+
+    fn read_blocks(
+        &self,
+        path: &RelPath,
+        expect: &Kind,
+        blocks: &[u32],
+    ) -> Result<Box<dyn ContentReader>> {
+        self.get().read_blocks(path, expect, blocks)
+    }
+
+    fn apply_delta(
+        &mut self,
+        path: &RelPath,
+        op: Op,
+        pre: Precondition,
+        delta: &Delta,
+        data: &mut dyn Read,
+    ) -> Result<Outcome> {
+        self.get_mut().apply_delta(path, op, pre, delta, data)
     }
 }
 

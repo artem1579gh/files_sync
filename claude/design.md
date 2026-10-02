@@ -59,9 +59,10 @@ src/index/   entry.rs, vv.rs (version vectors), store.rs (redb), journal.rs (int
 src/symlink/ policy.rs, safety.rs (port of rsync unsafe_symlink), munge.rs
 src/scan/    scanner.rs, hasher.rs
 src/watch/   inotify.rs, debounce.rs
-src/replica/ mod.rs (trait, Housekeeping, PairReplica), local.rs, remote.rs (T21), proto/{mod,messages,framing}.rs (wire protocol, T20)
+src/replica/ mod.rs (trait, Housekeeping, PairReplica), local.rs, remote.rs (T21), delta.rs (block-level delta, T24),
+             proto/{mod,messages,framing}.rs (wire protocol, T20)
 src/engine/  reconcile.rs, plan.rs, executor.rs, conflict.rs
-tests/       harness/, attack.rs, symlink_matrix.rs, stress.rs, crash.rs, remote.rs, net.rs
+tests/       harness/, attack.rs, symlink_matrix.rs, stress.rs, crash.rs, remote.rs, net.rs, delta.rs
 ```
 
 **Crates (one choice for each need):**
@@ -404,6 +405,12 @@ trait Replica {
     fn apply(&mut self, p: &RelPath, op: Op, pre: Precondition, content: Option<&mut dyn Read>) -> Result<Outcome>;
     fn watch(&mut self) -> Option<Receiver<Hint>>;
     fn adopt(&mut self, p: &RelPath) -> Result<bool> { Ok(false) }     // -K: adopt the symlink at p as a directory (§4.3.1)
+    fn record_sync(&mut self, peer, tombstones, retention) -> Result<Vec<RelPath>>;  // tombstone GC (§3)
+    // Block-level delta transfer (§7.1, T24); the defaults mean "whole files only":
+    fn is_remote(&self) -> bool { false }
+    fn blocks(&self, p: &RelPath, expect: &Kind) -> Result<Option<Blocks>> { Ok(None) }
+    fn read_blocks(&self, p: &RelPath, expect: &Kind, blocks: &[u32]) -> Result<Box<dyn ContentReader>>;
+    fn apply_delta(&mut self, p: &RelPath, op: Op, pre: Precondition, delta: &Delta, data: &mut dyn Read) -> Result<Outcome>;
 }
 enum Op {                                   // every op that leaves an entry carries its vv (computed by the engine)
     WriteFile{meta: FileMeta, hash, vv}, Mkdir{mode, mtime_ns, vv}, Symlink{target, mtime_ns, vv},
@@ -428,7 +435,7 @@ enum Outcome { Applied(Entry), PreconditionFailed(Option<Entry>), Preserved{ con
 - **Transport:** TCP plus `rustls` with mutual TLS. Device ID = hash of the certificate, as in syncthing.
 - **Server:** a `serve` process wraps a `LocalReplica`.
 - **Index exchange:** incremental, by `seq`.
-- **Content:** streamed in chunks. Block lists (128 KiB blake3 blocks) for delta transfer come later (T24).
+- **Content:** streamed in chunks; a file that both sides hold is sent as a block-level delta (T24, below).
 
 **Wire protocol as implemented (T20, `src/replica/proto/`):**
 - **Framing:** a 4-byte big-endian length, then exactly one postcard message (trailing bytes are an error). `MAX_FRAME` = 32 MiB bounds what a peer can make us allocate; the body buffer grows with the bytes that arrive, not with the claimed length. Every malformed input (short header or body, empty or oversized frame, unknown variant, invalid `RelPath`, non-canonical version vector, bad UTF-8, overflowing `Duration`) is `Error::Protocol`, never a panic. EOF between frames is a clean close (`Ok(None)`). `VersionVector` decoding no longer lets the encoded length size its allocation (smallvec's impl reserves it up front).
@@ -448,6 +455,23 @@ enum Outcome { Applied(Entry), PreconditionFailed(Option<Entry>), Preserved{ con
 - **Errors.** Any transport failure (I/O, TLS, malformed or unexpected message) closes the connection and becomes `Error::Connection { peer, reason }` (`RemoteKind::Protocol`, so the executor aborts the cycle); the next call reconnects. `Daemon::run` treats `is_disconnected()` as transient: it waits `RECONNECT_DELAY` (5 s) and runs a full cycle. A source that fails mid-`Apply` (stream ended with `Abort`) is returned as that source error.
 - **Incremental index exchange.** `RemoteReplica` mirrors the server's index (wire form) and sends `ChangesSince { seq: last seen }`; the engine's `changes_since(0)` is answered from the mirror, so a no-op cycle transfers no entries. Entries only disappear through `record_sync`, whose collected paths are removed from the mirror. The mirror starts over on every new connection (the server's index may have been replaced).
 - **Daemon and status over the network.** The daemon and `drain_quarantine` work on the `Housekeeping` trait (`next_sweep`, `sweep`, `status`), implemented by `LocalReplica`, `RemoteReplica` (no quarantine here) and `PairReplica`. `status` shows a remote replica as "served at ADDR"; its state is shown by `status` on its host. `--sandbox` confines writes to the local roots and the state directory (and works for `serve`).
+
+**Block-level delta transfer (T24: `src/replica/delta.rs`):**
+- **Blocks.** A file is cut into fixed, aligned blocks of `BLOCK_SIZE` = 128 KiB (the last one shorter), each hashed with blake3, as in syncthing; no rolling hash, so an insertion shifts every later block and they are all sent. `Blocks { size, hashes }` is a file's block list. Files of more than `MAX_BLOCKS` (2^19, i.e. 64 GiB) blocks are always sent whole, so a block list (16 MiB) and a delta fit one frame.
+- **Trait.** Four methods with defaults, so a replica without them is sent whole files:
+  - `is_remote()` (default `false`; `RemoteReplica`: `true`): reaching the replica crosses a network.
+  - `blocks(path, expect: &Kind) -> Option<Blocks>` (default `None`): the block list of the indexed file, from a stable read (`StableReader`: the size, and the indexed hash at EOF, must match, else `Unstable`). `None` means "no delta with this replica" (a v1 session, too many blocks).
+  - `read_blocks(path, expect, blocks: &[u32])`: streams the chosen blocks of the indexed file, in the given order. The file is opened like `open_read` and its fingerprint must equal the indexed one (ino, size, mtime, ctime), else `Unstable`; at the end it must be unchanged and still reachable by its name (or link), else the read fails with `Unstable`. It cannot check the whole hash; the destination checks every block.
+  - `apply_delta(path, op, pre, delta: &Delta, data)`: like `apply` with `Op::WriteFile`, but the content is assembled from the destination's own current file plus `data`. `Delta { blocks, reuse }`: the new file's block list, and for each of its blocks either the index of a block of the destination's current file with the same hash, or `None` (its bytes come next in `data`, in order).
+- **Engine (who decides).** For a `WriteFile` step, the executor uses a delta only if (1) one side `is_remote()` (local pairs stream whole files: same host, nothing to save), (2) the step replaces a file (`pre` is `Matches { kind: File, .. }`), (3) both the old and the new size are at least `Engine::delta_min_size` (default `DELTA_MIN_SIZE` = 1 MiB), and (4) both `blocks()` return a list. It then matches the new blocks against the old ones by hash (same index first, then any) (`Delta::plan`), and reads the needed blocks with `src.read_blocks` (skipped if none are needed) and passes them to `dst.apply_delta` (`SyncReport::deltas` counts these). Even when no block can be reused, the delta is used: the block lists cost 0.025 % of the file, and every replaced file above the threshold takes one path. The engine still does no I/O; every check below runs inside the replicas.
+- **Assembly (race-freedom, inside `LocalReplica::apply_delta`).**
+  1. The logical precondition is checked against the index first (as in `apply`); the delta must fit (`blocks` consistent with `size`, one `reuse` per block, every reused index a block of the current file), else `InvalidOp`.
+  2. The current file is opened through the read route (`Disk::open_pinned`: followed links on the way, a followed file's referent) and its fingerprint must be the indexed one, else `PreconditionFailed` (changed since the scan).
+  3. An `Assembler` (a plain `Read`) yields the new content block by block: a reused block is `pread` from the pinned old file and must hash to the **new** block's hash; a received block is read from `data` and must hash to its block hash. Any mismatch, a short read, or an old file that is not unchanged and still at its name when the last block is done, fails the read with `Unstable`. The old fd is closed before the content ends, so the commit can lease the old inode (§5.3 step 4(b)).
+  4. That `Read` is the content of an ordinary `apply` (`WriteFile`): `commit::replace_file` writes a new temp file (never in place), checks the whole-file hash against the op's hash, and commits with the usual CAS against the indexed fingerprint. So an old file that changes during assembly gives `Unstable` with nothing committed (the temp file is an unlinked `O_TMPFILE`, or removed), and a change after assembly is caught by the CAS as before. Hook points: `delta.block` (after each assembled block), `delta.assembled` (before the final check of the old file).
+- **Protocol (version 2).** `PROTOCOL_VERSION` = 2, `MIN_PROTOCOL_VERSION` = 1. New variants are appended (so v1 messages encode as before): `Request::Blocks { path, expect }` → `Response::Blocks(Option<Blocks>)`; `Request::ReadBlocks { path, expect, blocks }` → `Response::Reading` + content (as `OpenRead`); `Request::ApplyDelta { path, op, pre, delta }`, always followed by a content stream (drained by the server if unused) → `Response::Applied`. Each connection remembers its negotiated version: on a v1 session `RemoteReplica::blocks` answers `None` (whole files), and the server refuses v2 requests as a protocol error. `Server::max_protocol` and `RemoteReplica::with_protocol` cap the version (tests force v1 sessions with them).
+- **Block lists: computed on demand, not stored.** Decided against storing them with the entry: storing would cost index space (32 bytes per 128 KiB, for every file) and a schema change, and would only save one read of each side's file per delta transfer, which happens only for files above the threshold, across a network that is assumed to be the bottleneck. The destination must read its reused blocks anyway, and verifies each one by hash, so a stored list would not save a check either. The cost of on-demand lists: each delta transfer reads the source file once to hash it (plus the needed blocks again) and the destination's current file twice (list, then assembly).
+- **Traffic.** `RemoteReplica::traffic()` counts the bytes sent and received on its connections (TLS records included). Changing one byte of a 64 MiB file costs three block lists (16 KiB each), the delta, and the changed block (twice in loopback-remote mode, where both replicas are remote).
 
 ---
 
@@ -480,6 +504,8 @@ enum Outcome { Applied(Entry), PreconditionFailed(Option<Entry>), Preserved{ con
 
   Each test asserts no loss and no escape.
 
+  Delta assembly (§7.1) has the points `delta.block` and `delta.assembled`; a closure there changes the destination's current file mid-assembly.
+
   A syscall failure that no filesystem change can trigger on cue (`openat2`'s `EAGAIN` for a rename racing anywhere on the system, §4.5) has a **fault point** instead: `fs::hooks::fault("root.in_tree_lookup")` returns the errno a closure registered with `hooks::on_fault` injects, and the caller acts as if the syscall had failed with it. Fault points are not traced, so the crash suite does not crash at them.
 - **proptest:**
   - the rsync `unsafe_symlink` table plus random targets;
@@ -487,7 +513,7 @@ enum Outcome { Applied(Entry), PreconditionFailed(Option<Entry>), Preserved{ con
   - version-vector comparison is a partial order;
   - model-based random operation sequences on A and B, interleaved with syncs, checked against a reference model (`tests/model.rs`, T14). The model is independent of the engine: per path, a causal history is a *set* of edit events, recorded (like the scanner) only when the path differs from the last sync. A sync resolves each path on its own (superset wins; concurrent: same content merges, live beats deleted, otherwise the §6.2 winner stays and the loser becomes a conflict copy), then resurrects, deepest first, every non-directory with something live beneath it (its file or symlink becomes a conflict copy). Conflict copies are predicted as (directory, original name, loser's ID7, content); the real name is adopted from disk. After every sync the real tree must match the model exactly (kind, file content and mtime, symlink target), on top of `assert_converged`. Every write is unique in content and mtime, and the user gives every symlink it creates or moves a fresh mtime, so the model always knows the winner.
 - **Harness (`tests/harness/`):** two tempdirs, a scenario DSL, and `assert_converged` (trees equal after policy normalization, version vectors equal). It runs over loopback too (T22):
-  - **Modes** (the replica factory, `Mode`): `Local`, where the engine calls the `LocalReplica`s directly, and `Remote` (loopback-remote), where each `LocalReplica` is served by an in-process `Server` on 127.0.0.1 and the engine reaches it through a `RemoteReplica` (mutual TLS, wire protocol, hint connections), both replicas alike. A pair is opened locally, then `Pair::over(mode)` serves it. `Tree::replica` is a `TestReplica` (`Local` or `Remote { client, server }`) that implements `Replica` and `Housekeeping`. A served replica is swept as `serve` sweeps it (its due deadlines, plus the server's own sweep after `RecordSync`).
+  - **Modes** (the replica factory, `Mode`): `Local`, where the engine calls the `LocalReplica`s directly, and `Remote` (loopback-remote), where each `LocalReplica` is served by an in-process `Server` on 127.0.0.1 and the engine reaches it through a `RemoteReplica` (mutual TLS, wire protocol, hint connections), both replicas alike. A pair is opened locally, then `Pair::over(mode)` serves it. In remote mode `over` also sets `Engine::delta_min_size(0)`, so every replaced file goes as a block-level delta (§7.1) and the suites cover delta transfer, races included (`sync_racing` fires `Read` before `read_blocks` and `Apply` before `apply_delta`). `Pair::over_each([mode; 2], versions)` serves each replica on its own terms (one side local; protocol version caps per server and client) and leaves the engine alone; `Pair::traffic()` sums the clients' byte counters. `Tree::replica` is a `TestReplica` (`Local` or `Remote { client, server }`) that implements `Replica` and `Housekeeping`. A served replica is swept as `serve` sweeps it (its due deadlines, plus the server's own sweep after `RecordSync`).
   - The harness's own observations (index entries, config, quarantine) and local-only settings go to the `LocalReplica` directly (`TestReplica::local`/`local_mut`, behind the server's lock when served). Everything the engine and `assert_converged`'s comparisons do (`changes_since`, `scan`, …) goes through `Replica`, so over the protocol in remote mode.
   - `both_modes! { name, … }` defines each `fn name(Mode)` as two tests, `local::name` and `remote::name`. `sync_once`, `symlink_matrix`, `model` and `stress` run in both modes; `crash`, `attack` and `daemon` stay local (their hooks and event sources live in the replica's process, and the remote paths are covered by the suites above and `tests/remote.rs`).
   - `Pair::new(policy)`: fixed replica IDs (predictable conflict names) and quarantine grace 0.
