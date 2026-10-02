@@ -64,6 +64,16 @@ pub enum Error {
     #[error("unstable path \"{}\": {reason}", path.escape_ascii())]
     Unstable { path: Vec<u8>, reason: &'static str },
 
+    /// The index database failed (I/O, corruption detected by redb, or a
+    /// transaction error).
+    #[error("index database: {0}")]
+    Db(#[from] redb::Error),
+
+    /// The index database opened but its contents are unusable: a schema or
+    /// replica mismatch, or a record that does not decode.
+    #[error("bad index: {reason}")]
+    BadIndex { reason: String },
+
     /// Neither `$XDG_STATE_HOME` nor `$HOME` gives a usable state directory.
     #[error("cannot determine state directory: set XDG_STATE_HOME or HOME to an absolute path")]
     NoStateHome,

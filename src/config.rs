@@ -61,24 +61,33 @@ impl FromStr for ReplicaId {
     }
 }
 
-/// How a replica treats symlinks, named after the matching rsync option.
+/// How a replica treats symlinks, named after the matching rsync option
+/// (design §4.3). [`crate::symlink::classify`] applies it to one link.
 ///
-/// Placeholder: the exact semantics are finalised in T09 (design §4.3).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// "Unsafe" is rsync's lexical check (absolute, or leaving the root through
+/// `..`; [`crate::symlink::is_unsafe`]), applied to the canonical (unmunged)
+/// target. `--munge-links` and `-K` are separate per-replica flags on
+/// [`ReplicaConfig`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SymlinkPolicy {
-    /// No `-l`: symlinks are not synced.
+    /// No `-l`: every symlink is `Unmanaged(IgnoredLink)`; incoming changes to
+    /// the path are skipped.
     Skip,
-    /// `-l` (implied by `-a`): symlinks are synced as symlinks.
+    /// `-l` (implied by `-a`): symlinks are synced as symlinks, target bytes
+    /// verbatim, dangling allowed.
     #[default]
     Links,
-    /// `-L`: every symlink is replaced by its referent.
+    /// `-L`: every symlink is indexed as its referent (File or Dir); a
+    /// dangling one is `Unmanaged(Dangling)`.
     CopyLinks,
-    /// `--copy-unsafe-links`: unsafe symlinks are replaced by their referent.
+    /// `--copy-unsafe-links`: unsafe symlinks as with `-L`, safe ones as with `-l`.
     CopyUnsafeLinks,
-    /// `--safe-links`: unsafe symlinks are ignored.
+    /// `--safe-links`: unsafe symlinks are `Unmanaged(IgnoredLink)`, safe ones
+    /// are synced as symlinks.
     SafeLinks,
-    /// `-k`: symlinks to directories are replaced by the directory.
+    /// `-k`: symlinks to directories are indexed as the directory; all other
+    /// symlinks (dangling ones included) as with `-l`.
     CopyDirlinks,
 }
 

@@ -185,7 +185,7 @@ The design lives in [`design.md`](design.md); §N.M below refers to its sections
 
 ## M2: index, symlinks, scanner
 
-### [ ] T08: Index entries, version vectors, redb store
+### [x] T08: Index entries, version vectors, redb store
 - **Depends on:** T01
 - **Read:** §3, §6.1
 - **Files:** `src/index/{mod,entry,vv,store}.rs`
@@ -205,8 +205,15 @@ The design lives in [`design.md`](design.md); §N.M below refers to its sections
   - Store round-trip tests pass.
   - `changes_since` returns every entry put after the given seq.
 - **Notes:**
+  - **Entry** (`index/entry.rs`): `Entry`, `Kind`, `UnmanagedReason`, `LocalMeta` as in §3. `Entry`'s serde form is the **wire** form (`local` is `#[serde(skip)]`, tested: the raw target bytes don't appear in the encoding); the store persists `(Entry, LocalMeta)`. `LinkInfo { ino, ctime_ns, raw_target, out_of_tree }` was left open by the design (T10/T17 may extend it). Also `Entry::new` (seq 0, default local), `is_live`/`is_tombstone`/`is_unmanaged`, and `sync_mode(st_mode) = & 0o1777` (same mask as `commit.rs`).
+  - **VersionVector** (`index/vv.rs`): `SmallVec<[(ReplicaId, u64); 2]>` (new dep `smallvec` with `serde`), canonical (sorted, no zeros), so derived `==` agrees with `compare == Equal`; `PartialOrd` follows `compare`. API: `bump(id)` (max + 1), `bump_after(id, floor)` (above a Lamport floor too), `get`, `set`, `max_counter`, `iter`, `merge` (returns a new vector), `compare -> Ord4`, `descends`, `FromIterator`. Deserialisation rejects unsorted, duplicate, zero or > `MAX_COUNTER` (2^62) counters, so `bump` can't overflow and needs no error path.
+  - **IndexStore** (`index/store.rs`): `open(path, replica)` creates or checks `meta` (schema 1, replica ID; mismatch → `Error::BadIndex`); `path_for(pair_dir, id)` = `<pair>/<id>.redb`. Values are stored as `&[u8]` and decoded by us, so a corrupt record is `BadIndex`, not a panic inside redb's `Value::from_bytes`. `by_seq` keeps exactly one row per entry (the old one is removed on overwrite). Transactions: `read() -> ReadTxn` (snapshot: `get`, `changes_since`, `iter_prefix`, `len`, `next_seq`, `max_counter`) and `write() -> WriteTxn` (`get` sees own puts, `put(&path, &mut Entry) -> seq` sets `entry.seq`, `remove` for T18's GC, `commit`; drop = abort). The single-op helpers on `IndexStore` each use one transaction.
+  - `iter_prefix` is component-wise (`a` gives `a`, `a/…`, not `ab` or `a.txt`; root gives everything), via the key range `["a/", "a0")`. `changes_since` and `iter_prefix` return `Vec`s; fine for now, a streaming/callback form can come with T21 if large indexes need it.
+  - `meta.max_counter` is the largest vv counter ever put (a Lamport clock), for `bump_after`. T10 should bump with `vv.bump_after(local_id, store.max_counter())` so a re-created path outranks anything seen before.
+  - New errors: `Error::Db(redb::Error)` (every redb sub-error goes through `redb::Error`) and `Error::BadIndex { reason }`.
+  - Tests (16): vv basics, compare cases, non-canonical serde rejected, proptests (partial order: reflexive, swap-consistent, antisymmetric, transitive; merge commutative, associative, idempotent, upper and least upper bound; bump strictly dominates; serde round trip); entry wire form; store round-trip of every kind with full `LocalMeta`, non-UTF-8 key and the root key, across reopen; overwrite reassigns seq; `changes_since` against a model over 50 puts with overwrites, at every cut; `iter_prefix`; transaction abort/snapshot isolation/remove; another replica's index rejected; corrupt record → `BadIndex`.
 
-### [ ] T09: Symlink safety, munging, policy
+### [x] T09: Symlink safety, munging, policy
 - **Depends on:** T01
 - **Read:** §4 (all)
 - **Files:** `src/symlink/{mod,safety,munge,policy}.rs`, `src/config.rs` (finalize `SymlinkPolicy`)
@@ -219,6 +226,12 @@ The design lives in [`design.md`](design.md); §N.M below refers to its sections
   - proptest: `unmunge(munge(x)) == x` for all x, and `munge` is injective;
   - a classification table test for each policy × {safe, unsafe, dangling, dir referent}.
 - **Notes:**
+  - **Deviation (design §4.2 updated):** `safety::unsafe_symlink(dest, src)` ports rsync **3.4.1**, not the classic version. The classic algorithm (identical in upstream 3.2.7) disagreed with the installed `rsync 3.2.7` on 8 of 41 cases: Ubuntu backports the CVE-2024-12088 fix, which also rejects a `/../` after the leading `../` run (`a/../x`, `./../x`) and a trailing `/..` (`x/..`, even `../..` at depth 2). T17's differential test compares against the installed rsync, so we follow the current upstream. Quirks kept: `..` in `src` resets the margin, a leading `/` in `src` adds depth, repeated `/` are skipped, only exact `.`/`..` are special, input ends at the first NUL. `is_unsafe(&RelPath, target)` wraps it.
+  - The 40-row table (plus raw-`src` quirks) was checked one by one against `rsync -a --safe-links` on this machine (scratch script, not committed; 45/45 agree including the policy-test targets). T17 can turn this into a permanent differential test.
+  - **munge** (`symlink/munge.rs`): `munge`, `unmunge` (strips exactly one prefix; a target without it is returned unchanged), `is_munged`, `PREFIX`. Unlike rsync's sender (which unmunges only when `len > prefix len`), the exact-prefix target `/rsyncd-munged/` unmunges to the empty target, so `unmunge(munge(x)) == x` holds for all `x`; empty targets can't exist on Linux anyway. T17 should use `is_munged` to spot user-made unprefixed links in a munged replica.
+  - **policy** (`symlink/policy.rs`): `classify(policy, link, canonical_target, referent: Option<FileKind>) -> Treatment`. **Deviation from the task text:** the referent is an `fs::FileKind` (what `stat` says), not an index `Kind`, because it describes the on-disk object, not an entry. `None` = dangling; `Some(Special)` under following → `Unmanaged(Special)`; `Some(Symlink)` (impossible after `stat`) is treated as dangling. Loops (ancestor dev/ino, `ELOOP`) are for the scanner (T10). `needs_referent(policy, link, target)` tells the scanner when it can skip the `stat`. Rows: Skip → `IgnoredLink`; Links → `AsSymlink`; CopyLinks → `Follow`/`Dangling`; CopyUnsafeLinks → unsafe as `-L`, safe as `-l`; SafeLinks → unsafe `IgnoredLink`, safe `AsSymlink`; CopyDirlinks → `Follow` only for a dir referent, else `AsSymlink` (dangling stays a link, as in rsync's `link_stat`). `-K` and munging are per-replica and not part of `classify`.
+  - `config::SymlinkPolicy` is final: docs describe each policy's §4.3 behaviour, `Hash` was added, and it is re-exported as `symlink::SymlinkPolicy`.
+  - Tests (7): safety table (40 rows) + raw-`src` quirks; munge examples + proptests (round trip, injective; inputs biased towards repeated and partial prefixes); policy matrix of 6 policies × {safe, unsafe} × {file, dir, dangling, special}, each with 3 target spellings, plus a check that the referent is ignored when `needs_referent` is false; depth-dependent safety.
 
 ### [ ] T10: Scanner
 - **Depends on:** T03, T08, T09

@@ -107,7 +107,10 @@ struct LocalMeta { dev, ino, ctime_ns, mnt_id, raw_target: Option<Vec<u8>>, via_
 ```
 
 - **Paths:** index keys are raw path bytes relative to the root, never UTF-8 `String`.
-- **Local change:** the replica's counter becomes `max(all counters) + 1`, as in syncthing.
+- **Wire vs. stored form:** `Entry`'s serde form is the wire form; `local` is `#[serde(skip)]`. The store persists `(Entry, LocalMeta)` together. `LinkInfo { ino, ctime_ns, raw_target, out_of_tree }` describes the followed link behind a `via_link` entry. `mode` keeps the sticky bit (`st_mode & 0o1777`, the same mask the commit code uses).
+- **Version vectors** are canonical: sorted by replica, no zero counters, every counter ≤ 2^62 (enforced when decoding, so `bump` cannot overflow). `compare` gives `Ord4 { Equal, Dominates, Dominated, Concurrent }`.
+- **Local change:** the replica's counter becomes `max(all counters) + 1`, as in syncthing. `bump_after(id, floor)` also lifts it above `floor`; the store keeps the largest counter ever stored (`max_counter`, a Lamport clock) for that purpose.
+- **Store (redb):** `entries` (path → postcard `(Entry, LocalMeta)`), `by_seq` (seq → path, exactly one row per entry at its current seq), `meta` (schema version, replica ID, `next_seq`, `max_counter`). Every put gets a fresh seq, starting at 1, so `changes_since(0)` returns everything.
 - **Rehash shortcut:** a file is not rehashed if (ino, size, mtime, ctime) are unchanged.
 - **Racily clean entries:** if ctime is within one timestamp tick of the scan start, the entry is marked `racy` and is always rehashed on the next scan. Git uses the same rule.
 - **Tombstones:** a deletion keeps its version vector. A tombstone is garbage-collected when every known replica has an equal version vector and a retention period has passed (default 30 days).
@@ -124,10 +127,11 @@ For each path, the two-way result must equal running `rsync <opts>` in the direc
 ### 4.2 "Unsafe" links
 
 This is a lexical check, ported from rsync's `unsafe_symlink()`. A link is unsafe if:
-- its target is absolute, or
-- walking its `..` components, starting from the link's own directory (expressed relative to the root), ever goes above depth 0.
+- its target is absolute or empty, or
+- walking its `..` components, starting from the link's own directory (expressed relative to the root), ever goes above depth 0, or
+- *(rsync ≥ 3.4.0, CVE-2024-12088, also backported by distributions)* its target contains a `..` component anywhere after the leading run of `../` (e.g. `a/../x`), or ends in `/..`. An intermediate component could later be replaced by a symlink.
 
-Both sides use the same relative paths, so the classification is symmetric. **Security never depends on this check.** Escapes are prevented by the kernel through `RESOLVE_BENEATH` (§5.1).
+We port rsync 3.4.1, quirks included (`symlink/safety.rs`), and check it against the installed rsync. The check runs on the canonical (unmunged) target. Both sides use the same relative paths, so the classification is symmetric. **Security never depends on this check.** Escapes are prevented by the kernel through `RESOLVE_BENEATH` (§5.1).
 
 ### 4.3 Policy for each rsync option
 
