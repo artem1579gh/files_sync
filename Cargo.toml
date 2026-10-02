@@ -19,6 +19,10 @@ toml = "1.1.6"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
+[features]
+# Race-injection points in fs::hooks for integration tests (tests/attack.rs, crash.rs).
+hooks = []
+
 [dev-dependencies]
 proptest = "1.11.0"
 tempfile = "3.27.0"

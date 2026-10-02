@@ -1,0 +1,220 @@
+//! Reserved names and conflict-copy names (design §2, §5.3, §6.2).
+//!
+//! Every name starting with [`RESERVED_PREFIX`] belongs to us: temp files
+//! (`.~fsync.<id>`), quarantined old inodes (`.~fsync.old.<id>`), files
+//! being deleted (`.~fsync.del.<id>`) and capability probes
+//! (`.~fsync.probe.*`). The scanner and watcher ignore them all.
+//!
+//! [`conflict_name`] lives here rather than in `engine/conflict.rs` because
+//! `fs::commit` needs it too and `fs` must not depend on the engine.
+
+use std::fmt;
+
+use jiff::civil::DateTime;
+
+use crate::config::ReplicaId;
+use crate::error::{Error, Result};
+
+/// Prefix of every name we create for our own bookkeeping.
+pub const RESERVED_PREFIX: &[u8] = b".~fsync.";
+
+/// Longest file name Linux filesystems accept.
+pub const NAME_MAX: usize = 255;
+
+/// True for names in the reserved `.~fsync.` namespace.
+pub fn is_reserved(name: &[u8]) -> bool {
+    name.starts_with(RESERVED_PREFIX)
+}
+
+/// Random identifier of one temp, quarantine or delete name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TmpId(pub u64);
+
+impl TmpId {
+    pub fn random() -> Result<TmpId> {
+        let mut buf = [0u8; 8];
+        let mut filled = 0;
+        while filled < buf.len() {
+            match rustix::rand::getrandom(&mut buf[filled..], rustix::rand::GetRandomFlags::empty())
+            {
+                Ok(n) => filled += n,
+                Err(rustix::io::Errno::INTR) => {}
+                Err(e) => return Err(Error::io("getrandom", e.into())),
+            }
+        }
+        Ok(TmpId(u64::from_le_bytes(buf)))
+    }
+}
+
+impl fmt::Display for TmpId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:016x}", self.0)
+    }
+}
+
+/// What a reserved name is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TmpKind {
+    /// `.~fsync.<id>`: new content staged for a commit.
+    Temp,
+    /// `.~fsync.old.<id>`: a replaced inode in quarantine (§5.3 step 4(f)).
+    Old,
+    /// `.~fsync.del.<id>`: an object being deleted (§5.6).
+    Del,
+}
+
+impl TmpKind {
+    fn infix(self) -> &'static str {
+        match self {
+            TmpKind::Temp => "",
+            TmpKind::Old => "old.",
+            TmpKind::Del => "del.",
+        }
+    }
+}
+
+/// `.~fsync.<id>`, `.~fsync.old.<id>` or `.~fsync.del.<id>`.
+pub fn name(kind: TmpKind, id: TmpId) -> Vec<u8> {
+    format!(".~fsync.{}{id}", kind.infix()).into_bytes()
+}
+
+pub fn tmp(id: TmpId) -> Vec<u8> {
+    name(TmpKind::Temp, id)
+}
+
+pub fn old(id: TmpId) -> Vec<u8> {
+    name(TmpKind::Old, id)
+}
+
+pub fn del(id: TmpId) -> Vec<u8> {
+    name(TmpKind::Del, id)
+}
+
+/// The inverse of [`name`]; `None` for any other name (probe names included).
+pub fn parse(name: &[u8]) -> Option<(TmpKind, TmpId)> {
+    let rest = name.strip_prefix(RESERVED_PREFIX)?;
+    let (kind, hex) = if let Some(hex) = rest.strip_prefix(b"old.") {
+        (TmpKind::Old, hex)
+    } else if let Some(hex) = rest.strip_prefix(b"del.") {
+        (TmpKind::Del, hex)
+    } else {
+        (TmpKind::Temp, rest)
+    };
+    if hex.len() != 16 || !hex.iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return None;
+    }
+    let id = u64::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?;
+    Some((kind, TmpId(id)))
+}
+
+/// `stem.sync-conflict-YYYYMMDD-HHMMSS-<ID7>.ext` (design §6.2).
+///
+/// `split_ext` is false for directories and symlinks, which never get an
+/// extension split. A name has an extension when it has a `.` that is neither
+/// its first nor its last byte; the extension is what follows the last one.
+/// `now` is the local wall-clock time. If the result would exceed
+/// [`NAME_MAX`], the stem is shortened.
+pub fn conflict_name(name: &[u8], split_ext: bool, now: DateTime, replica: ReplicaId) -> Vec<u8> {
+    let id = replica.to_string();
+    let marker = format!(
+        ".sync-conflict-{:04}{:02}{:02}-{:02}{:02}{:02}-{}",
+        now.year(),
+        now.month(),
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second(),
+        &id[..7]
+    );
+    let dot = name
+        .iter()
+        .rposition(|&b| b == b'.')
+        .filter(|&i| split_ext && i > 0 && i + 1 < name.len());
+    let (mut stem, mut ext) = match dot {
+        Some(i) => (&name[..i], &name[i..]),
+        None => (name, &[][..]),
+    };
+    // An extension too long to keep alongside the marker is not one.
+    if ext.len() + marker.len() + 1 > NAME_MAX {
+        (stem, ext) = (name, &[][..]);
+    }
+    let room = NAME_MAX - marker.len() - ext.len();
+    stem = &stem[..stem.len().min(room)];
+
+    let mut out = Vec::with_capacity(stem.len() + marker.len() + ext.len());
+    out.extend_from_slice(stem);
+    out.extend_from_slice(marker.as_bytes());
+    out.extend_from_slice(ext);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jiff::civil::date;
+
+    #[test]
+    fn reserved_names_round_trip() {
+        let id = TmpId(0x0123_4567_89ab_cdef);
+        assert_eq!(tmp(id), b".~fsync.0123456789abcdef");
+        assert_eq!(old(id), b".~fsync.old.0123456789abcdef");
+        assert_eq!(del(id), b".~fsync.del.0123456789abcdef");
+        for kind in [TmpKind::Temp, TmpKind::Old, TmpKind::Del] {
+            let n = name(kind, id);
+            assert!(is_reserved(&n));
+            assert_eq!(parse(&n), Some((kind, id)));
+        }
+        assert_ne!(TmpId::random().unwrap(), TmpId::random().unwrap());
+    }
+
+    #[test]
+    fn parse_rejects_other_names() {
+        for n in [
+            &b"file"[..],
+            b".~fsync.",
+            b".~fsync.probe.0123456789abcdef.a",
+            b".~fsync.old.0123",
+            b".~fsync.0123456789ABCDEF",
+            b".~fsync.0123456789abcdef0",
+            b".~fsync.xyz.0123456789abcdef",
+        ] {
+            assert_eq!(parse(n), None, "{}", n.escape_ascii());
+        }
+        assert!(is_reserved(b".~fsync.probe.x"));
+        assert!(!is_reserved(b".~fsync"));
+        assert!(!is_reserved(b"a.~fsync.x"));
+    }
+
+    #[test]
+    fn conflict_names() {
+        let now = date(2026, 10, 2).at(9, 5, 7, 0);
+        let id = ReplicaId(0xabcdef0123456789);
+        let c = |n: &[u8], split| String::from_utf8(conflict_name(n, split, now, id)).unwrap();
+        let m = ".sync-conflict-20261002-090507-abcdef0";
+        assert_eq!(c(b"report.txt", true), format!("report{m}.txt"));
+        assert_eq!(c(b"a.tar.gz", true), format!("a.tar{m}.gz"));
+        assert_eq!(c(b"Makefile", true), format!("Makefile{m}"));
+        assert_eq!(c(b".bashrc", true), format!(".bashrc{m}"));
+        assert_eq!(c(b"trailing.", true), format!("trailing.{m}"));
+        assert_eq!(c(b"dir.d", false), format!("dir.d{m}"));
+        // Non-UTF-8 bytes pass through.
+        assert_eq!(
+            conflict_name(b"\xff.x", true, now, id),
+            [&b"\xff"[..], m.as_bytes(), b".x"].concat()
+        );
+    }
+
+    #[test]
+    fn conflict_name_fits_name_max() {
+        let now = date(2026, 1, 1).at(0, 0, 0, 0);
+        let id = ReplicaId(1);
+        let long = [b'a'; 250];
+        let n = conflict_name(&[&long[..], b".txt"].concat(), true, now, id);
+        assert_eq!(n.len(), NAME_MAX);
+        assert!(n.ends_with(b"-0000000.txt"));
+        // An absurd extension is not split off.
+        let n = conflict_name(&[&b"a."[..], &long[..]].concat(), true, now, id);
+        assert_eq!(n.len(), NAME_MAX);
+        assert!(n.ends_with(b"-0000000"));
+    }
+}

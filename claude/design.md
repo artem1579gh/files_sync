@@ -226,16 +226,17 @@ Both sides use the same relative paths, so the classification is symmetric. **Se
 - `fsync(parentfd)`.
 - `statx` the name and require ino == N with the same mtime and size. ctime will have changed because of the rename; we accept that and record it.
 - Re-resolve the parent and compare its (dev, ino) (§5.1).
+- If either check fails, the commit already happened but the name or its directory changed right after: report `Unstable` so the path is rescanned.
 - In **one** redb transaction, write the index entry (local meta = the fingerprint we produced) and mark the journal intent Done.
 - The resulting inotify event then finds the index already up to date, so **there is no echo**.
 
 ### 5.4 Directories
 
-`mkdirat(parentfd, name, mode)` directly on the name; `EEXIST` means `PreconditionFailed`.
+`mkdirat(parentfd, tmp, 0700)` under a temp name, pin it with an `O_RDONLY|O_DIRECTORY` fd, `fchmod` it to the wanted mode (so the umask does not apply and the chmod cannot hit someone else's directory), then `renameat2(tmp → name, RENAME_NOREPLACE)` and the usual step 5 checks. `EEXIST` means `PreconditionFailed`. (Originally `mkdirat` directly on the name; the temp name gives the same atomic emptiness of the name plus a verified inode and exact mode.)
 
 ### 5.5 Symlinks
 
-`symlinkat(target, parentfd, tmp)`, then the same `NOREPLACE` or `EXCHANGE` commit. Verification compares the readlink bytes plus ino.
+`symlinkat(target, parentfd, tmp)`, then the same `NOREPLACE` or `EXCHANGE` commit. Verification compares the readlink bytes plus ino. A file and a symlink may replace each other in one exchange (the old object only has to be a file or symlink matching the index); directories are never exchanged.
 
 ### 5.6 Deletes
 
@@ -302,7 +303,7 @@ Take the union of paths over both indexes. For each path, given entries `ea` and
 ### 6.2 Conflicts
 
 - **Winner:** the newer mtime; a tie goes to the higher ReplicaId. For type conflicts, Dir > File > Symlink.
-- **Loser:** renamed on its own replica to `stem.sync-conflict-YYYYMMDD-HHMMSS-<ID7>.ext`, where `<ID7>` is the first 7 characters of the replica ID. Directories, symlinks and names without an extension get no extension split.
+- **Loser:** renamed on its own replica to `stem.sync-conflict-YYYYMMDD-HHMMSS-<ID7>.ext`, where `<ID7>` is the first 7 characters of the replica ID. Directories, symlinks and names without an extension get no extension split. If the name is taken, the timestamp is bumped by a second and retried. The helper is `fs::tmpname::conflict_name` (in `fs/`, because `fs::commit` needs it too).
 - The conflict copy gets a fresh version vector and syncs to both sides like any other file. The winner gets the merged version vector plus a bump.
 
 ### 6.3 Ordering
@@ -366,7 +367,7 @@ enum Outcome { Applied(Entry), PreconditionFailed(Option<Entry>), Preserved{ con
 ## 9. Verification strategy
 
 - **Unit tests:** every commit path in `fs/commit.rs`.
-- **Deterministic race injection.** `fs::hooks::point("before_exchange")` and similar exist only under `cfg(test)` or the `hooks` feature. Tests register closures that mutate the filesystem at exactly that moment:
+- **Deterministic race injection.** `fs::hooks::point("replace.before_exchange")` and similar exist only under `cfg(test)` or the `hooks` feature. Tests register closures (per thread) that mutate the filesystem at exactly that moment:
   - swap a directory for a symlink to `/tmp/outside`;
   - write between the precondition check and the exchange;
   - replace the file between the precondition check and the exchange;

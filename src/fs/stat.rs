@@ -70,6 +70,15 @@ impl Fingerprint {
             .and_then(|st| Self::from_statx(&st))
     }
 
+    /// Like [`Fingerprint::at`], but `Ok(None)` when `name` does not exist.
+    pub fn at_opt(dirfd: BorrowedFd<'_>, name: &[u8]) -> Result<Option<Fingerprint>> {
+        match Self::at(dirfd, name) {
+            Ok(fp) => Ok(Some(fp)),
+            Err(Error::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     pub fn from_statx(st: &Statx) -> Result<Fingerprint> {
         if st.stx_mask & NEEDED.bits() != NEEDED.bits() {
             return Err(Error::io(
