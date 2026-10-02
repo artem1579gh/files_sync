@@ -360,7 +360,7 @@ The design lives in [`design.md`](design.md); §N.M below refers to its sections
     - `plan`: a push matrix (every target kind under every pushed kind → ops, phases, preconditions, vectors, source); an ordering test (rename → deletes depth-descending → creates depth-ascending, including a dir→file type change and `MergeVv`); a resurrection plan.
     - `engine/sim.rs` (proptest, 512 cases): two in-memory replicas that mirror `LocalReplica`'s index semantics (incl. `InvalidOp` as a failure). It runs random edits on a synced base, then concurrent random edits on both sides, then syncs. It asserts convergence in ≤ 3 rounds (limit 5), equal live entries, no failed steps, and that every file version survives unless the peer's vector dominates it. Mutation-checked: disabling resurrection or the conflict rename makes it fail.
 
-### [ ] T13: Executor, conflicts, `sync --once`, test harness
+### [x] T13: Executor, conflicts, `sync --once`, test harness
 - **Depends on:** T11, T12
 - **Read:** §6.2, §6.4, §7, §9 (harness)
 - **Files:** `src/engine/{executor,conflict}.rs`, `src/cli.rs`, `tests/harness/mod.rs`, `tests/sync_once.rs`
@@ -386,6 +386,36 @@ The design lives in [`design.md`](design.md); §N.M below refers to its sections
   - symlinks under `Links`.
   - `cargo run -- sync --once` works on two real directories.
 - **Notes:**
+  - **API (design §6.4 updated):**
+    - `engine::Engine` (builder `max_rounds`): `sync_once(a, b)` = `sync(a, b, Scope::Full)`. `sync` takes the initial scan scope, for T16's watcher-driven cycles. Each round reconciles the **whole** indexes (`changes_since(0)`); incremental exchange by `seq` is left for T16/T20.
+    - It returns `SyncReport { rounds, applied, retried, conflicts: Vec<ConflictCopy>, resurrected, unmanaged, errors: Vec<(RelPath, String)>, unresolved }` and `is_converged()`. `engine::MAX_ROUNDS = 5`; `sim.rs` now uses it.
+    - `engine/conflict.rs` is bookkeeping only (`ConflictCopy {side, path, copy}`, logging of conflicts and resurrections). The resolution itself is already in reconcile/plan (T12): `RenameToConflict` on the loser side, then normal propagation.
+  - **Executor behaviour:**
+    - These mark a path dirty (skip its later steps, rescan it on both sides before the next round): `PreconditionFailed`, `Preserved`, `Err` that `is_unstable()`/`is_not_found()` from either `open_read` or `apply`, `Rescan` actions, and `ScanStats::dirty`.
+    - Other per-path errors (also `InvalidOp`, an engine bug) are logged and reported, and that path and its subtree are left alone for the rest of the cycle. Only `Db`/`BadIndex` errors and scan errors (root or index) abort.
+    - `ScanStats::errors` paths are reported, not blocked: the scanner keeps their entries unchanged, which is safe to reconcile.
+    - The loop stops when a reconcile yields no steps and nothing is dirty. A round that only rescans counts toward the 5.
+  - **CLI:** `sync --once` runs one cycle, prints a summary (applied, conflict copies, resurrections, unmanaged, errors, unresolved) and exits non-zero if not converged.
+    - Before exiting it drains both quarantines (sweeps until empty, at most 10 × `DEFAULT_GRACE`). Otherwise every replaced file would leave a `.~fsync.old.*` behind when the process exits. **T15** should still sweep stale quarantine names at startup (a crash or a give-up leaves them).
+    - The `stubs_…` CLI test now covers only `daemon`/`status`. New test `sync_once_syncs_two_directories` (also checks that no reserved names are left after a replace).
+    - Checked by hand with `cargo run -- init` + `sync --once` on two scratch dirs: initial sync, then a concurrent edit → conflict copy on both sides.
+  - **Harness** (`tests/harness/mod.rs`, design §9 updated):
+    - Holds two `LocalReplica`s, not generic `Replica`s: **T22** has to abstract over replica construction.
+    - The `Racing` wrapper passes every `Replica` call through to its `LocalReplica` and injects a user edit before the first `apply`/`open_read` at a path. It covers the retry loop without the `hooks` feature.
+    - `assert_converged`'s normalization handles only `Links` and `Skip` (plus unmunging). Other policies hit `unimplemented!` (**T17**).
+  - **Tests** (`tests/sync_once.rs`, 15):
+    - create, modify (content, file mode), delete on each side, plus a no-op second cycle;
+    - concurrent modification with each side winning by mtime → one conflict copy with the loser's ID7, both contents on both sides;
+    - concurrent identical change → `MergeVv`, no copy;
+    - delete vs modification on each side → the modification survives;
+    - dir delete vs new child → resurrection;
+    - type changes file→dir→symlink→file→dir→file;
+    - nested dirs (create, dir mode, recursive delete);
+    - symlinks under `Links` (relative, dir link not descended, absolute, dangling, escaping, retarget, delete, concurrent retarget → conflict copy of the link);
+    - `Skip` leaves links alone and reports a link-vs-file `Unmanaged`;
+    - vv records both replicas;
+    - races: destination edited before `apply` → retry → conflict; source rewritten before `open_read` → `Unstable` → resent; directory filled just before `Rmdir` → kept.
+  - Mutation-checked: skipping conflict renames, or not rescanning dirty paths, makes tests fail.
 
 ### [ ] T14: Model-based property test
 - **Depends on:** T13

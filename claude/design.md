@@ -345,6 +345,10 @@ Details of the table, as implemented by `engine::reconcile` (T12):
 
 Any `PreconditionFailed` marks the path dirty. The loop then rescans the dirty paths on both replicas and runs another round, up to 5 rounds per sync cycle. Paths still unresolved wait for the next cycle. A round with a conflict or a resurrection needs a following round even when nothing failed: the conflict copies and the winner's merged vector propagate then. So the loop runs while `reconcile` still yields steps (the T12 model test converges in at most 3 rounds without concurrent edits).
 
+**Executor** (`engine::Engine`, T13): `sync(a, b, scope)` scans `scope` on both replicas (`sync_once` = `Scope::Full`), then loops: rescan the dirty paths on both sides, reconcile **snapshots of the whole indexes** (`changes_since(0)`), and run the plan's phases. A `WriteFile` streams `open_read` on the source side straight into `apply` on the destination. Dirty paths come from `PreconditionFailed`, `Preserved`, `Err(Unstable)` or not-found (from either `open_read` or `apply`), `Rescan` actions and scan-reported dirty paths. After a step fails, that path's later steps in the round are skipped. Any other per-path error (e.g. `EACCES`, or an `InvalidOp`, which is an engine bug) is logged and reported, and the path and its subtree are left alone for the rest of the cycle. Only index failures (`Db`, `BadIndex`) and scan failures (root or index) abort the cycle. The loop stops when a reconcile yields no steps and nothing is dirty. After `MAX_ROUNDS` (5) rounds (a round that only rescans counts too), what is left is reported as `unresolved`. `SyncReport` lists rounds, applied/retried steps, conflict copies (`engine::conflict::ConflictCopy`, recorded when the rename applied), resurrections, `Unmanaged` skips (warned once per cycle), errors and unresolved paths.
+
+`sync --once` (CLI) runs one cycle, then waits for both quarantines to drain (sweeping until empty, at most 10 grace periods), so a one-shot run leaves no `.~fsync.old.*` files behind. It exits non-zero if the cycle did not converge.
+
 Rename detection by inode or hash is an optional later optimization.
 
 ---
@@ -419,7 +423,11 @@ enum Outcome { Applied(Entry), PreconditionFailed(Option<Entry>), Preserved{ con
   - munge/unmunge is a bijection;
   - version-vector comparison is a partial order;
   - model-based random operation sequences on A and B, interleaved with syncs, checked against a reference model.
-- **Harness (`tests/harness/`):** two tempdirs, a scenario DSL, and `assert_converged` (trees equal after policy normalization, version vectors equal). It is generic over `Replica`, so the network phase reruns it over loopback.
+- **Harness (`tests/harness/`):** two tempdirs, a scenario DSL, and `assert_converged` (trees equal after policy normalization, version vectors equal). The network phase must be able to rerun it over loopback (T22 makes it generic over `Replica`; T13's version holds two `LocalReplica`s).
+  - `Pair::new(policy)`: fixed replica IDs (predictable conflict names) and quarantine grace 0.
+  - DSL on `pair.a` / `pair.b`: user edits through plain `std::fs` (`write`, `write_at` (sets the mtime), `mkdir`, `symlink`, `chmod`, `rm`) and observations (`read`, `readlink`, `ls`, `conflicts`, `entry`, …). `sync()` must converge; `try_sync()` returns the report whatever it says.
+  - `sync_racing(side, Apply|Read, path, edit)` wraps the replicas so a user edit runs right before the engine's first `apply` or `open_read` at `path`. It is the integration-level test of the dirty → rescan → retry loop.
+  - `assert_converged`: sweeps the quarantines; the trees match (file content, mode and mtime; directory mode; symlink targets, unmunged; symlinks dropped under `Skip`; other policies are T17's job); the live index entries match, vectors included; there are no reserved names; a full rescan of either side changes nothing (no echo).
 - **Symlink matrix:**
   - policy × {safe relative, unsafe relative, absolute, dangling, directory link, loop, munged} × direction;
   - a differential test against real `rsync` (when installed) for the one-directional cases.

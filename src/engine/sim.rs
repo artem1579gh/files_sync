@@ -13,16 +13,13 @@ use jiff::civil::date;
 use proptest::prelude::*;
 
 use crate::config::ReplicaId;
-use crate::engine::{ActionKind, Side, Snapshot, Step, is_beneath, plan, reconcile};
+use crate::engine::{ActionKind, MAX_ROUNDS, Side, Snapshot, Step, is_beneath, plan, reconcile};
 use crate::fs::RelPath;
 use crate::index::{Entry, Kind, VersionVector};
 use crate::replica::{Op, Precondition};
 
 const IA: ReplicaId = ReplicaId(0x1111_2222_3333_4444);
 const IB: ReplicaId = ReplicaId(0xaaaa_bbbb_cccc_dddd);
-
-/// §6.4's limit per sync cycle.
-const MAX_ROUNDS: usize = 5;
 
 struct Model {
     id: ReplicaId,

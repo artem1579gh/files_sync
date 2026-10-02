@@ -2,12 +2,17 @@
 //!
 //! The engine performs no I/O itself; it talks only to the `Replica` trait.
 //! [`reconcile`] compares two index views and decides what to do for each
-//! path; [`plan`] turns those decisions into ordered per-replica steps.
+//! path; [`plan`] turns those decisions into ordered per-replica steps;
+//! [`Engine`] runs them as sync cycles against two replicas.
+pub mod conflict;
+pub mod executor;
 pub mod plan;
 pub mod reconcile;
 #[cfg(test)]
 mod sim;
 
+pub use conflict::ConflictCopy;
+pub use executor::{Engine, MAX_ROUNDS, SyncReport};
 pub use plan::{Phase, PhaseKind, Step, plan};
 pub use reconcile::{Action, ActionKind, Resolution, SkipReason, reconcile};
 
