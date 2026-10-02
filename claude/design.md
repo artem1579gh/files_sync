@@ -428,7 +428,7 @@ enum Outcome { Applied(Entry), PreconditionFailed(Option<Entry>), Preserved{ con
 - **Transport:** TCP plus `rustls` with mutual TLS. Device ID = hash of the certificate, as in syncthing.
 - **Server:** a `serve` process wraps a `LocalReplica`.
 - **Index exchange:** incremental, by `seq`.
-- **Content:** streamed in chunks. Block lists (128 KiB blake3 blocks) for delta transfer come later.
+- **Content:** streamed in chunks. Block lists (128 KiB blake3 blocks) for delta transfer come later (T24).
 
 **Wire protocol as implemented (T20, `src/replica/proto/`):**
 - **Framing:** a 4-byte big-endian length, then exactly one postcard message (trailing bytes are an error). `MAX_FRAME` = 32 MiB bounds what a peer can make us allocate; the body buffer grows with the bytes that arrive, not with the claimed length. Every malformed input (short header or body, empty or oversized frame, unknown variant, invalid `RelPath`, non-canonical version vector, bad UTF-8, overflowing `Duration`) is `Error::Protocol`, never a panic. EOF between frames is a clean close (`Ok(None)`). `VersionVector` decoding no longer lets the encoded length size its allocation (smallvec's impl reserves it up front).
@@ -464,6 +464,7 @@ enum Outcome { Applied(Entry), PreconditionFailed(Option<Entry>), Preserved{ con
 | M6 | full symlink matrix | T17 |
 | M7 | hardening: leases, GC, landlock, stress test | T18–T19 |
 | M8 | network: **production variant** | T20–T22 |
+| M9 | follow-ups: crash-suite flake, block-level delta transfer | T23–T24 |
 
 ---
 

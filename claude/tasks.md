@@ -637,7 +637,7 @@ The design lives in [`design.md`](design.md); §N.M below refers to its sections
   - **Changes outside `proto/`:** `Error::Remote { kind: RemoteKind, message }` and `Error::Protocol { reason }`, `RemoteKind`, `Error::remote_kind()`; `is_unstable`/`is_not_found` recognise remote errors; the executor's `is_fatal` is now `remote_kind() ∈ {Index, Protocol}` (same set as before for local errors, plus protocol and remote index errors). Serde derives on `Scope`, `ScanStats`, `Hint`, `Outcome`. `VersionVector` decodes through its own visitor, which caps the up-front reservation (smallvec's impl reserves the claimed length).
   - **Tests** (15, in `proto/mod.rs`): every `Request`/`Response`/`Op`/`Outcome`/`Kind`/`Content`/`Hello`/`HelloReply` variant round-trips over `std::io::pipe` (exhaustive matches on `Request`, `Response`, `Op` and `Content`, so a new variant won't compile until the test covers it) with a clean EOF after; `LocalMeta` never crosses; the frame layout; handshake (success, version choice, no common version, wrong replica either way, server picking an unknown version, bad magic either way, hang-ups); content (0 / 1 / one chunk / 3 chunks + 17 bytes, in step for the next frame), a torn source → `Abort` → `is_unstable()` on the receiver and stays failed, hash mismatch, an unexpected message, hints set aside by the filter, connection closed at and inside a frame, `drain`; 17 hand-made malformed frames (incl. `..` and NUL in paths, unsorted/zero vv, 2^60-element and 4 GiB length claims, bad bool, bad UTF-8, overflowing `Duration`) are `Protocol` errors and I/O errors stay `Io`; oversized messages are not sent; proptest: random bytes and corrupted/truncated valid messages never panic (2000 cases each); `batches`; error classes survive the round trip and are not prefixed twice when passed on.
   - Mutation-checked by hand: skipping the hash check, the trailing-bytes check, or `drain`'s loop each fails tests.
-  - **Pre-existing flake (not fixed, not caused by T20):** `cargo test --features hooks --test crash` fails about 1 run in 6–10, on this branch and on a clean T19 checkout alike (1 of 10 there). Always scenario 14 ("materialize"), at varying hook points (`stage.synced`, `commit.synced`, `scan.stat`): the harness's final rescan of A reports `d/e/l` dirty (`dirty: [RelPath("d/e/l")]`, no changes). Looks timing-dependent; worth a look by whoever touches T15/T17 code next.
+  - **Pre-existing flake (not fixed, not caused by T20):** `cargo test --features hooks --test crash` fails about 1 run in 6–10, on this branch and on a clean T19 checkout alike (1 of 10 there). Always scenario 14 ("materialize"), at varying hook points (`stage.synced`, `commit.synced`, `scan.stat`): the harness's final rescan of A reports `d/e/l` dirty (`dirty: [RelPath("d/e/l")]`, no changes). Looks timing-dependent; worth a look by whoever touches T15/T17 code next. → **T23**.
   - **For T21:** the server must answer requests in order and drain an `Apply`'s content before answering when `apply` did not consume it. A client that drops an `open_read` reader before EOF must `drain` it (or close the connection); there is no cancel message. The client side of hints needs a reader that demultiplexes `Response::Hint` from answers (`ContentStream`'s filter does this inside a stream). Map `Request::RecordSync` batches back to one `record_sync` call (same `peer` and `retention`).
 
 ### [x] T21: RemoteReplica, server, TLS
@@ -674,7 +674,7 @@ The design lives in [`design.md`](design.md); §N.M below refers to its sections
     - `tests/net.rs` (3, two processes, separate state homes as two hosts): `serve` + `sync --once` + `status` + `daemon` (both directions, SIGTERM) + server certificate not the pinned one (`is not the pinned`) + client certificate not pinned (fails; the server logs `rejected: TLS handshake failed`) + `serve` stops cleanly on SIGTERM; `serve` without an address or identity, sync with nothing listening; `--sandbox` on both sides (skipped without landlock).
     - Unit: `tls` (device ID text, identity save/load/pin/permissions), `config::init_with_a_remote_replica`; `init_round_trips` now expects the identity files.
     - Mutation-checked by hand: a verifier that accepts any certificate fails both `wrong_certificates_are_rejected` and the two-process test. 15 consecutive runs of `remote` + `net`: no flake.
-  - **Follow-ups (T22 / later):** the harness can serve a replica in-process with `Server::new(..).spawn(TcpListener::bind("127.0.0.1:0"))` and `ServerHandle::into_replica`; the crash/attack hooks are not reachable through a remote replica's process boundary unless the server runs in-process. No retry of a request on a connection that dies mid-request (the cycle fails and is retried as a whole). Block-level delta transfer (§7.1) is still open. The pre-existing `crash` flake noted under T20 was not looked at.
+  - **Follow-ups (T22 / later):** the harness can serve a replica in-process with `Server::new(..).spawn(TcpListener::bind("127.0.0.1:0"))` and `ServerHandle::into_replica`; the crash/attack hooks are not reachable through a remote replica's process boundary unless the server runs in-process. No retry of a request on a connection that dies mid-request (the cycle fails and is retried as a whole). Block-level delta transfer (§7.1) → **T24**. The pre-existing `crash` flake noted under T20 was not looked at → **T23**.
 
 ### [ ] T22: Network test parity
 - **Depends on:** T21, T14, T17, T19
@@ -682,4 +682,43 @@ The design lives in [`design.md`](design.md); §N.M below refers to its sections
 - **Files:** `tests/harness/mod.rs`, the existing test files
 - **Do:** make the harness generic over a `ReplicaFactory` (local or loopback-remote), then run the sync_once, model, symlink_matrix and stress suites in both modes.
 - **Done when:** every suite passes in both modes.
+- **Notes:**
+
+## M9: follow-ups
+
+### [ ] T23: Fix the `crash` suite flake
+- **Depends on:** T15, T17
+- **Read:** §4.3.1, §4.5, §5.8, §9 (crash suite)
+- **Files:** `tests/crash.rs`, plus whatever the root cause turns out to be (likely `src/replica/local.rs`, `src/scan/scanner.rs` or `src/fs/commit.rs`)
+- **Do:**
+  - Reproduce the flake recorded in T20's Notes: `cargo test --features hooks --test crash` fails about 1 run in 6–10, always in scenario 14 ("materialize", under `-L`), at varying hook points (`stage.synced`, `commit.synced`, `scan.stat`). The harness's final rescan of A reports `d/e/l` dirty (`dirty: [RelPath("d/e/l")]`) with no changes. Run the suite in a loop, with `--release` if that makes it more frequent, until it fails, and capture the logs (`RUST_LOG=files_sync=debug`).
+  - Find the root cause. Is it a real defect (a recovery or rescan that leaves the index unstable after a crash during materialize), or a test that is wrong (e.g. a timestamp/racy-window assumption in the harness)?
+  - Fix the cause. Do not paper over it with retries, sleeps or a looser assertion, unless the analysis shows the "dirty" report is correct behaviour; then explain why in Notes and assert the correct behaviour instead.
+- **Done when:**
+  - 50 consecutive runs of `cargo test --features hooks --test crash` pass;
+  - the root cause is written up in Notes;
+  - if it was a product bug, a deterministic regression test (a hook point, not timing) fails without the fix and passes with it;
+  - `cargo test --features hooks` and clippy pass.
+- **Notes:**
+
+### [ ] T24: Block-level delta transfer
+- **Depends on:** T22
+- **Read:** §3, §5.2, §5.3, §7, §7.1
+- **Files:** `src/replica/proto/messages.rs`, `src/replica/proto/mod.rs`, `src/replica/{mod,local,remote}.rs`, `src/server.rs`, `src/engine/executor.rs`, `src/scan/hasher.rs`, and the index if block lists are stored
+- **Do:**
+  - Extend design §7.1 first with the concrete scheme, then implement it. The starting point is the sketch: fixed, aligned 128 KiB blake3 blocks, as in syncthing (no rolling hash). The source sends the new file's block list. The destination reuses the blocks it already holds in its current file at that path and receives only the missing ones.
+  - **Race-freedom stays intact.**
+    - The destination assembles a new temp file from stable reads of its own indexed file plus the received blocks. It never writes in place.
+    - The temp file is committed by the usual CAS replace against the expected fingerprint.
+    - The whole-file hash is checked against `Op::WriteFile`'s hash before commit.
+    - If the old file changes during assembly, the result is `Unstable` with nothing committed, and the path is rescanned.
+    - All checks run inside the destination replica. The engine still does no I/O, and only orchestrates through `Replica` methods. Extend the trait as needed (e.g. a block list from the source, reads of selected blocks, and an `apply` content that is either a full stream or a delta), with a default that falls back to the full stream.
+  - **Protocol:** bump `PROTOCOL_VERSION` to 2 for the new messages. A v1 peer must still work: both sides negotiate down and use full transfers.
+  - Use delta only when it can pay off: the destination holds a live file at the path, and the size is above a threshold. Local pairs keep streaming whole files (same host, no network to save).
+  - Block hashes may be computed on demand, or stored with the entry (computed by the hasher in the same pass as the file hash). Decide, and note the trade-off in the design.
+- **Done when:**
+  - changing 1 byte in a 64 MiB file and syncing over the loopback-remote mode transfers at most a few blocks plus protocol overhead. Assert this with a byte counter on the connection.
+  - a destination file modified mid-assembly (hook point) commits nothing and leaves no temp files.
+  - a forced v1 session still syncs correctly with full transfers.
+  - the T22 suites pass in both modes, and so do the attack suite and clippy.
 - **Notes:**
