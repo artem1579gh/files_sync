@@ -2,7 +2,8 @@
 //!
 //! [`classify`] covers every row of the §4.3 table except the per-replica
 //! settings: `--munge-links` changes only how targets are stored
-//! ([`super::munge`]), and `-K` adoption needs the peer's entry (T17).
+//! ([`super::munge`]), and `-K` adoption needs the peer's entry (the
+//! engine asks for it, design §4.3.1).
 
 pub use crate::config::SymlinkPolicy;
 use crate::fs::{FileKind, RelPath};

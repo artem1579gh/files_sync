@@ -21,7 +21,11 @@
 //!   with `RENAME_NOREPLACE`;
 //! - **directory mode** (§5.4) is the one in-place change: a directory
 //!   cannot be replaced by a copy, so it is pinned, checked and `fchmod`ed
-//!   through the pinning fd.
+//!   through the pinning fd. [`set_referent_mode`] does the same for the
+//!   directory a `-K` link points to (§4.3.1);
+//! - **materialize** (§4.3.1) replaces a followed directory link with a real
+//!   copy of the directory, staged as a whole tree under a temp name and
+//!   exchanged with the link like a replace.
 //!
 //! After the rename, the parent is fsynced, the name must hold the inode we
 //! staged (or nothing, after a delete), and the parent must still resolve to
@@ -39,7 +43,10 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::time::{Duration, Instant};
 
 use jiff::ToSpan;
-use rustix::fs::{AtFlags, CWD, Mode, OFlags, RenameFlags, Timespec, Timestamps, UTIME_OMIT};
+use rustix::fs::{
+    AtFlags, CWD, Dir, FileType, Mode, OFlags, RenameFlags, ResolveFlags, Timespec, Timestamps,
+    UTIME_OMIT,
+};
 use rustix::io::Errno;
 
 use crate::config::ReplicaId;
@@ -357,6 +364,185 @@ pub fn set_dir_mode(
     t.finish(&Fingerprint::of_fd(pin.as_fd())?)
 }
 
+/// One object of the tree [`materialize`] builds, relative to its top.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CopyNode {
+    Dir {
+        mode: u32,
+    },
+    /// A regular file whose content must hash to `hash`.
+    File {
+        meta: FileMeta,
+        hash: [u8; 32],
+    },
+    /// A symlink with these raw target bytes.
+    Symlink {
+        target: Vec<u8>,
+    },
+}
+
+/// Replaces the symlink at `path`, which must match `link`, with a real
+/// directory of mode `mode` holding a copy of `tree` (design §4.3: an
+/// incoming change beneath a followed directory first turns the link into
+/// the directory it showed).
+///
+/// `tree` lists the objects beneath `path`, relative to it, parents first.
+/// A file's content comes from `open(rel)` and must hash to its
+/// [`CopyNode::File::hash`]; otherwise nothing is committed
+/// ([`Outcome::PreconditionFailed`]). The copy is staged under a temp name
+/// and exchanged with the link like a replace (§5.3 step 4); the link goes
+/// into `quarantine`. Nothing is ever written through the link.
+pub fn materialize(
+    ctx: &Ctx<'_>,
+    quarantine: &mut Quarantine,
+    path: &RelPath,
+    link: &Expected,
+    mode: u32,
+    tree: &[(RelPath, CopyNode)],
+    open: &mut dyn FnMut(&RelPath) -> Result<Box<dyn Read>>,
+) -> Result<Outcome> {
+    let t = Target::resolve(ctx.root, path)?;
+    if link.fp.kind != FileKind::Symlink {
+        return Ok(Outcome::PreconditionFailed("not a symlink"));
+    }
+    if let Some(reason) = precheck(&t, link)? {
+        return Ok(Outcome::PreconditionFailed(reason));
+    }
+    let mut rec = Record::new(ctx.journal, IntentOp::Materialize, &t, Some(link))?;
+    // Writable while it is filled; `mode` is set at the end.
+    let mut staged = stage_dir(&t, &mut rec, 0o700)?;
+    staged.tree = true;
+    point("materialize.staged");
+    if let Err(reason) = fill_tree(&t, ctx.caps, &staged, tree, open)? {
+        staged.discard()?;
+        return Ok(Outcome::PreconditionFailed(reason));
+    }
+    rustix::fs::fchmod(&staged.pin, Mode::from_raw_mode(mode & MODE_MASK))
+        .map_err(|e| t.err("chmod temp directory for", e))?;
+    staged.fp = Fingerprint::of_fd(staged.pin.as_fd())?;
+    point("materialize.filled");
+    rec.staged(&staged.fp)?;
+    commit_replace(ctx, quarantine, &t, staged, link, &mut rec)
+}
+
+/// Creates the objects of `tree` in the staged directory. Directory modes
+/// are set last, deepest first, so a read-only directory can still be filled.
+fn fill_tree(
+    t: &Target<'_>,
+    caps: &Caps,
+    staged: &Staged<'_>,
+    tree: &[(RelPath, CopyNode)],
+    open: &mut dyn FnMut(&RelPath) -> Result<Box<dyn Read>>,
+) -> Result<std::result::Result<(), &'static str>> {
+    // Only named temp files: each is created at its final name inside our
+    // own staged directory.
+    let caps = Caps {
+        o_tmpfile: false,
+        ..*caps
+    };
+    let mut dir_modes = Vec::new();
+    for (rel, node) in tree {
+        let (parent, name) = match rel.parent() {
+            None => continue,
+            Some(p) if p.is_root() => (None, rel.name().expect("not the root")),
+            Some(p) => {
+                let fd = rustix::fs::openat2(
+                    &staged.pin,
+                    p.as_bytes(),
+                    OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                    Mode::empty(),
+                    RESOLVE,
+                )
+                .map_err(|e| t.err("open staged directory for", e))?;
+                (Some(fd), rel.name().expect("not the root"))
+            }
+        };
+        let dir = parent.as_ref().map_or(staged.pin.as_fd(), |fd| fd.as_fd());
+        match node {
+            CopyNode::Dir { mode } => {
+                rustix::fs::mkdirat(dir, name, Mode::from_raw_mode(0o700))
+                    .map_err(|e| t.err("create staged directory for", e))?;
+                dir_modes.push((rel, *mode));
+            }
+            CopyNode::File { meta, hash } => {
+                let mut tmp = TempFile::create(dir, &caps, name)?;
+                tmp.copy_from(&mut *open(rel)?)?;
+                if tmp.hash() != *hash {
+                    return Ok(Err("content changed while it was copied"));
+                }
+                let mut file = tmp.finish(*meta, |_| Ok(()))?;
+                // Part of the staged tree from now on.
+                file.live = false;
+            }
+            CopyNode::Symlink { target } => {
+                rustix::fs::symlinkat(target.as_slice(), dir, name)
+                    .map_err(|e| t.err("create staged symlink for", e))?;
+            }
+        }
+        point("materialize.copied");
+    }
+    for (rel, mode) in dir_modes.into_iter().rev() {
+        let fd = rustix::fs::openat2(
+            &staged.pin,
+            rel.as_bytes(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+            RESOLVE,
+        )
+        .map_err(|e| t.err("open staged directory for", e))?;
+        rustix::fs::fchmod(&fd, Mode::from_raw_mode(mode & MODE_MASK))
+            .map_err(|e| t.err("chmod staged directory for", e))?;
+    }
+    Ok(Ok(()))
+}
+
+/// Sets the permission bits of the directory the symlink at `path` points to
+/// (an adopted or followed link written through, `-K`, design §4.3).
+///
+/// The link must still be `link` (same inode and ctime), and the directory
+/// it resolves to must be `dir`'s inode with `dir`'s mode. The directory is
+/// pinned through the link with an `O_RDONLY|O_DIRECTORY` fd, checked, and
+/// changed through that fd.
+pub fn set_referent_mode(
+    ctx: &Ctx<'_>,
+    path: &RelPath,
+    link: &Fingerprint,
+    dir: &Fingerprint,
+    mode: u32,
+) -> Result<Outcome> {
+    let t = Target::resolve(ctx.root, path)?;
+    match t.stat(t.name)? {
+        Some(fp) if fp.kind == FileKind::Symlink && fp.unchanged(link) => {}
+        _ => return Ok(Outcome::PreconditionFailed("changed since scan")),
+    }
+    point("chmod.before_follow");
+    let pin = match rustix::fs::openat2(
+        t.parent(),
+        t.name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::NO_MAGICLINKS,
+    ) {
+        Ok(pin) => pin,
+        Err(Errno::NOENT | Errno::NOTDIR | Errno::LOOP) => {
+            return Ok(Outcome::PreconditionFailed("not a link to a directory"));
+        }
+        Err(e) => return Err(t.err("follow", e)),
+    };
+    let fp = Fingerprint::of_fd(pin.as_fd())?;
+    if !fp.same_file(dir) || fp.kind != FileKind::Dir || fp.mode & MODE_MASK != dir.mode & MODE_MASK
+    {
+        return Ok(Outcome::PreconditionFailed("changed since scan"));
+    }
+    point("chmod.followed");
+    rustix::fs::fchmod(&pin, Mode::from_raw_mode(mode & MODE_MASK))
+        .map_err(|e| t.err("chmod", e))?;
+    point("chmod.after_chmod");
+    t.check_parent()?;
+    point("commit.verified");
+    Ok(Outcome::Applied(Fingerprint::of_fd(pin.as_fd())?))
+}
+
 // ---------------------------------------------------------------------------
 // The target of a commit
 // ---------------------------------------------------------------------------
@@ -525,7 +711,9 @@ impl<'j> Record<'j> {
             _ => TmpKind::Temp,
         })?;
         let old = match op {
-            IntentOp::Replace | IntentOp::Delete => Some(fresh(TmpKind::Old)?),
+            IntentOp::Replace | IntentOp::Materialize | IntentOp::Delete => {
+                Some(fresh(TmpKind::Old)?)
+            }
             IntentOp::Create | IntentOp::Rename => None,
         };
         Ok(Record {
@@ -756,6 +944,7 @@ impl<'p> TempFile<'p> {
             fp,
             pin: self.fd.take().expect("TempFile used after finish"),
             live: true,
+            tree: false,
         })
     }
 }
@@ -794,6 +983,8 @@ pub struct Staged<'p> {
     fp: Fingerprint,
     pin: OwnedFd,
     live: bool,
+    /// A directory we filled ([`materialize`]): removed with its content.
+    tree: bool,
 }
 
 impl Staged<'_> {
@@ -811,6 +1002,12 @@ impl Staged<'_> {
             return Ok(());
         }
         let fp = self.fp;
+        if self.tree {
+            return match Fingerprint::at_opt(self.parent, &self.name)? {
+                Some(now) if same_object(&fp, &now) => remove_tree(self.parent, &self.name),
+                _ => Ok(()),
+            };
+        }
         remove_if(self.parent, &self.name, |f| same_object(&fp, f)).map(drop)
     }
 }
@@ -848,6 +1045,53 @@ fn remove_if(
             format!("remove {}", name.escape_ascii()),
             e.into(),
         )),
+    }
+}
+
+/// Removes the directory `parent/name` and everything in it: a tree of ours
+/// under a reserved name (only [`materialize`] stages one). Nothing beneath
+/// it is followed.
+fn remove_tree(parent: BorrowedFd<'_>, name: &[u8]) -> Result<()> {
+    let what = || format!("remove {}", name.escape_ascii());
+    let dir = match rustix::fs::openat2(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+        RESOLVE,
+    ) {
+        Ok(dir) => dir,
+        Err(Errno::NOENT) => return Ok(()),
+        Err(e) => return Err(Error::io(what(), e.into())),
+    };
+    let mut children = Vec::new();
+    for entry in Dir::read_from(&dir).map_err(|e| Error::io(what(), e.into()))? {
+        let entry = entry.map_err(|e| Error::io(what(), e.into()))?;
+        let child = entry.file_name().to_bytes();
+        if child != b"." && child != b".." {
+            children.push((child.to_vec(), entry.file_type()));
+        }
+    }
+    for (child, ft) in children {
+        let is_dir = match ft {
+            FileType::Directory => true,
+            FileType::Unknown => {
+                Fingerprint::at_opt(dir.as_fd(), &child)?.is_some_and(|fp| fp.kind == FileKind::Dir)
+            }
+            _ => false,
+        };
+        if is_dir {
+            remove_tree(dir.as_fd(), &child)?;
+        } else {
+            match rustix::fs::unlinkat(&dir, child.as_slice(), AtFlags::empty()) {
+                Ok(()) | Err(Errno::NOENT) => {}
+                Err(e) => return Err(Error::io(what(), e.into())),
+            }
+        }
+    }
+    match rustix::fs::unlinkat(parent, name, AtFlags::REMOVEDIR) {
+        Ok(()) | Err(Errno::NOENT) => Ok(()),
+        Err(e) => Err(Error::io(what(), e.into())),
     }
 }
 
@@ -918,6 +1162,7 @@ fn stage_symlink<'p>(t: &'p Target<'_>, rec: &mut Record<'_>, target: &[u8]) -> 
         fp,
         pin,
         live: true,
+        tree: false,
     };
     rec.staged(&fp)?;
     Ok(staged)
@@ -945,6 +1190,7 @@ fn stage_dir<'p>(t: &'p Target<'_>, rec: &mut Record<'_>, mode: u32) -> Result<S
         fp: Fingerprint::of_fd(pin.as_fd())?,
         pin,
         live: true,
+        tree: false,
     };
     rustix::fs::fchmod(&staged.pin, Mode::from_raw_mode(mode & MODE_MASK))
         .map_err(|e| t.err("chmod temp directory for", e))?;
@@ -1410,16 +1656,20 @@ pub fn recover(
     let tmp = intent.tmp.as_slice();
     match (intent.op, inspect(&t, tmp, intent)?) {
         (_, Found::Absent) => {}
-        (IntentOp::Create | IntentOp::Replace, Found::Staged) => remove_ours(&t, tmp, &mut rep)?,
+        (IntentOp::Create | IntentOp::Replace | IntentOp::Materialize, Found::Staged) => {
+            remove_ours(&t, tmp, intent, &mut rep)?
+        }
         // Recorded before anything was exchanged: only ours can be there.
-        (IntentOp::Create | IntentOp::Replace, Found::Other) if intent.staged.is_none() => {
-            remove_ours(&t, tmp, &mut rep)?
+        (IntentOp::Create | IntentOp::Replace | IntentOp::Materialize, Found::Other)
+            if intent.staged.is_none() =>
+        {
+            remove_ours(&t, tmp, intent, &mut rep)?
         }
         (IntentOp::Create, _) => {
             tracing::warn!(path = %t.path, name = %tmp.escape_ascii(), "foreign object at a reserved name; left alone");
             rep.foreign += 1;
         }
-        (IntentOp::Replace | IntentOp::Delete, Found::Expected(pin)) => {
+        (IntentOp::Replace | IntentOp::Materialize | IntentOp::Delete, Found::Expected(pin)) => {
             let exp = intent.expected.as_ref().expect("found the expected object");
             match verify_old(&t, tmp, &exp.fp, exp, "recover.before_rehash") {
                 Verified::Unchanged => {
@@ -1490,9 +1740,17 @@ fn quarantine_name(intent: &Intent) -> &[u8] {
     intent.old.as_deref().unwrap_or(&intent.tmp)
 }
 
-/// Removes our own object at `name` (a directory only if empty).
-fn remove_ours(t: &Target<'_>, name: &[u8], rep: &mut Recovered) -> Result<()> {
-    match remove_if(t.parent(), name, |_| true) {
+/// Removes our own object at `name`: a directory only if empty, except the
+/// tree a [`materialize`] staged, which is ours with all its content.
+fn remove_ours(t: &Target<'_>, name: &[u8], intent: &Intent, rep: &mut Recovered) -> Result<()> {
+    let removed = if intent.op == IntentOp::Materialize
+        && t.stat(name)?.is_some_and(|fp| fp.kind == FileKind::Dir)
+    {
+        remove_tree(t.parent(), name).map(|()| true)
+    } else {
+        remove_if(t.parent(), name, |_| true)
+    };
+    match removed {
         Ok(true) => rep.removed += 1,
         Ok(false) => {}
         Err(e) => {
@@ -1522,7 +1780,7 @@ fn put_back(
         point("recover.undone");
         rep.restored += 1;
         return match t.stat(from)? {
-            Some(back) if same_object(&n, &back) => remove_ours(t, from, rep),
+            Some(back) if same_object(&n, &back) => remove_ours(t, from, intent, rep),
             Some(back) => {
                 rep.conflicts
                     .push(t.preserve(ctx.replica, from, back.kind)?);

@@ -505,7 +505,7 @@ The design lives in [`design.md`](design.md); §N.M below refers to its sections
 
 ## M6: symlinks complete
 
-### [ ] T17: Full symlink policy matrix and -K adoption
+### [x] T17: Full symlink policy matrix and -K adoption
 - **Depends on:** T13, T09
 - **Read:** §4 (all)
 - **Files:** `src/symlink/policy.rs`, `src/scan/scanner.rs`, `src/replica/local.rs`, `tests/symlink_matrix.rs`
@@ -519,6 +519,52 @@ The design lives in [`design.md`](design.md); §N.M below refers to its sections
   - Differential test: when `rsync` is in PATH, for each one-directional case run `rsync -a <opts> A/ C/` and assert that our B equals C, ignoring our reserved names and conflict copies.
 - **Done when:** the matrix passes; the rsync differential passes or is skipped with a message when rsync is absent.
 - **Notes:**
+  - **Design:** new §4.3.1 describes what was built. §4.2, §4.4, §4.5, §5.8, §5.9, §7 and §9 are updated too.
+  - **API:**
+    - `config`: `FollowedWrite { Replace (default), Conflict }` as `followed_write`, and `keep_dirlinks_unsafe` (both optional in TOML).
+    - `LinkInfo::adopted`. **Index schema 2**, so a T16 index is refused with `BadIndex`.
+    - `Replica::adopt(path) -> Result<bool>`, with a default of `Ok(false)` (T21 forwards it).
+    - `Scanner::keep_dirlinks(on, unsafe_ok)` and `Scanner::adopt(paths)`.
+    - `Root::at_fd` and `fs::root::follow_at`.
+    - `commit::materialize` + `CopyNode`, `commit::set_referent_mode`, `IntentOp::Materialize`.
+    - `watch::Followed`, `EventSource::follow` (default no-op), `Watcher::follow`.
+    - Harness: `Opts`, `Pair::with`, `Pair::open_at_with`, `Tree::{synced, raw, opts, adopted}`, `raw_tree`.
+  - **Deviations:**
+    - **`-K` adoption is requested by the engine.** The scanner cannot see the peer's entry. So before each reconcile, the engine calls `Replica::adopt` once per path and cycle where one side has a directory and the other a symlink or `IgnoredLink`. The replica rescans that path with the scanner's `adopt` set. The adoption is a local change (bumped vv).
+    - **`followed_write = conflict` declines changes:** the local version re-asserts itself with `merge + bump`, and incoming files and symlinks become conflict copies beside the followed link. Beneath a followed directory a copy is flat, named after the path's last component. A `RenameToConflict` there is a no-op `Applied`.
+    - **Loops and rsync:** loops under `-L`/`-k` are `Unmanaged(Loop)`, while rsync recurses until the path is too long. They are excluded from the differential test.
+    - **Munging sender and rsync:** with a munging sender, rsync's `--copy-unsafe-links` judges the munged target; we classify the canonical one (§4.2). That combination is excluded from the differential test.
+  - **Route** (`replica/local.rs`, `Disk`): replaces T11's "refuse anything at or beneath `via_link`".
+    - Reads (`open_read`, materialize) go through every followed directory. Each is opened through its link and must be the indexed link and the indexed directory. Before T17, files beneath a followed directory could not be read (sync looped until `unresolved`).
+    - At a followed link itself, the commit acts on the link: `Expected` is the link's fingerprint, and the referent must be unchanged.
+    - An index-only `SetMeta` never materializes or declines.
+  - **Materialize:**
+    - Built from the index: unmanaged entries are not copied (they become tombstones on the rescan, which is harmless), symlinks get their raw targets, and file hashes are checked.
+    - After it, a scoped rescan of the link (no bump) and a retry, at most once per directory level.
+    - A peer that deletes a whole followed directory makes us materialize it first, then delete it. Correct, but wasteful.
+  - **Watcher:**
+    - After every scan that changed something, `LocalReplica` hands the watcher all followed and adopted links (an O(index) walk).
+    - Aliases are wd → link paths. In-tree referents share the tree's watch; out-of-tree ones get their own. Refreshes add the new watches first, then drop the stale ones.
+  - **Tests:**
+    - `tests/symlink_matrix.rs` (11):
+      - The matrix: 6 policies × 8 cases × {A→B, B→A, both changed} = 144 scenarios, each against a written-out table and the expected tree on both sides.
+      - rsync differential on all 96 one-directional cases except the 4 loops under `-L`/`-k`; with rsync 3.2.7 installed, all agree. Without rsync the checks are skipped with a message (checked with `PATH=/nonexistent`).
+      - `munged_sender` (3 policies, plus the rsync `--munge-links` differential).
+      - `copy_links_write_back`, `followed_write_conflict_keeps_links`.
+      - `keep_dirlinks_adopts_and_writes_through` (plus the rsync `-K` differential), `keep_dirlinks_outside_the_root`.
+    - `local.rs` (4, replacing `followed_links_are_read_but_not_written`):
+      - followed file write-back (refusals included);
+      - materialize, including a referent changed mid-copy → nothing committed, no leftovers;
+      - conflict mode;
+      - `-K` adopt, write-through, chmod, retarget, out of tree.
+    - Other unit tests: inotify aliases. `tests/daemon.rs` (+1): in-tree and out-of-tree referents reach B through the watcher alone.
+    - Attack suite: `Materialize` (150 cases) and `ChmodReferent` (30), with the `materialize` hook prefix in the coverage check. 1758 cases in all, all passing.
+    - Crash suite: per-scenario policy, plus a `materialize` scenario under `-L`. 853 cases (was 684), all passing.
+  - **Follow-ups / residuals:**
+    - **Crash replay beneath a `-K` link:** an intent of a commit written through a `-K` link records its path relative to the pinned directory. Replay resolves it from the replica root, finds a different parent, and skips the intent: its reserved names are left in the referent, and logged. The crash tests don't cover this. A fix would record the link in the intent.
+    - **Mixed policies:** `apply` still writes whatever symlink comes in. With mixed policies (e.g. A `Links`, B `SafeLinks`), an unsafe link written to B becomes `IgnoredLink` on B's next scan, and then stays `Skip(Unmanaged)`. That is stable, but not rsync. With the same policy on both sides, classification is symmetric.
+    - **Out-of-tree directories:** a directory created inside an out-of-tree referent is watched only after the scan that its own event triggers.
+    - **CLI:** no flags for the new settings yet (config file only). T18's `status` could show adopted links.
 
 ## M7: hardening
 

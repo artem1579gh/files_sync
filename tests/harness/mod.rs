@@ -15,13 +15,13 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crossbeam_channel::Receiver;
-use files_sync::config::{ReplicaConfig, ReplicaId, SymlinkPolicy};
+use files_sync::config::{FollowedWrite, ReplicaConfig, ReplicaId, SymlinkPolicy};
 use files_sync::engine::{Engine, Side, SyncReport};
-use files_sync::fs::{RelPath, is_reserved};
+use files_sync::fs::{FileKind, RelPath, is_reserved};
 use files_sync::index::{Entry, Kind, VersionVector};
 use files_sync::replica::{ContentReader, LocalReplica, Op, Outcome, Precondition, Replica};
 use files_sync::scan::{ScanStats, Scope};
-use files_sync::symlink::unmunge;
+use files_sync::symlink::{Treatment, classify, unmunge};
 use files_sync::watch::Hint;
 
 /// Fixed replica IDs, so conflict names are predictable.
@@ -42,9 +42,27 @@ pub struct Pair {
     pub a: Tree,
     pub b: Tree,
     pub engine: Engine,
-    policy: SymlinkPolicy,
     state: PathBuf,
     _state: Option<tempfile::TempDir>,
+}
+
+/// A replica's symlink settings (design §4.3).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Opts {
+    pub policy: SymlinkPolicy,
+    pub munge_links: bool,
+    pub keep_dirlinks: bool,
+    pub keep_dirlinks_unsafe: bool,
+    pub followed_write: FollowedWrite,
+}
+
+impl From<SymlinkPolicy> for Opts {
+    fn from(policy: SymlinkPolicy) -> Opts {
+        Opts {
+            policy,
+            ..Opts::default()
+        }
+    }
 }
 
 /// Opens the replica `id` rooted at `root`, with its index in `state`.
@@ -52,11 +70,16 @@ pub fn open_replica(
     root: &Path,
     state: &Path,
     id: ReplicaId,
-    policy: SymlinkPolicy,
+    opts: impl Into<Opts>,
 ) -> LocalReplica {
+    let opts = opts.into();
     let mut cfg = ReplicaConfig::new(root.canonicalize().unwrap()).unwrap();
     cfg.id = id;
-    cfg.symlinks = policy;
+    cfg.symlinks = opts.policy;
+    cfg.munge_links = opts.munge_links;
+    cfg.keep_dirlinks = opts.keep_dirlinks;
+    cfg.keep_dirlinks_unsafe = opts.keep_dirlinks_unsafe;
+    cfg.followed_write = opts.followed_write;
     LocalReplica::open(&cfg, state)
         .unwrap()
         // Old inodes are unlinked by the first sweep, so
@@ -67,10 +90,15 @@ pub fn open_replica(
 impl Pair {
     /// Two empty replicas syncing symlinks under `policy`.
     pub fn new(policy: SymlinkPolicy) -> Pair {
+        Pair::with(policy, policy)
+    }
+
+    /// Two empty replicas with their own symlink settings.
+    pub fn with(a: impl Into<Opts>, b: impl Into<Opts>) -> Pair {
         let state = tempfile::tempdir().unwrap();
-        let tree = |id| {
+        let tree = |id, opts| {
             let dir = tempfile::tempdir().unwrap();
-            let replica = open_replica(dir.path(), state.path(), id, policy);
+            let replica = open_replica(dir.path(), state.path(), id, opts);
             Tree {
                 root: dir.path().to_path_buf(),
                 _dir: Some(dir),
@@ -78,28 +106,38 @@ impl Pair {
             }
         };
         Pair {
-            a: tree(ID_A),
-            b: tree(ID_B),
+            a: tree(ID_A, a.into()),
+            b: tree(ID_B, b.into()),
             engine: Engine::new(),
-            policy,
             state: state.path().to_path_buf(),
             _state: Some(state),
         }
     }
 
     /// Opens the replicas of existing directories, which are left in place
-    /// when the pair is dropped (for a child process of a crash test).
+    /// when the pair is dropped (for a child process of a crash test, or
+    /// roots that share a parent directory).
     pub fn open_at(a: &Path, b: &Path, state: &Path, policy: SymlinkPolicy) -> Pair {
-        let tree = |root: &Path, id| Tree {
+        Pair::open_at_with(a, b, state, policy, policy)
+    }
+
+    /// [`Pair::open_at`] with each replica's own symlink settings.
+    pub fn open_at_with(
+        a: &Path,
+        b: &Path,
+        state: &Path,
+        opts_a: impl Into<Opts>,
+        opts_b: impl Into<Opts>,
+    ) -> Pair {
+        let tree = |root: &Path, id, opts: Opts| Tree {
             root: root.to_path_buf(),
             _dir: None,
-            replica: open_replica(root, state, id, policy),
+            replica: open_replica(root, state, id, opts),
         };
         Pair {
-            a: tree(a, ID_A),
-            b: tree(b, ID_B),
+            a: tree(a, ID_A, opts_a.into()),
+            b: tree(b, ID_B, opts_b.into()),
             engine: Engine::new(),
-            policy,
             state: state.to_path_buf(),
             _state: None,
         }
@@ -117,24 +155,23 @@ impl Pair {
             a,
             b,
             engine,
-            policy,
             state,
             _state,
         } = self;
         let (ida, idb) = (a.replica.id(), b.replica.id());
+        let (oa, ob) = (a.opts(), b.opts());
         let close = |t: Tree| (t.root, t._dir);
         let (a, b) = (close(a), close(b));
         f();
-        let open = |(root, dir): (PathBuf, Option<tempfile::TempDir>), id| Tree {
-            replica: open_replica(&root, &state, id, policy),
+        let open = |(root, dir): (PathBuf, Option<tempfile::TempDir>), id, opts| Tree {
+            replica: open_replica(&root, &state, id, opts),
             root,
             _dir: dir,
         };
         Pair {
-            a: open(a, ida),
-            b: open(b, idb),
+            a: open(a, ida, oa),
+            b: open(b, idb, ob),
             engine,
-            policy,
             state,
             _state,
         }
@@ -192,8 +229,9 @@ impl Pair {
     }
 
     /// Checks that the pair is in sync:
-    /// - the trees are equal after policy normalization (file content,
-    ///   mode and mtime; directory mode; symlink targets, unmunged);
+    /// - the trees are equal as each replica's policy shows them
+    ///   ([`Tree::synced`]: file content, mode and mtime; directory mode;
+    ///   symlink targets, unmunged; followed links as what they point to);
     /// - the live index entries are equal, version vectors included;
     /// - no reserved (`.~fsync.`) names are left, and nothing is quarantined;
     /// - a full rescan of either replica changes nothing (no echo).
@@ -202,7 +240,7 @@ impl Pair {
             t.replica.sweep_quarantine();
             assert!(t.replica.quarantine().is_empty(), "quarantine not empty");
         }
-        let (ta, tb) = (self.a.tree(self.policy), self.b.tree(self.policy));
+        let (ta, tb) = (self.a.synced(), self.b.synced());
         assert_eq!(ta, tb, "trees differ (left: A, right: B)");
         assert_eq!(
             self.a.live_entries(),
@@ -299,6 +337,125 @@ impl Replica for Racing<'_> {
 
     fn watch(&mut self) -> Option<Receiver<Hint>> {
         self.inner.watch()
+    }
+
+    fn adopt(&mut self, path: &RelPath) -> files_sync::Result<bool> {
+        self.inner.adopt(path)
+    }
+}
+
+/// How [`walk`] shows symlinks: as a replica with these settings syncs them.
+struct View<'a> {
+    opts: Opts,
+    /// Whether the replica adopted the link at a path (`-K`).
+    adopted: &'a dyn Fn(&str) -> bool,
+}
+
+/// The tree at `root` as it is: symlinks as symlinks, with their raw target
+/// bytes. Panics on a reserved name.
+pub fn raw_tree(root: &Path) -> BTreeMap<String, Node> {
+    let mut out = BTreeMap::new();
+    walk(root, "", None, &mut Vec::new(), &mut out);
+    out
+}
+
+/// Lists the directory `dir` (shown as `prefix`). `opts` is `None` for
+/// the raw view. `stack` holds the (dev, ino) of the directories being
+/// walked, to stop at loops as the scanner does.
+fn walk(
+    dir: &Path,
+    prefix: &str,
+    view: Option<&View>,
+    stack: &mut Vec<(u64, u64)>,
+    out: &mut BTreeMap<String, Node>,
+) {
+    let md = fs::metadata(dir).unwrap();
+    stack.push((md.dev(), md.ino()));
+    let mut entries: Vec<_> = fs::read_dir(dir).unwrap().map(|e| e.unwrap()).collect();
+    entries.sort_by_key(|e| e.file_name());
+    for e in entries {
+        let name = e.file_name();
+        assert!(
+            !is_reserved(name.as_bytes()),
+            "reserved name left in {}: {}",
+            dir.display(),
+            name.to_string_lossy()
+        );
+        let key = if prefix.is_empty() {
+            name.to_str().unwrap().to_owned()
+        } else {
+            format!("{prefix}/{}", name.to_str().unwrap())
+        };
+        let path = e.path();
+        let md = path.symlink_metadata().unwrap();
+        let ft = md.file_type();
+        if ft.is_dir() {
+            out.insert(
+                key.clone(),
+                Node::Dir {
+                    mode: md.mode() & 0o1777,
+                },
+            );
+            walk(&path, &key, view, stack, out);
+        } else if ft.is_file() {
+            out.insert(key, file_node(&path, &md));
+        } else if ft.is_symlink() {
+            let raw = fs::read_link(&path).unwrap().into_os_string().into_vec();
+            let Some(view) = view else {
+                out.insert(key, Node::Symlink(String::from_utf8(raw).unwrap()));
+                continue;
+            };
+            let opts = &view.opts;
+            let target = if opts.munge_links { unmunge(&raw) } else { raw };
+            let referent = fs::metadata(&path).ok();
+            let kind = referent.as_ref().map(|m| {
+                if m.is_file() {
+                    FileKind::File
+                } else if m.is_dir() {
+                    FileKind::Dir
+                } else {
+                    FileKind::Special
+                }
+            });
+            let treatment = if (view.adopted)(&key) {
+                Treatment::Follow
+            } else {
+                classify(opts.policy, &rp(&key), &target, kind)
+            };
+            match (treatment, referent) {
+                (Treatment::AsSymlink, _) => {
+                    out.insert(key, Node::Symlink(String::from_utf8(target).unwrap()));
+                }
+                (Treatment::Follow, Some(m)) if m.is_dir() => {
+                    if stack.contains(&(m.dev(), m.ino())) {
+                        continue; // Unmanaged(Loop)
+                    }
+                    out.insert(
+                        key.clone(),
+                        Node::Dir {
+                            mode: m.mode() & 0o1777,
+                        },
+                    );
+                    let target = fs::canonicalize(&path).unwrap();
+                    walk(&target, &key, Some(view), stack, out);
+                }
+                (Treatment::Follow, Some(m)) => {
+                    out.insert(key, file_node(&path, &m));
+                }
+                // Not synced.
+                _ => {}
+            }
+        }
+        // FIFOs, sockets and devices are never synced.
+    }
+    stack.pop();
+}
+
+fn file_node(path: &Path, md: &fs::Metadata) -> Node {
+    Node::File {
+        content: String::from_utf8(fs::read(path).unwrap()).unwrap(),
+        mode: md.mode() & 0o1777,
+        mtime_ns: md.mtime() * 1_000_000_000 + md.mtime_nsec(),
     }
 }
 
@@ -416,9 +573,9 @@ impl Tree {
         self.path(rel).symlink_metadata().unwrap().mode() & 0o7777
     }
 
-    /// Every path in the tree, sorted.
+    /// Every path in the tree, sorted (symlinks as symlinks).
     pub fn ls(&self) -> Vec<String> {
-        self.tree(SymlinkPolicy::Links).into_keys().collect()
+        self.raw().into_keys().collect()
     }
 
     /// The names in directory `rel` (`""` for the root) that are conflict
@@ -438,65 +595,58 @@ impl Tree {
         self.replica.index().get(&rp(rel)).unwrap()
     }
 
-    /// The tree on disk, normalized for `policy`. Panics on a reserved name.
-    pub fn tree(&self, policy: SymlinkPolicy) -> BTreeMap<String, Node> {
+    /// This replica's symlink settings.
+    pub fn opts(&self) -> Opts {
+        let c = self.replica.config();
+        Opts {
+            policy: c.symlinks,
+            munge_links: c.munge_links,
+            keep_dirlinks: c.keep_dirlinks,
+            keep_dirlinks_unsafe: c.keep_dirlinks_unsafe,
+            followed_write: c.followed_write,
+        }
+    }
+
+    /// The tree on disk as it is: symlinks as symlinks, with their raw
+    /// target bytes. Panics on a reserved name.
+    pub fn raw(&self) -> BTreeMap<String, Node> {
+        raw_tree(&self.root)
+    }
+
+    /// The tree as this replica syncs it, under its own symlink settings:
+    /// targets unmunged; links that are followed (or adopted, `-K`) as what
+    /// they point to; links that are not synced (and loops) left out.
+    /// FIFOs, sockets and devices are never synced. Panics on a reserved
+    /// name.
+    pub fn synced(&self) -> BTreeMap<String, Node> {
         let mut out = BTreeMap::new();
-        self.walk(Path::new(""), policy, &mut out);
+        let view = View {
+            opts: self.opts(),
+            adopted: &|p| self.adopted(p),
+        };
+        walk(&self.root, "", Some(&view), &mut Vec::new(), &mut out);
         out
     }
 
-    fn walk(&self, rel: &Path, policy: SymlinkPolicy, out: &mut BTreeMap<String, Node>) {
-        for e in fs::read_dir(self.root().join(rel)).unwrap() {
-            let e = e.unwrap();
-            let name = e.file_name();
-            assert!(
-                !is_reserved(name.as_bytes()),
-                "reserved name left in {}: {}",
-                self.root().display(),
-                rel.join(&name).display()
-            );
-            let rel = rel.join(&name);
-            let key = rel.to_str().unwrap().to_owned();
-            let md = e.path().symlink_metadata().unwrap();
-            let ft = md.file_type();
-            if ft.is_dir() {
-                out.insert(
-                    key,
-                    Node::Dir {
-                        mode: md.mode() & 0o1777,
-                    },
-                );
-                self.walk(&rel, policy, out);
-            } else if ft.is_file() {
-                let content = String::from_utf8(fs::read(e.path()).unwrap()).unwrap();
-                let mtime_ns = md.mtime() * 1_000_000_000 + md.mtime_nsec();
-                let mode = md.mode() & 0o1777;
-                out.insert(
-                    key,
-                    Node::File {
-                        content,
-                        mode,
-                        mtime_ns,
-                    },
-                );
-            } else if ft.is_symlink() {
-                let raw = fs::read_link(e.path()).unwrap().into_os_string().into_vec();
-                let target = if self.replica.config().munge_links {
-                    unmunge(&raw)
-                } else {
-                    raw
-                };
-                match policy {
-                    SymlinkPolicy::Links => {
-                        out.insert(key, Node::Symlink(String::from_utf8(target).unwrap()));
-                    }
-                    // Never synced: each side keeps its own.
-                    SymlinkPolicy::Skip => {}
-                    other => unimplemented!("normalization for {other:?} (T17)"),
-                }
-            }
-            // FIFOs, sockets and devices are never synced.
-        }
+    /// Whether the index has `rel` as a directory adopted by `-K`.
+    pub fn adopted(&self, rel: &str) -> bool {
+        self.entry(rel)
+            .is_some_and(|e| e.kind == Kind::Dir && e.local.via_link.is_some_and(|v| v.adopted))
+    }
+
+    /// For compatibility: the tree normalized for `policy` (with this
+    /// replica's other settings).
+    pub fn tree(&self, policy: SymlinkPolicy) -> BTreeMap<String, Node> {
+        let mut out = BTreeMap::new();
+        let view = View {
+            opts: Opts {
+                policy,
+                ..self.opts()
+            },
+            adopted: &|p| self.adopted(p),
+        };
+        walk(&self.root, "", Some(&view), &mut Vec::new(), &mut out);
+        out
     }
 
     /// The live index entries, compared on what is synced (a file's mtime;

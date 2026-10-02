@@ -104,9 +104,33 @@ pub struct ReplicaConfig {
     /// rsync `--munge-links` (design §4.4).
     #[serde(default)]
     pub munge_links: bool,
-    /// rsync `-K` / `--keep-dirlinks`.
+    /// rsync `-K` / `--keep-dirlinks`: a symlink to a directory whose peer
+    /// entry is a real directory is adopted as that directory, and incoming
+    /// changes beneath it are written through it (design §4.3).
     #[serde(default)]
     pub keep_dirlinks: bool,
+    /// `--keep-dirlinks-unsafe`: with `keep_dirlinks`, also adopt (and write
+    /// through) links whose directory lies outside the replica root.
+    #[serde(default)]
+    pub keep_dirlinks_unsafe: bool,
+    /// What an incoming change does to a symlink this replica follows
+    /// (`-L`, `-k`, `--copy-unsafe-links`; design §4.3).
+    #[serde(default)]
+    pub followed_write: FollowedWrite,
+}
+
+/// How an incoming change treats a followed symlink (design §4.3).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FollowedWrite {
+    /// The link is replaced by a real object, as rsync's receiver does. A
+    /// change beneath a followed directory first turns the link into a real
+    /// copy of that directory.
+    #[default]
+    Replace,
+    /// The link is kept and the incoming object is written as a conflict
+    /// copy beside it; the local version wins and goes back to the peer.
+    Conflict,
 }
 
 impl ReplicaConfig {
@@ -118,6 +142,8 @@ impl ReplicaConfig {
             symlinks: SymlinkPolicy::default(),
             munge_links: false,
             keep_dirlinks: false,
+            keep_dirlinks_unsafe: false,
+            followed_write: FollowedWrite::Replace,
         })
     }
 }
@@ -481,8 +507,13 @@ mod tests {
         big.replicas[0].id = ReplicaId(u64::MAX);
         big.replicas[1].symlinks = SymlinkPolicy::CopyUnsafeLinks;
         big.replicas[1].munge_links = true;
+        big.replicas[1].keep_dirlinks = true;
+        big.replicas[1].keep_dirlinks_unsafe = true;
+        big.replicas[1].followed_write = FollowedWrite::Conflict;
         big.save(state.path()).unwrap();
         assert_eq!(PairConfig::load(state.path(), "docs").unwrap(), big);
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("followed_write = \"conflict\""), "{text}");
 
         // No temp files are left behind.
         let names: Vec<_> = fs::read_dir(path.parent().unwrap())

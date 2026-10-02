@@ -56,6 +56,9 @@ pub enum IntentOp {
     Delete,
     /// `rename_to`: `tmp` is the name the target is moved aside to.
     Rename,
+    /// `materialize`: like `Replace`, but the staged object is a directory
+    /// tree, all of it ours (removed with its content).
+    Materialize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

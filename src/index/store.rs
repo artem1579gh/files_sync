@@ -37,7 +37,8 @@ const META_NEXT_SEQ: &str = "next_seq";
 const META_MAX_COUNTER: &str = "max_counter";
 
 /// Bump when the encoding of any table changes.
-const SCHEMA_VERSION: u64 = 1;
+/// 2: `LinkInfo::adopted` (T17).
+const SCHEMA_VERSION: u64 = 2;
 
 /// The first seq handed out; `changes_since(0)` returns everything.
 const FIRST_SEQ: u64 = 1;
@@ -506,6 +507,7 @@ mod tests {
                 ctime_ns: 6,
                 raw_target: b"/abs/\xfe".to_vec(),
                 out_of_tree: true,
+                adopted: true,
             }),
             racy: true,
         };

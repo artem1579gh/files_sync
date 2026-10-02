@@ -289,3 +289,45 @@ fn edits_on_both_sides_converge_with_a_conflict_copy() {
     assert_eq!(p.a.read("shared.txt"), "from b, newer");
     assert_eq!(p.a.conflicts("").len(), 1);
 }
+
+/// `-L`: changes to what followed links point to arrive under the links'
+/// paths, from the watcher alone (no periodic rescan): in the tree (the
+/// referent's own path is watched too) and outside it (extra watches).
+#[test]
+fn followed_referents_are_watched() {
+    let outside = tempfile::tempdir().unwrap();
+    fs::create_dir(outside.path().join("o")).unwrap();
+    fs::write(outside.path().join("o/f"), "out v1").unwrap();
+    let mut p = Pair::new(SymlinkPolicy::CopyLinks);
+    p.a.write("d/x", "in v1");
+    p.a.symlink("l", "d");
+    p.a.symlink("lo", outside.path().to_str().unwrap());
+    let ((), _) = with_daemon(&mut p, Daemon::new(), |c| {
+        c.next_cycle(START);
+        c.settle(Duration::from_secs(1));
+        assert_eq!(read(c.b.join("lo/o/f")).as_deref(), Some("out v1"));
+
+        fs::write(outside.path().join("o/f"), "out v2").unwrap();
+        wait_until("outside edit reaches B", Duration::from_secs(3), || {
+            read(c.b.join("lo/o/f")).as_deref() == Some("out v2")
+        });
+        fs::write(c.a.join("d/x"), "in v2").unwrap();
+        wait_until("edit through l reaches B", Duration::from_secs(3), || {
+            read(c.b.join("l/x")).as_deref() == Some("in v2")
+                && read(c.b.join("d/x")).as_deref() == Some("in v2")
+        });
+        // A new directory outside, then a file in it (watched after the
+        // scan that found the directory).
+        fs::create_dir(outside.path().join("new")).unwrap();
+        wait_until("new outside dir reaches B", Duration::from_secs(3), || {
+            c.b.join("lo/new").is_dir()
+        });
+        c.settle(Duration::from_millis(500));
+        fs::write(outside.path().join("new/g"), "g").unwrap();
+        wait_until("file in it reaches B", Duration::from_secs(3), || {
+            read(c.b.join("lo/new/g")).as_deref() == Some("g")
+        });
+        c.settle(Duration::from_millis(500));
+    });
+    p.assert_converged();
+}

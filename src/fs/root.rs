@@ -226,6 +226,14 @@ impl Root {
         })
     }
 
+    /// A root at the directory open at `fd` (an `O_PATH` fd is fine), named
+    /// `path` in messages: the directory an adopted or followed link points
+    /// to, written through with `-K` (design §4.3). Everything beneath it is
+    /// resolved as beneath any root.
+    pub(crate) fn at_fd(fd: OwnedFd, path: PathBuf) -> Root {
+        Root { fd, path }
+    }
+
     pub fn fd(&self) -> BorrowedFd<'_> {
         self.fd.as_fd()
     }
@@ -342,6 +350,24 @@ impl Root {
             },
         }
     }
+}
+
+/// Opens what the symlink `parent/name` points to, following every link on
+/// the way with only `RESOLVE_NO_MAGICLINKS`. For a followed or adopted link
+/// whose referent the caller then checks against the index (its pinned
+/// (dev, ino), design §4.3), so the route does not matter.
+pub(crate) fn follow_at(
+    parent: BorrowedFd<'_>,
+    name: &[u8],
+    flags: OFlags,
+) -> std::result::Result<OwnedFd, Errno> {
+    rustix::fs::openat2(
+        parent,
+        name,
+        flags,
+        Mode::empty(),
+        ResolveFlags::NO_MAGICLINKS,
+    )
 }
 
 /// `openat2(dirfd, path, flags, RESOLVE)`.

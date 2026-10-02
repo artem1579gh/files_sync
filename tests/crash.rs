@@ -62,6 +62,8 @@ const T2: u64 = 1_700_000_100;
 
 struct Scenario {
     name: &'static str,
+    /// Both replicas' symlink policy.
+    policy: SymlinkPolicy,
     /// User edits synced before the crashing cycle.
     base: fn(&Pair),
     /// The user edits the crashing cycle syncs.
@@ -74,6 +76,7 @@ struct Scenario {
 
 const SCENARIOS: &[Scenario] = &[
     Scenario {
+        policy: SymlinkPolicy::Links,
         name: "create_file",
         base: |p| p.a.mkdir("d"),
         change: |p| p.a.write_at("d/f", "new file", T1),
@@ -81,6 +84,7 @@ const SCENARIOS: &[Scenario] = &[
         held: None,
     },
     Scenario {
+        policy: SymlinkPolicy::Links,
         name: "replace_file",
         base: |p| p.a.write_at("f", "old content", T0),
         change: |p| p.a.write_at("f", "new content", T1),
@@ -88,6 +92,7 @@ const SCENARIOS: &[Scenario] = &[
         held: Some("f"),
     },
     Scenario {
+        policy: SymlinkPolicy::Links,
         name: "create_symlink",
         base: |_| {},
         change: |p| p.a.symlink("l", "some/target"),
@@ -95,6 +100,7 @@ const SCENARIOS: &[Scenario] = &[
         held: None,
     },
     Scenario {
+        policy: SymlinkPolicy::Links,
         name: "replace_symlink",
         base: |p| p.a.symlink("l", "old-target"),
         change: |p| p.a.symlink("l", "new-target"),
@@ -102,6 +108,7 @@ const SCENARIOS: &[Scenario] = &[
         held: None,
     },
     Scenario {
+        policy: SymlinkPolicy::Links,
         name: "file_to_symlink",
         base: |p| p.a.write_at("f", "a file", T0),
         change: |p| p.a.symlink("f", "now-a-link"),
@@ -109,6 +116,7 @@ const SCENARIOS: &[Scenario] = &[
         held: None,
     },
     Scenario {
+        policy: SymlinkPolicy::Links,
         name: "symlink_to_file",
         base: |p| p.a.symlink("f", "a-link"),
         change: |p| p.a.write_at("f", "now a file", T1),
@@ -116,6 +124,7 @@ const SCENARIOS: &[Scenario] = &[
         held: None,
     },
     Scenario {
+        policy: SymlinkPolicy::Links,
         name: "mkdir_with_child",
         base: |_| {},
         change: |p| p.a.write_at("d/e/f", "nested", T1),
@@ -123,6 +132,7 @@ const SCENARIOS: &[Scenario] = &[
         held: None,
     },
     Scenario {
+        policy: SymlinkPolicy::Links,
         name: "delete_file",
         base: |p| p.a.write_at("f", "doomed", T0),
         change: |p| p.a.rm("f"),
@@ -130,6 +140,7 @@ const SCENARIOS: &[Scenario] = &[
         held: Some("f"),
     },
     Scenario {
+        policy: SymlinkPolicy::Links,
         name: "delete_symlink",
         base: |p| p.a.symlink("l", "t"),
         change: |p| p.a.rm("l"),
@@ -137,6 +148,7 @@ const SCENARIOS: &[Scenario] = &[
         held: None,
     },
     Scenario {
+        policy: SymlinkPolicy::Links,
         name: "delete_tree",
         base: |p| {
             p.a.write_at("d/f", "f", T0);
@@ -148,6 +160,7 @@ const SCENARIOS: &[Scenario] = &[
         held: Some("d/f"),
     },
     Scenario {
+        policy: SymlinkPolicy::Links,
         name: "conflict",
         base: |p| p.a.write_at("f.txt", "base", T0),
         change: |p| {
@@ -158,6 +171,7 @@ const SCENARIOS: &[Scenario] = &[
         held: Some("f.txt"),
     },
     Scenario {
+        policy: SymlinkPolicy::Links,
         name: "chmod_file",
         base: |p| {
             p.a.write_at("f", "same content", T0);
@@ -168,6 +182,7 @@ const SCENARIOS: &[Scenario] = &[
         held: Some("f"),
     },
     Scenario {
+        policy: SymlinkPolicy::Links,
         name: "chmod_dir",
         base: |p| {
             p.a.mkdir("d");
@@ -178,6 +193,7 @@ const SCENARIOS: &[Scenario] = &[
         held: None,
     },
     Scenario {
+        policy: SymlinkPolicy::Links,
         name: "dir_to_file",
         base: |p| p.a.write_at("d/x", "child", T0),
         change: |p| {
@@ -186,6 +202,20 @@ const SCENARIOS: &[Scenario] = &[
         },
         files: true,
         held: Some("d/x"),
+    },
+    // `-L` write-back: A's followed directory becomes a real copy first.
+    Scenario {
+        policy: SymlinkPolicy::CopyLinks,
+        name: "materialize",
+        base: |p| {
+            p.a.write_at("d/x", "x", T0);
+            p.a.write_at("d/e/y", "y", T0);
+            p.a.symlink("d/e/l", "../x");
+            p.a.symlink("l", "d");
+        },
+        change: |p| p.b.write_at("l/x", "changed on b", T1),
+        files: true,
+        held: None,
     },
 ];
 
@@ -196,6 +226,7 @@ const SCENARIOS: &[Scenario] = &[
 /// What a child process does.
 struct ChildSpec {
     dirs: [PathBuf; 3],
+    policy: SymlinkPolicy,
     named: bool,
     /// Run the cycle (true), or only open the replicas, i.e. replay.
     cycle: bool,
@@ -220,6 +251,7 @@ impl ChildSpec {
             &self.point,
             &self.nth.to_string(),
             self.late.as_deref().unwrap_or(""),
+            &format!("{:?}", self.policy),
         ]
         .join("\n")
     }
@@ -233,6 +265,10 @@ impl ChildSpec {
             point: f[5].to_owned(),
             nth: f[6].parse().unwrap(),
             late: Some(f[7]).filter(|l| !l.is_empty()).map(str::to_owned),
+            policy: [SymlinkPolicy::Links, SymlinkPolicy::CopyLinks]
+                .into_iter()
+                .find(|p| format!("{p:?}") == f[8])
+                .expect("a scenario policy"),
         }
     }
 
@@ -286,7 +322,7 @@ fn crash_child() {
         }
         hits += 1;
     });
-    let mut pair = Pair::open_at(a, b, state, SymlinkPolicy::Links);
+    let mut pair = Pair::open_at(a, b, state, spec.policy);
     if spec.cycle {
         if spec.named {
             force_named(&mut pair);
@@ -317,14 +353,15 @@ fn cycle(p: &mut Pair) {
 }
 
 fn prepare(sc: &Scenario) -> Pair {
-    let mut p = Pair::new(SymlinkPolicy::Links);
+    let mut p = Pair::new(sc.policy);
     (sc.base)(&p);
     p.sync();
     (sc.change)(&p);
     p
 }
 
-/// The tree after a sync, conflict copies keyed without their timestamp.
+/// The tree after a sync (symlinks as symlinks), conflict copies keyed
+/// without their timestamp.
 type Outcome = BTreeMap<String, Node>;
 
 fn outcome(p: &Pair) -> Outcome {
@@ -432,6 +469,7 @@ fn run_case(case: Case, want: &Outcome) -> Result<bool, String> {
     let mut pair = pair.reopen_after(|| {
         let mut child = ChildSpec {
             dirs: dirs.clone(),
+            policy: sc.policy,
             named: case.named,
             cycle: true,
             point: case.point.to_owned(),
@@ -591,6 +629,8 @@ fn crashes_at_every_hook_point() {
         "rename.after_rename",
         "rename.moved",
         "chmod.after_chmod",
+        "materialize.copied",
+        "materialize.filled",
         "quarantine.before_unlink",
         "commit.verified",
     ] {

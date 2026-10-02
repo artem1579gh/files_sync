@@ -66,6 +66,16 @@ pub trait Replica {
 
     /// Change hints from a watcher, if the replica has one.
     fn watch(&mut self) -> Option<Receiver<Hint>>;
+
+    /// `-K` (design §4.3): the peer holds a real directory at `path`, where
+    /// this replica's index has a symlink. If this replica keeps dirlinks and
+    /// the link points to a directory it may adopt, it indexes the link as
+    /// that directory from now on (a local change). Returns whether `path`
+    /// is an adopted directory now.
+    fn adopt(&mut self, path: &RelPath) -> Result<bool> {
+        let _ = path;
+        Ok(false)
+    }
 }
 
 /// A change to apply at one path. Every op that leaves an entry at the path

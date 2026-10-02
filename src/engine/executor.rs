@@ -23,10 +23,11 @@ use std::io::Read;
 
 use crate::engine::conflict::{ConflictCopy, log_resolutions};
 use crate::engine::{
-    Action, ActionKind, Side, SkipReason, Snapshot, Step, is_beneath, plan, reconcile,
+    Action, ActionKind, IndexView, Side, SkipReason, Snapshot, Step, is_beneath, plan, reconcile,
 };
 use crate::error::{Error, Result};
 use crate::fs::RelPath;
+use crate::index::{Entry, Kind, UnmanagedReason};
 use crate::replica::{Op, Outcome, Replica};
 use crate::scan::{ScanStats, Scope};
 
@@ -113,6 +114,7 @@ impl Engine {
             dirty: BTreeSet::new(),
             errors: BTreeMap::new(),
             unmanaged: BTreeSet::new(),
+            adopt_asked: BTreeSet::new(),
         };
         cycle.scan(&scope)?;
         let mut round = 0;
@@ -178,6 +180,8 @@ struct Cycle<'r> {
     errors: BTreeMap<RelPath, String>,
     /// Paths skipped as `Unmanaged` (warned about once).
     unmanaged: BTreeSet<RelPath>,
+    /// Symlinks a replica was asked to adopt (`-K`) this cycle.
+    adopt_asked: BTreeSet<(Side, RelPath)>,
 }
 
 /// How a step went.
@@ -212,8 +216,15 @@ impl Cycle<'_> {
     /// Reconciles the current indexes. Rescans go to `dirty`; returns the
     /// actions that have steps, without paths that already failed.
     fn reconcile(&mut self) -> Result<Vec<Action>> {
-        let a = Snapshot::new(self.a.id(), self.a.changes_since(0)?);
-        let b = Snapshot::new(self.b.id(), self.b.changes_since(0)?);
+        let mut a = Snapshot::new(self.a.id(), self.a.changes_since(0)?);
+        let mut b = Snapshot::new(self.b.id(), self.b.changes_since(0)?);
+        let [adopted_a, adopted_b] = self.adopt_dirlinks(&a, &b)?;
+        if adopted_a {
+            a = Snapshot::new(self.a.id(), self.a.changes_since(0)?);
+        }
+        if adopted_b {
+            b = Snapshot::new(self.b.id(), self.b.changes_since(0)?);
+        }
         let now = jiff::Zoned::now().datetime();
         let mut todo = Vec::new();
         for action in reconcile(&a, &b, now) {
@@ -237,6 +248,48 @@ impl Cycle<'_> {
         }
         log_resolutions(&todo, [self.a.id(), self.b.id()]);
         Ok(todo)
+    }
+
+    /// `-K` (design §4.3): where one side has a real directory and the other
+    /// a symlink (synced or ignored), the symlink's replica may adopt it as
+    /// that directory. Asked once per path and cycle. Returns which sides
+    /// adopted something.
+    fn adopt_dirlinks(&mut self, a: &Snapshot, b: &Snapshot) -> Result<[bool; 2]> {
+        let linkish = |e: &Entry| {
+            matches!(
+                e.kind,
+                Kind::Symlink { .. } | Kind::Unmanaged(UnmanagedReason::IgnoredLink)
+            )
+        };
+        let mut asks = Vec::new();
+        for (path, ea) in a.entries() {
+            let Some(eb) = b.get(path) else { continue };
+            if linkish(ea) && eb.kind == Kind::Dir {
+                asks.push((Side::A, path.clone()));
+            } else if linkish(eb) && ea.kind == Kind::Dir {
+                asks.push((Side::B, path.clone()));
+            }
+        }
+        let mut adopted = [false; 2];
+        for (side, path) in asks {
+            if self.has_failed(&path) || !self.adopt_asked.insert((side, path.clone())) {
+                continue;
+            }
+            let replica: &mut dyn Replica = match side {
+                Side::A => &mut *self.a,
+                Side::B => &mut *self.b,
+            };
+            match replica.adopt(&path) {
+                Ok(true) => adopted[side as usize] = true,
+                Ok(false) => {}
+                Err(e) if is_fatal(&e) => return Err(e),
+                Err(e) => {
+                    tracing::debug!(%path, ?side, error = %e, "cannot adopt symlink; rescanning");
+                    self.dirty.insert(path);
+                }
+            }
+        }
+        Ok(adopted)
     }
 
     /// `path` or one of its ancestors failed with an error this cycle.

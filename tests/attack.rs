@@ -43,8 +43,8 @@ use std::time::{Duration, SystemTime};
 use files_sync::Result;
 use files_sync::config::ReplicaId;
 use files_sync::fs::caps::Caps;
-use files_sync::fs::commit::{self, Ctx, Expected, FileMeta, Outcome, Quarantine};
-use files_sync::fs::{RelPath, Root, hooks, is_reserved};
+use files_sync::fs::commit::{self, CopyNode, Ctx, Expected, FileMeta, Outcome, Quarantine};
+use files_sync::fs::{Fingerprint, RelPath, Root, hooks, is_reserved};
 use files_sync::index::Journal;
 
 const REPLICA: ReplicaId = ReplicaId(0x0123456789abcdef);
@@ -53,6 +53,9 @@ const TARGET: &str = "a/b/t";
 const CHILD: &str = "a/b/t/c";
 /// Where [`Op::RenameFile`] and [`Op::RenameSymlink`] move the target.
 const CONFLICT: &str = "a/b/t.conflict";
+/// The directory the target links to in [`Op::Materialize`] and
+/// [`Op::ChmodReferent`].
+const SRC: &str = "a/src";
 const NEW: &[u8] = b"new content from the peer";
 const META: FileMeta = FileMeta {
     mode: 0o644,
@@ -83,9 +86,14 @@ enum Op {
     RenameSymlink,
     /// Changes a directory's mode in place.
     ChmodDir,
+    /// Replaces the symlink `a/b/t -> ../src` with a real copy of the
+    /// directory it points to (`-L` write-back).
+    Materialize,
+    /// Changes the mode of `a/src` through the symlink `a/b/t` (`-K`).
+    ChmodReferent,
 }
 
-const ALL_OPS: [Op; 12] = [
+const ALL_OPS: [Op; 14] = [
     Op::CreateFile,
     Op::CreateSymlink,
     Op::Mkdir,
@@ -98,6 +106,8 @@ const ALL_OPS: [Op; 12] = [
     Op::RenameFile,
     Op::RenameSymlink,
     Op::ChmodDir,
+    Op::Materialize,
+    Op::ChmodReferent,
 ];
 
 impl Op {
@@ -197,6 +207,8 @@ struct World {
     caps: Caps,
     journal: Journal,
     expected: Option<Expected>,
+    /// The directory the target links to, as set up.
+    referent: Option<Fingerprint>,
     /// An fd on the user file (`t`, or `c` for `DeleteThenRmdir`).
     held: Option<fs::File>,
     tracked: Rc<RefCell<Vec<Tracked>>>,
@@ -227,6 +239,7 @@ impl World {
             caps,
             journal: Journal::in_memory().unwrap(),
             expected: None,
+            referent: None,
             held: None,
             tracked: Rc::default(),
         };
@@ -246,6 +259,17 @@ impl World {
                 fs::create_dir(w.p(TARGET)).unwrap();
                 fs::set_permissions(w.p(TARGET), fs::Permissions::from_mode(0o755)).unwrap();
                 w.expected = Some(Expected::from(w.root.stat(&rp(TARGET)).unwrap()));
+            }
+            Op::Materialize | Op::ChmodReferent => {
+                fs::create_dir_all(w.p("a/src/sub")).unwrap();
+                fs::set_permissions(w.p(SRC), fs::Permissions::from_mode(0o755)).unwrap();
+                for (f, data) in SRC_FILES {
+                    fs::write(w.p(&format!("{SRC}/{f}")), data).unwrap();
+                }
+                symlink("x", w.p("a/src/ln")).unwrap();
+                symlink("../src", w.p(TARGET)).unwrap();
+                w.expected = Some(Expected::from(w.root.stat(&rp(TARGET)).unwrap()));
+                w.referent = Some(w.root.stat(&rp(SRC)).unwrap());
             }
         }
         w
@@ -412,6 +436,26 @@ fn run(op: Op, v: Variant, caps: Caps, inj: Option<Injection>) -> (World, Run) {
         Op::ChmodDir => call(TARGET, &mut |_| {
             commit::set_dir_mode(&ctx, &t, &exp().fp, 0o700)
         }),
+        Op::Materialize => {
+            let src = w.p(SRC);
+            let tree = src_tree();
+            call(TARGET, &mut |q| {
+                // As the replica reads its index's files: by path, checked
+                // by hash at the end.
+                let mut open = |rel: &RelPath| -> Result<Box<dyn std::io::Read>> {
+                    let path = src.join(rel.as_os_str());
+                    let data = fs::read(&path).map_err(|e| files_sync::Error::io("read", e))?;
+                    Ok(Box::new(std::io::Cursor::new(data)))
+                };
+                commit::materialize(&ctx, q, &t, exp(), 0o750, &tree, &mut open)
+            })
+        }
+        Op::ChmodReferent => {
+            let dir = w.referent.unwrap();
+            call(SRC, &mut |_| {
+                commit::set_referent_mode(&ctx, &t, &exp().fp, &dir, 0o700)
+            })
+        }
     }
     q.sweep();
     let trace = hooks::take_trace();
@@ -430,6 +474,28 @@ fn run(op: Op, v: Variant, caps: Caps, inj: Option<Injection>) -> (World, Run) {
         outside_before,
     };
     (w, run)
+}
+
+/// The files in [`SRC`].
+const SRC_FILES: [(&str, &[u8]); 2] = [("x", b"src x"), ("sub/y", b"src sub/y")];
+
+/// [`SRC`] as [`commit::materialize`] copies it.
+fn src_tree() -> Vec<(RelPath, CopyNode)> {
+    let file = |data: &[u8]| CopyNode::File {
+        meta: META,
+        hash: hash(data),
+    };
+    vec![
+        (
+            rp("ln"),
+            CopyNode::Symlink {
+                target: b"x".to_vec(),
+            },
+        ),
+        (rp("sub"), CopyNode::Dir { mode: 0o700 }),
+        (rp("sub/y"), file(SRC_FILES[1].1)),
+        (rp("x"), file(SRC_FILES[0].1)),
+    ]
 }
 
 /// Whether the outcome is true right after the call: `Applied` means the
@@ -634,8 +700,9 @@ fn attack_op(op: Op) -> usize {
 fn commit_points() -> BTreeSet<&'static str> {
     const SRC: &str = include_str!("../src/fs/commit.rs");
     // `recover.*` points are reached by replay only (tests/crash.rs).
-    const PREFIXES: [&str; 10] = [
+    const PREFIXES: [&str; 11] = [
         "commit",
+        "materialize",
         "journal",
         "stage",
         "create",
@@ -736,4 +803,6 @@ attack_tests! {
     attack_rename_file => Op::RenameFile,
     attack_rename_symlink => Op::RenameSymlink,
     attack_chmod_dir => Op::ChmodDir,
+    attack_materialize => Op::Materialize,
+    attack_chmod_referent => Op::ChmodReferent,
 }

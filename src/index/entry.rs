@@ -78,8 +78,13 @@ pub struct LinkInfo {
     pub ctime_ns: i64,
     /// The link's target bytes as read from disk.
     pub raw_target: Vec<u8>,
-    /// The referent lies outside the replica root (read-only, extra watches).
+    /// The referent lies outside the replica root (read-only unless adopted
+    /// with `keep_dirlinks_unsafe`; watched with extra watches).
     pub out_of_tree: bool,
+    /// A link to a directory kept as that directory by `-K` (design §4.3),
+    /// not followed by the symlink policy. The entry's (dev, ino) pin the
+    /// directory: the adoption holds only while the link resolves to it.
+    pub adopted: bool,
 }
 
 /// The mode bits that are synced: permissions plus sticky, never setuid/setgid.

@@ -13,7 +13,9 @@
 //!   link's own path) or, when that escapes, from the link's directory with
 //!   `RESOLVE_NO_MAGICLINKS` only, as an out-of-tree referent (§4.5). The link
 //!   must be unchanged (same inode, so same target) after its referent is
-//!   read or opened.
+//!   read or opened. With `-K` ([`Scanner::keep_dirlinks`]), a link adopted
+//!   earlier (or named in [`Scanner::adopt`]) is indexed as the directory it
+//!   points to while that is still the pinned directory (§4.3.1).
 //! - **Files:** not rehashed when (ino, size, mtime, ctime) match the index and
 //!   the entry is not `racy`; otherwise hashed with a stable read (§5.2). A
 //!   file whose ctime is within the racy window of the scan start is marked
@@ -47,7 +49,7 @@ use crate::index::{
     Entry, IndexStore, Kind, LinkInfo, LocalMeta, ReadTxn, UnmanagedReason, sync_mode,
 };
 use crate::scan::hasher::Hasher;
-use crate::symlink::{SymlinkPolicy, Treatment, classify, needs_referent, unmunge};
+use crate::symlink::{SymlinkPolicy, Treatment, classify, is_munged, needs_referent, unmunge};
 
 /// Default racy window: a file whose ctime is this close to the scan start
 /// (or later) is rehashed by the next scan. Generous next to a kernel
@@ -94,6 +96,9 @@ pub struct Scanner<'a> {
     index: &'a IndexStore,
     policy: SymlinkPolicy,
     munge_links: bool,
+    keep_dirlinks: bool,
+    keep_dirlinks_unsafe: bool,
+    adopt: HashSet<RelPath>,
     racy_window: Duration,
 }
 
@@ -106,8 +111,28 @@ impl<'a> Scanner<'a> {
             index,
             policy,
             munge_links: false,
+            keep_dirlinks: false,
+            keep_dirlinks_unsafe: false,
+            adopt: HashSet::new(),
             racy_window: DEFAULT_RACY_WINDOW,
         }
+    }
+
+    /// rsync `-K` on this replica (design §4.3): links adopted earlier stay
+    /// adopted while they resolve to their pinned directory. With `unsafe_ok`
+    /// (`--keep-dirlinks-unsafe`), directories outside the root qualify too.
+    pub fn keep_dirlinks(mut self, on: bool, unsafe_ok: bool) -> Self {
+        self.keep_dirlinks = on;
+        self.keep_dirlinks_unsafe = unsafe_ok;
+        self
+    }
+
+    /// With [`keep_dirlinks`](Self::keep_dirlinks): adopts the symlinks at
+    /// `paths` that resolve to a directory (and are not followed anyway),
+    /// indexing them as that directory from now on.
+    pub fn adopt(mut self, paths: impl IntoIterator<Item = RelPath>) -> Self {
+        self.adopt.extend(paths);
+        self
     }
 
     /// rsync `--munge-links` on this replica: targets on disk are munged
@@ -135,6 +160,9 @@ impl<'a> Scanner<'a> {
             index: self.index,
             policy: self.policy,
             munge_links: self.munge_links,
+            keep_dirlinks: self.keep_dirlinks,
+            keep_dirlinks_unsafe: self.keep_dirlinks_unsafe,
+            adopt: &self.adopt,
             replica: self.index.replica(),
             racy_cutoff: now.saturating_sub(window),
             snap: self.index.read()?,
@@ -247,6 +275,9 @@ struct Walk<'a> {
     index: &'a IndexStore,
     policy: SymlinkPolicy,
     munge_links: bool,
+    keep_dirlinks: bool,
+    keep_dirlinks_unsafe: bool,
+    adopt: &'a HashSet<RelPath>,
     replica: ReplicaId,
     /// Files with a ctime at or after this are `racy`.
     racy_cutoff: i64,
@@ -522,6 +553,10 @@ impl Walk<'_> {
             Some(why) => return Ok(Obs::Dirty(why)),
         }
         let target = if self.munge_links {
+            if !is_munged(&raw) && old.is_none_or(|o| o.local.ino != fp.ino) {
+                // Not made by us: synced with its target as it is (§4.4).
+                tracing::warn!(%path, "symlink in a munged replica is not munged; synced as it is");
+            }
             unmunge(&raw)
         } else {
             raw.clone()
@@ -531,9 +566,16 @@ impl Walk<'_> {
             ..local_of(fp)
         };
 
+        // -K (§4.3): a link adopted earlier stays adopted while it resolves
+        // to the pinned directory; `adopt` asks for a new adoption.
+        let pinned = old
+            .filter(|o| o.kind == Kind::Dir && o.local.via_link.as_ref().is_some_and(|v| v.adopted))
+            .map(|o| (o.local.dev, o.local.ino));
+        let may_adopt = self.keep_dirlinks && (pinned.is_some() || self.adopt.contains(path));
+
         let mut referent = None;
         let mut looped = false;
-        let referent_kind = if needs_referent(self.policy, path, &target) {
+        let referent_kind = if may_adopt || needs_referent(self.policy, path, &target) {
             match self
                 .root
                 .open_referent(parent, path, name, OFlags::PATH | OFlags::CLOEXEC)
@@ -566,7 +608,31 @@ impl Walk<'_> {
                 dir: None,
             })
         };
-        match classify(self.policy, path, &target, referent_kind) {
+        let via = |out_of_tree, adopted| LinkInfo {
+            ino: fp.ino,
+            ctime_ns: fp.ctime_ns,
+            raw_target: raw.clone(),
+            out_of_tree,
+            adopted,
+        };
+        let treatment = classify(self.policy, path, &target, referent_kind);
+        if may_adopt
+            && matches!(
+                treatment,
+                Treatment::AsSymlink | Treatment::Unmanaged(UnmanagedReason::IgnoredLink)
+            )
+            && let Some((rfd, rfp, out_of_tree)) = &referent
+            && rfp.kind == FileKind::Dir
+            && (!out_of_tree || self.keep_dirlinks_unsafe)
+            && pinned.is_none_or(|id| id == (rfp.dev, rfp.ino))
+        {
+            let via = via(*out_of_tree, true);
+            return self.follow_dir(parent, path, name, fp, rfd, rfp, via, link_local.clone());
+        }
+        if pinned.is_some() {
+            tracing::info!(%path, "symlink no longer resolves to its adopted directory; no longer adopted");
+        }
+        match treatment {
             Treatment::AsSymlink => Ok(link_found(Kind::Symlink { target })),
             Treatment::Unmanaged(UnmanagedReason::Dangling) if looped => {
                 Ok(link_found(Kind::Unmanaged(UnmanagedReason::Loop)))
@@ -576,30 +642,42 @@ impl Walk<'_> {
                 let Some((rfd, rfp, out_of_tree)) = referent else {
                     return Ok(Obs::Dirty("symlink referent vanished"));
                 };
-                let via = LinkInfo {
-                    ino: fp.ino,
-                    ctime_ns: fp.ctime_ns,
-                    raw_target: raw,
-                    out_of_tree,
-                };
+                let via = via(out_of_tree, false);
                 match rfp.kind {
                     FileKind::File => self.follow_file(parent, path, name, fp, &rfp, via, old),
                     FileKind::Dir => {
-                        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
-                        let fd = match open_beneath(rfd.as_fd(), b".", flags) {
-                            Ok(fd) => fd,
-                            Err(e) => return Ok(errno_obs(e, path, "open symlink referent")),
-                        };
-                        if let Some(why) = link_unchanged(parent, name, fp)? {
-                            return Ok(Obs::Dirty(why));
-                        }
-                        self.dir_found(fd, &rfp, Some((via, link_local)))
+                        self.follow_dir(parent, path, name, fp, &rfd, &rfp, via, link_local)
                     }
                     // `classify` follows only files and directories.
                     _ => Ok(Obs::Dirty("symlink referent changed type")),
                 }
             }
         }
+    }
+
+    /// Opens the directory a followed (or adopted) link points to, as the
+    /// `O_PATH` fd `rfd` classified it. The link must be unchanged afterwards.
+    #[allow(clippy::too_many_arguments)]
+    fn follow_dir(
+        &self,
+        parent: BorrowedFd<'_>,
+        path: &RelPath,
+        name: &[u8],
+        link_fp: &Fingerprint,
+        rfd: &OwnedFd,
+        rfp: &Fingerprint,
+        via: LinkInfo,
+        link_local: LocalMeta,
+    ) -> Result<Obs> {
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+        let fd = match open_beneath(rfd.as_fd(), b".", flags) {
+            Ok(fd) => fd,
+            Err(e) => return Ok(errno_obs(e, path, "open symlink referent")),
+        };
+        if let Some(why) = link_unchanged(parent, name, link_fp)? {
+            return Ok(Obs::Dirty(why));
+        }
+        self.dir_found(fd, rfp, Some((via, link_local)))
     }
 
     /// Hashes the file a followed link points to. The link must still be

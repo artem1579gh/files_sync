@@ -21,8 +21,18 @@
 //!   limit (`fs.inotify.max_user_watches`) is hit, some directories go
 //!   unwatched, so the source falls back to polling: an [`Event::Overflow`]
 //!   every [`InotifySource::LIMIT_POLL`].
-//! - Reserved `.~fsync.` names are ignored. Symlinks are never followed, so
-//!   referents of followed links are not watched (T17).
+//! - Reserved `.~fsync.` names are ignored. Symlinks are never followed
+//!   while watching the tree.
+//! - **Followed links** (design §4.5): the replica hands over its followed
+//!   links with an fd on each referent ([`EventSource::follow`]). The
+//!   referent directory and every directory beneath it (or the referent
+//!   file) are watched as **aliases** of the link's path: an event there
+//!   also dirties the matching path beneath the link. An in-tree referent
+//!   shares its inode's watch with its own path; an out-of-tree one gets a
+//!   watch of its own. Aliases are rebuilt whenever the replica sends a new
+//!   set (after a scan that changed something); a directory created inside
+//!   an out-of-tree referent in between is reported, but its own content is
+//!   only seen by the next rescan.
 
 use std::collections::{HashMap, VecDeque};
 use std::mem::MaybeUninit;
@@ -31,12 +41,20 @@ use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::fs::inotify::{self, CreateFlags, ReadFlags, WatchFlags};
-use rustix::fs::{Dir, FileType};
+use rustix::fs::{Dir, FileType, OFlags};
 use rustix::io::Errno;
 
 use crate::error::{Error, Result};
+use crate::fs::root::open_beneath;
 use crate::fs::{Fingerprint, RelPath, Root, is_reserved};
-use crate::watch::{Event, EventSource};
+use crate::watch::{Event, EventSource, Followed};
+
+/// The events we watch for on a followed file (design §4.5).
+const FILE_MASK: WatchFlags = WatchFlags::MODIFY
+    .union(WatchFlags::CLOSE_WRITE)
+    .union(WatchFlags::ATTRIB)
+    .union(WatchFlags::DELETE_SELF)
+    .union(WatchFlags::MOVE_SELF);
 
 /// The events we watch for (design §5.9).
 const MASK: WatchFlags = WatchFlags::CREATE
@@ -61,6 +79,8 @@ pub struct InotifySource {
     buf: Vec<MaybeUninit<u8>>,
     by_wd: HashMap<Wd, Id>,
     by_id: HashMap<Id, (Wd, RelPath)>,
+    /// Watches of followed referents, with the paths they stand for.
+    aliases: HashMap<Wd, Vec<RelPath>>,
     /// Events produced outside `wait` (e.g. while adding watches).
     pending: Vec<Event>,
     /// Set once the watch limit was hit: when to poll next.
@@ -90,6 +110,7 @@ impl InotifySource {
             buf: vec![MaybeUninit::uninit(); 64 * 1024],
             by_wd: HashMap::new(),
             by_id: HashMap::new(),
+            aliases: HashMap::new(),
             pending: Vec::new(),
             poll_at: None,
         };
@@ -105,9 +126,15 @@ impl InotifySource {
         Ok(source)
     }
 
-    /// Number of directories watched.
+    /// Number of watches: the tree's directories, plus followed referents
+    /// outside it.
     pub fn watches(&self) -> usize {
         self.by_wd.len()
+            + self
+                .aliases
+                .keys()
+                .filter(|wd| !self.by_wd.contains_key(wd))
+                .count()
     }
 
     fn root_id(&self) -> Result<Id> {
@@ -195,6 +222,74 @@ impl InotifySource {
         true
     }
 
+    /// Watches what the followed links point to, as aliases of their paths;
+    /// replaces the previous aliases.
+    fn follow_links(&mut self, links: Vec<Followed>) {
+        // New watches first: a referent watched before keeps its watch
+        // (same inode, same wd), so no event is missed in between.
+        let old = std::mem::take(&mut self.aliases);
+        for link in links {
+            if link.dir {
+                self.alias_tree(link.path, link.fd);
+            } else {
+                self.alias(&link.path, &link.fd, FILE_MASK);
+            }
+        }
+        for wd in old.into_keys() {
+            // A watch of the tree itself stays.
+            if !self.aliases.contains_key(&wd) && !self.by_wd.contains_key(&wd) {
+                let _ = inotify::remove_watch(&self.inotify, wd);
+            }
+        }
+    }
+
+    /// Watches the directory open at `fd` and every directory beneath it
+    /// (opened without following symlinks) as aliases of `top` and its paths.
+    fn alias_tree(&mut self, top: RelPath, fd: OwnedFd) {
+        let mut todo = VecDeque::from([(top, fd)]);
+        while let Some((path, fd)) = todo.pop_front() {
+            let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+            let Ok(dir) = open_beneath(fd.as_fd(), b".", flags) else {
+                continue;
+            };
+            if !self.alias(&path, &dir, MASK) {
+                continue;
+            }
+            let Ok(entries) = Dir::read_from(&dir) else {
+                continue;
+            };
+            for entry in entries {
+                let Ok(entry) = entry else { break };
+                let name = entry.file_name().to_bytes();
+                if name == b"." || name == b".." || is_reserved(name) {
+                    continue;
+                }
+                if matches!(entry.file_type(), FileType::Directory | FileType::Unknown)
+                    && let Ok(child) = path.join(name)
+                    && let Ok(fd) = open_beneath(dir.as_fd(), name, OFlags::PATH | flags)
+                {
+                    todo.push_back((child, fd));
+                }
+            }
+        }
+    }
+
+    /// Adds a watch on what `fd` refers to, as an alias of `path`.
+    fn alias(&mut self, path: &RelPath, fd: &OwnedFd, mask: WatchFlags) -> bool {
+        let proc = format!("/proc/self/fd/{}", fd.as_raw_fd());
+        // Re-adding the watch of a watched directory keeps its wd and mask.
+        match inotify::add_watch(&self.inotify, proc.as_str(), mask) {
+            Ok(wd) => {
+                self.aliases.entry(wd).or_default().push(path.clone());
+                true
+            }
+            Err(e) => {
+                tracing::debug!(%path, error = %e, "cannot watch followed referent");
+                false
+            }
+        }
+    }
+
     /// Removes the watches of `top` and everything beneath it.
     fn unwatch_tree(&mut self, top: &RelPath) {
         let gone: Vec<(Id, Wd)> = self
@@ -206,8 +301,11 @@ impl InotifySource {
         for (id, wd) in gone {
             self.by_id.remove(&id);
             self.by_wd.remove(&wd);
-            // EINVAL if the kernel already dropped it (deleted directory).
-            let _ = inotify::remove_watch(&self.inotify, wd);
+            // A referent's watch stays for its aliases.
+            if !self.aliases.contains_key(&wd) {
+                // EINVAL if the kernel already dropped it (deleted directory).
+                let _ = inotify::remove_watch(&self.inotify, wd);
+            }
         }
     }
 
@@ -231,16 +329,30 @@ impl InotifySource {
             {
                 self.by_id.remove(&id);
             }
+            self.aliases.remove(&wd);
             return;
+        }
+        let aliases = self.aliases.get(&wd).cloned().unwrap_or_default();
+        let name = name.filter(|n| !n.is_empty());
+        if name.as_deref().is_some_and(is_reserved) {
+            return;
+        }
+        // The same change, seen through each followed link to this inode.
+        for alias in &aliases {
+            match &name {
+                Some(name) => {
+                    if let Ok(child) = alias.join(name) {
+                        out.push(Event::Dirty(child));
+                    }
+                }
+                None => out.push(Event::Dirty(alias.clone())),
+            }
         }
         let Some(path) = self.path_of(wd).cloned() else {
             return;
         };
-        match name.filter(|n| !n.is_empty()) {
+        match name {
             Some(name) => {
-                if is_reserved(&name) {
-                    return;
-                }
                 let Ok(child) = path.join(&name) else { return };
                 if mask.contains(ReadFlags::ISDIR) {
                     if mask.intersects(ReadFlags::MOVED_FROM | ReadFlags::DELETE) {
@@ -285,6 +397,10 @@ impl InotifySource {
 }
 
 impl EventSource for InotifySource {
+    fn follow(&mut self, links: Vec<Followed>) {
+        self.follow_links(links);
+    }
+
     fn wait(&mut self, timeout: Duration) -> Result<Vec<Event>> {
         let mut out = std::mem::take(&mut self.pending);
         let now = Instant::now();
@@ -390,6 +506,58 @@ mod tests {
 
         fs::remove_file(d.join("a/b/f")).unwrap();
         collect(&mut src, &["a/b/f"]);
+    }
+
+    /// Followed links' referents report under the links' paths too: in the
+    /// tree (sharing the watch), outside it, and a followed file.
+    #[test]
+    fn followed_referents_are_watched_as_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        fs::create_dir_all(d.join("d/sub")).unwrap();
+        fs::create_dir_all(out.path().join("o")).unwrap();
+        fs::write(out.path().join("of"), "x").unwrap();
+        symlink("d", d.join("l")).unwrap();
+        symlink(out.path(), d.join("lo")).unwrap();
+        symlink(out.path().join("of"), d.join("lf")).unwrap();
+        let mut src = source(d);
+        let tree = src.watches();
+        let open = |p: &Path| {
+            rustix::fs::open(p, OFlags::PATH | OFlags::CLOEXEC, rustix::fs::Mode::empty()).unwrap()
+        };
+        let follow = |path: &str, target: &Path, dir| Followed {
+            path: rp(path),
+            fd: open(target),
+            dir,
+        };
+        src.follow(vec![
+            follow("l", &d.join("d"), true),
+            follow("lo", out.path(), true),
+            follow("lf", &out.path().join("of"), false),
+        ]);
+        // The outside directory, its subdirectory and the file.
+        assert_eq!(src.watches(), tree + 3);
+
+        fs::write(d.join("d/sub/f"), "x").unwrap();
+        collect(&mut src, &["d/sub/f", "l/sub/f"]);
+        fs::write(out.path().join("o/g"), "x").unwrap();
+        collect(&mut src, &["lo/o/g"]);
+        fs::write(out.path().join("of"), "y").unwrap();
+        collect(&mut src, &["lf"]);
+
+        // A new set replaces the old: the outside watches go, the tree's stay.
+        src.follow(vec![follow("l", &d.join("d"), true)]);
+        assert_eq!(src.watches(), tree);
+        fs::write(out.path().join("o/h"), "x").unwrap();
+        fs::write(d.join("d/k"), "x").unwrap();
+        let ev = collect(&mut src, &["d/k", "l/k"]);
+        assert!(!ev.contains(&Event::Dirty(rp("lo/o/h"))), "{ev:?}");
+        // The in-tree directory is still watched for itself once unfollowed.
+        src.follow(Vec::new());
+        fs::write(d.join("d/sub/f2"), "x").unwrap();
+        let ev = collect(&mut src, &["d/sub/f2"]);
+        assert!(!ev.contains(&Event::Dirty(rp("l/sub/f2"))), "{ev:?}");
     }
 
     #[test]
