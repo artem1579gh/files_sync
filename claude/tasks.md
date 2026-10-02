@@ -61,7 +61,7 @@ The design lives in [`design.md`](design.md); §N.M below refers to its sections
 
 ## M1: race-safe filesystem primitives
 
-### [ ] T03: `Root`, `RelPath`, fingerprints
+### [x] T03: `Root`, `RelPath`, fingerprints
 - **Depends on:** T01
 - **Read:** §2, §3 (paths), §5.1, §5.2
 - **Files:** `src/fs/root.rs`, `src/fs/stat.rs`, `src/fs/mod.rs`
@@ -78,6 +78,14 @@ The design lives in [`design.md`](design.md); §N.M below refers to its sections
   - a file appended to during `stable_read` (from a hook or a thread) gives `Unstable`;
   - the normal case returns the correct blake3 hash.
 - **Notes:**
+  - `RelPath` (in `fs/root.rs`, re-exported as `fs::RelPath`) wraps `Vec<u8>`; the empty path is the root (`RelPath::root()`, depth 0, `parent()`/`name()` are `None`). Rejected: empty components (so absolute paths, `//` and a trailing `/`), `.`, `..` and NUL bytes. `join()` takes one or more components, validated the same way. Serde goes through `try_from = "Vec<u8>"`, so deserialised paths are validated too. `Display` uses `escape_ascii` (root shows as `.`). Reserved `.~fsync.` names are *not* rejected; that is the scanner's job (T04 adds `is_reserved`).
+  - `Root { fd, path }`: `open`, `fd`, `resolve_parent`, plus `open_dir` (an `O_RDONLY` fd for the directory itself, root included), `read_dir` (sorted, without `.`/`..`, reserved names included; `kind: Option<FileKind>`, `None` for `DT_UNKNOWN`) and `stat` (a `Fingerprint` of the path itself). For a depth-1 path, `resolve_parent` returns a dup of the root fd. `Caps::probe_path` now uses `Root::open`.
+  - **Deviation (design §5.1 updated):** directory opens use `O_PATH|O_DIRECTORY` without `O_NOFOLLOW`. With it, a trailing symlink in the parent path is opened as the link itself and fails with ENOTDIR instead of ELOOP. `RESOLVE_NO_SYMLINKS` alone rejects every symlink with ELOOP. The file open in `stable_read` keeps `O_NOFOLLOW` (no `O_DIRECTORY`, so it gives ELOOP).
+  - Errors: new `Error::InvalidPath { path, reason }` and `Error::Unstable { path: Vec<u8>, reason: &'static str }`. ELOOP, EXDEV and EAGAIN (openat2's "possible concurrent rename") map to `Unstable`. ENOENT and ENOTDIR stay `Error::Io`, so callers can tell "gone" from "changed". In `stable_read`, `Unstable.path` is the single `name`; callers holding the `RelPath` should rewrap it.
+  - `Fingerprint { dev (makedev), ino, size, mtime_ns, ctime_ns, mode (& 0o7777), kind: FileKind { File, Dir, Symlink, Special } }`, with `of_fd`, `at` (`AT_SYMLINK_NOFOLLOW`), `same_file` (dev+ino) and `unchanged` (same_file + kind, size, mtime, ctime: the §5.2 check). A statx result missing any needed field is an `Io` error (Unsupported). `mnt_id` from §3 `LocalMeta` is not in the fingerprint; T10 can add it if needed.
+  - `stable_read(parent, name, &mut impl Sink)`. `Sink` has `restart()` (called before each retry, so a sink can drop a torn attempt) and `write()`; `Vec<u8>` and `Discard` implement it. There are 1 + 3 attempts with 5/10/20 ms backoff. Unstable when: the name is a symlink or not a regular file; F1≠F2 (`unchanged`); more bytes are read than F1.size (stops early on a growing file); the byte count ≠ size; the name is removed or replaced (F3); or the file is leased (EAGAIN). The open uses `O_NONBLOCK`, so a FIFO or a foreign lease can't block us; FIFOs then fail the regular-file check. `O_NOATIME` falls back on EPERM. The returned fingerprint is F2.
+  - Tests (16 new): RelPath validation, parts, serde; resolve_parent (normal, symlinked intermediate inside and outside the tree → `Unstable`, missing/ENOTDIR → `Io`); read_dir types incl. non-UTF-8 names; stable_read normal multi-chunk + empty (blake3 checked), append on every attempt → `Unstable` after exactly 4 attempts, append on the first attempt only → success with the new content, a concurrent appending thread → `Unstable`, name replaced/removed mid-read, symlink/dir/FIFO → `Unstable`. Hooks don't exist yet (T04), so the "hook" is a `Sink` that mutates the file on its first write of each attempt. T04 could add a `hooks::point("stable_read.after_read")`.
+  - For T04: `resolve_parent` returns an `O_PATH` fd, which works as a dirfd for every `*at` call and for `O_TMPFILE`, but `fsync(parentfd)` (§5.3 step 5) needs a separate `O_RDONLY` open of the directory (`Root::open_dir`, or `openat2(parentfd, ".", O_RDONLY|O_DIRECTORY)`).
 
 ### [ ] T04: Hooks, temp files, create-type commits
 - **Depends on:** T03, T02

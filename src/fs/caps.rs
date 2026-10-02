@@ -13,6 +13,7 @@ use rustix::fs::{AtFlags, CWD, Mode, OFlags, RenameFlags, ResolveFlags, StatxFla
 use rustix::io::Errno;
 
 use crate::error::{Error, Result};
+use crate::fs::root::Root;
 
 /// Name prefix of probe files; inside the reserved `.~fsync.` namespace.
 pub const PROBE_PREFIX: &str = ".~fsync.probe.";
@@ -58,13 +59,7 @@ impl Caps {
 
     /// Opens the directory at `path` and probes it.
     pub fn probe_path(path: &Path) -> Result<Caps> {
-        let fd = rustix::fs::open(
-            path,
-            OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(|e| io_err(format!("open replica root {}", path.display()), e))?;
-        Self::probe(fd.as_fd())
+        Self::probe(Root::open(path)?.fd())
     }
 
     /// `O_TMPFILE` works and its result can be linked into the tree.

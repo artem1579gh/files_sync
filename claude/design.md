@@ -170,7 +170,8 @@ Both sides use the same relative paths, so the classification is symmetric. **Se
 
 - `Root` holds the root dirfd (`O_PATH | O_DIRECTORY`).
 - Every operation re-resolves its **parent** directory with:
-  `openat2(rootfd, parent, O_PATH|O_DIRECTORY|O_NOFOLLOW, RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS|RESOLVE_NO_MAGICLINKS|RESOLVE_NO_XDEV)`.
+  `openat2(rootfd, parent, O_PATH|O_DIRECTORY, RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS|RESOLVE_NO_MAGICLINKS|RESOLVE_NO_XDEV)`.
+  No `O_NOFOLLOW` on directory opens: with `O_PATH` (or `O_DIRECTORY`) it makes the kernel open a trailing symlink as itself and fail with `ENOTDIR`, whereas without it `RESOLVE_NO_SYMLINKS` rejects every symlink on the way, the trailing one included, with `ELOOP`. Nothing is followed either way.
   It then acts with `*at(parentfd, name)`, where `name` is a single path component. **No multi-component path string is ever passed to the kernel.**
 - A directory swapped for a symlink makes the resolution fail with `ELOOP` (or `EXDEV`). That counts as an unstable path and triggers a rescan. This closes the whole rsync CVE class of "swap a dir for a symlink mid-transfer".
 - **Residual case: a directory moved out of the root.** `mv root/a /tmp/x` while we hold a dirfd for `a` puts our write into the moved directory. This is not privilege escalation: an attacker can only redirect writes into a directory they could already move. Mitigation: after each commit, re-resolve the parent and compare (dev, ino); a mismatch triggers a rescan. The test invariant is **"never create anything in a directory that was never inside the root."**

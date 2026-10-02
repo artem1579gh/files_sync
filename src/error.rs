@@ -53,6 +53,17 @@ pub enum Error {
     )]
     MissingCapabilities { fs_type: String, missing: String },
 
+    /// A replica-relative path is malformed (absolute, `.`/`..`, empty or
+    /// NUL-containing components).
+    #[error("invalid relative path \"{}\": {reason}", path.escape_ascii())]
+    InvalidPath { path: Vec<u8>, reason: &'static str },
+
+    /// The path or file changed while we were resolving or reading it (a
+    /// symlink or mount point on the way, or a concurrent modification). The
+    /// caller should mark the path dirty and rescan it later (design §5.1, §5.2).
+    #[error("unstable path \"{}\": {reason}", path.escape_ascii())]
+    Unstable { path: Vec<u8>, reason: &'static str },
+
     /// Neither `$XDG_STATE_HOME` nor `$HOME` gives a usable state directory.
     #[error("cannot determine state directory: set XDG_STATE_HOME or HOME to an absolute path")]
     NoStateHome,
