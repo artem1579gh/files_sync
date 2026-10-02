@@ -6,6 +6,7 @@
 pub mod caps;
 pub mod commit;
 pub mod hooks;
+pub mod lease;
 pub mod root;
 pub mod stat;
 pub mod tmpname;
@@ -14,4 +15,4 @@ pub use root::{DirEntry, RelPath, Root};
 pub use stat::{
     Discard, FileKind, Fingerprint, Recheck, Sink, StableReader, stable_read, stable_read_with,
 };
-pub use tmpname::{conflict_name, is_reserved};
+pub use tmpname::{conflict_name, is_conflict_name, is_reserved};

@@ -383,3 +383,70 @@ fn directory_filled_during_delete_is_kept() {
         assert!(!t.exists("d/f"));
     }
 }
+
+/// T18: a tombstone is collected on both sides once both held the deletion
+/// for the retention period; a later create syncs as a new file, and
+/// nothing deleted comes back.
+#[test]
+fn tombstones_are_collected_after_the_retention_period() {
+    let mut p = pair();
+    p.a.write("f", "x");
+    p.a.mkdir("d");
+    p.a.write("d/g", "y");
+    p.a.write("keep", "z");
+    p.sync();
+    p.a.rm("f");
+    p.b.rm("d");
+    // Default retention (30 days): the tombstones stay.
+    let r = p.sync();
+    assert_eq!(r.collected, [0, 0]);
+    for t in [&p.a, &p.b] {
+        for path in ["f", "d", "d/g"] {
+            assert_eq!(t.entry(path).unwrap().kind, Kind::Tombstone, "{path}");
+        }
+    }
+
+    p.engine = p
+        .engine
+        .clone()
+        .tombstone_retention(std::time::Duration::ZERO);
+    let r = p.sync();
+    assert_eq!((r.applied, r.collected), (0, [3, 3]));
+    for t in [&p.a, &p.b] {
+        for path in ["f", "d", "d/g"] {
+            assert_eq!(t.entry(path), None, "{path}");
+        }
+        assert_eq!(t.read("keep"), "z");
+    }
+    let r = p.sync();
+    assert_eq!((r.applied, r.collected), (0, [0, 0]));
+    p.assert_converged();
+    assert!(!p.a.exists("f") && !p.b.exists("d"));
+
+    // Re-created after the GC: an ordinary new file.
+    p.b.write("f", "again");
+    let r = p.sync();
+    assert_eq!(r.applied, 1);
+    assert_eq!(p.a.read("f"), "again");
+    p.assert_converged();
+}
+
+/// Independent deletes on both sides leave concurrent tombstones, which
+/// reconcile never equalises (§6.1); they are collected all the same.
+#[test]
+fn concurrent_tombstones_are_collected() {
+    let mut p = pair();
+    p.a.write("f", "x");
+    p.sync();
+    p.a.write("f", "a's edit");
+    p.a.rm("f");
+    p.b.rm("f");
+    p.engine = p
+        .engine
+        .clone()
+        .tombstone_retention(std::time::Duration::ZERO);
+    let r = p.sync();
+    assert_eq!(r.collected, [1, 1]);
+    assert_eq!((p.a.entry("f"), p.b.entry("f")), (None, None));
+    p.assert_converged();
+}

@@ -8,28 +8,38 @@
 //!   current seq, so `changes_since` is a range scan.
 //! - `meta`: schema version, replica ID, next seq, max counter.
 //! - `intents`: the commit journal ([`Journal`], design §5.8).
+//! - `peers`: peer replica ID → wall-clock time (ns) of the last sync cycle
+//!   with it ([`IndexStore::record_sync`]).
+//! - `acks`: peer ID (8 bytes, big-endian) + path bytes → postcard [`Ack`]:
+//!   what the peer held at one of our tombstones, and since when (tombstone
+//!   GC, design §3).
 //!
 //! Every write goes through a [`WriteTxn`]; the single-op helpers on
 //! [`IndexStore`] open one per call.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use redb::{
-    Database, ReadOnlyTable, ReadTransaction, ReadableDatabase, ReadableTable,
-    ReadableTableMetadata, Table,
-    TableDefinition, WriteTransaction,
+    Database, Durability, ReadOnlyTable, ReadTransaction, ReadableDatabase, ReadableTable,
+    ReadableTableMetadata, Table, TableDefinition, WriteTransaction,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::config::ReplicaId;
 use crate::error::{Error, Result};
 use crate::fs::RelPath;
-use crate::index::entry::{Entry, LocalMeta};
+use crate::index::entry::{Entry, Kind, LocalMeta};
 use crate::index::journal::{INTENTS, Journal};
+use crate::index::vv::VersionVector;
 
 const ENTRIES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("entries");
 const BY_SEQ: TableDefinition<u64, &[u8]> = TableDefinition::new("by_seq");
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
+const PEERS: TableDefinition<u64, i64> = TableDefinition::new("peers");
+const ACKS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("acks");
 
 const META_SCHEMA: &str = "schema";
 const META_REPLICA: &str = "replica_id";
@@ -42,6 +52,42 @@ const SCHEMA_VERSION: u64 = 2;
 
 /// The first seq handed out; `changes_since(0)` returns everything.
 const FIRST_SEQ: u64 = 1;
+
+/// How long a tombstone is kept after every peer acknowledged it (design §3).
+pub const DEFAULT_TOMBSTONE_RETENTION: Duration = Duration::from_secs(30 * 24 * 3600);
+
+/// What a peer's index holds at a path where this index has a tombstone
+/// (tombstone GC, design §3).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PeerState {
+    /// No entry: it never had one, or it collected its tombstone already.
+    Absent,
+    /// A tombstone with this version vector.
+    Tombstone(VersionVector),
+    /// A live or `Unmanaged` entry: the deletion is not acknowledged.
+    Live,
+}
+
+/// A peer's acknowledgement of one of our tombstones: our tombstone's version
+/// vector and the peer's (`None`: no entry) when first seen together, and
+/// when that was.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ack {
+    pub ours: VersionVector,
+    pub theirs: Option<VersionVector>,
+    /// Wall-clock time in ns since the Unix epoch.
+    pub since_ns: i64,
+}
+
+fn ack_key(peer: ReplicaId, path: &[u8]) -> Vec<u8> {
+    let mut key = peer.0.to_be_bytes().to_vec();
+    key.extend_from_slice(path);
+    key
+}
+
+fn decode_ack(key: &[u8], value: &[u8]) -> Result<Ack> {
+    postcard::from_bytes(value).map_err(|e| bad(format!("ack \"{}\": {e}", key.escape_ascii())))
+}
 
 fn dberr(e: impl Into<redb::Error>) -> Error {
     Error::Db(e.into())
@@ -98,6 +144,8 @@ impl IndexStore {
             let entries = txn.open_table(ENTRIES).map_err(dberr)?;
             txn.open_table(BY_SEQ).map_err(dberr)?;
             txn.open_table(INTENTS).map_err(dberr)?;
+            txn.open_table(PEERS).map_err(dberr)?;
+            txn.open_table(ACKS).map_err(dberr)?;
             match get_meta(&meta, META_SCHEMA)? {
                 None => {
                     if !entries.is_empty().map_err(dberr)? {
@@ -203,6 +251,22 @@ impl IndexStore {
     pub fn max_counter(&self) -> Result<u64> {
         self.read()?.max_counter()
     }
+
+    /// Records a sync cycle with `peer` at `now_ns` and collects tombstones,
+    /// in one (non-durable) transaction; see [`WriteTxn::record_sync`].
+    pub fn record_sync(
+        &self,
+        peer: ReplicaId,
+        tombstones: &[(RelPath, VersionVector, PeerState)],
+        now_ns: i64,
+        retention: Duration,
+    ) -> Result<Vec<RelPath>> {
+        let mut txn = self.write()?;
+        txn.txn.set_durability(Durability::None).map_err(dberr)?;
+        let removed = txn.record_sync(peer, tombstones, now_ns, retention)?;
+        txn.commit()?;
+        Ok(removed)
+    }
 }
 
 /// A read-only snapshot of the index.
@@ -251,6 +315,28 @@ impl ReadTxn {
 
     pub fn max_counter(&self) -> Result<u64> {
         self.meta(META_MAX_COUNTER)
+    }
+
+    /// Every peer synced with, and the wall-clock time (ns) of the last
+    /// sync cycle with it.
+    pub fn peers(&self) -> Result<Vec<(ReplicaId, i64)>> {
+        let peers = self.txn.open_table(PEERS).map_err(dberr)?;
+        let mut out = Vec::new();
+        for row in peers.iter().map_err(dberr)? {
+            let (k, v) = row.map_err(dberr)?;
+            out.push((ReplicaId(k.value()), v.value()));
+        }
+        Ok(out)
+    }
+
+    /// `peer`'s acknowledgement of our tombstone at `path`, if recorded.
+    pub fn ack(&self, peer: ReplicaId, path: &RelPath) -> Result<Option<Ack>> {
+        let acks = self.txn.open_table(ACKS).map_err(dberr)?;
+        let key = ack_key(peer, path.as_bytes());
+        match acks.get(key.as_slice()).map_err(dberr)? {
+            Some(v) => Ok(Some(decode_ack(&key, v.value())?)),
+            None => Ok(None),
+        }
     }
 }
 
@@ -371,12 +457,150 @@ impl WriteTxn {
         self.max_counter
     }
 
+    /// Tombstone GC (design §3), after a sync cycle with `peer` that ended
+    /// at `now_ns` (wall clock).
+    ///
+    /// `tombstones` lists every tombstone of this index as the cycle ended,
+    /// with its version vector and what `peer` held at its path. One that is
+    /// no longer the stored entry (another entry, or another vector) is
+    /// ignored. For the others, the peer's acknowledgement is recorded: a
+    /// tombstone or no entry there acknowledges the deletion (from now on,
+    /// or since the earlier record if the peer's vector and ours are
+    /// unchanged; a peer that dropped its tombstone keeps its record); a live
+    /// entry withdraws it. Records of paths that are no tombstone any more go.
+    ///
+    /// A tombstone is then removed if every peer synced with so far has
+    /// acknowledged it for at least `retention`. Neither side can resurrect it
+    /// then: the peer has nothing live there, and a later change on either
+    /// side gets a version vector that dominates or is concurrent with the
+    /// other side's tombstone, which a modification wins (§6.1). Concurrent
+    /// tombstones never become equal (§6.1 never pushes one over another), so
+    /// any peer tombstone counts, whatever its vector.
+    ///
+    /// Also records `now_ns` as the last sync with `peer`. Returns the paths
+    /// whose tombstones were removed.
+    pub fn record_sync(
+        &mut self,
+        peer: ReplicaId,
+        tombstones: &[(RelPath, VersionVector, PeerState)],
+        now_ns: i64,
+        retention: Duration,
+    ) -> Result<Vec<RelPath>> {
+        let mut current: Vec<(&RelPath, &VersionVector)> = Vec::new();
+        {
+            let entries = self.entries()?;
+            let mut acks = self.txn.open_table(ACKS).map_err(dberr)?;
+            for (path, vv, state) in tombstones {
+                let key = ack_key(peer, path.as_bytes());
+                let is_current = get_entry(&entries, path)?
+                    .is_some_and(|e| e.kind == Kind::Tombstone && &e.vv == vv);
+                if !is_current {
+                    acks.remove(key.as_slice()).map_err(dberr)?;
+                    continue;
+                }
+                current.push((path, vv));
+                let old = match acks.get(key.as_slice()).map_err(dberr)? {
+                    Some(v) => Some(decode_ack(&key, v.value())?),
+                    None => None,
+                };
+                let old = old.filter(|a| &a.ours == vv);
+                let theirs = match state {
+                    PeerState::Live => {
+                        acks.remove(key.as_slice()).map_err(dberr)?;
+                        continue;
+                    }
+                    PeerState::Absent => match old {
+                        Some(_) => continue,
+                        None => None,
+                    },
+                    PeerState::Tombstone(t) => {
+                        if old.as_ref().is_some_and(|a| a.theirs.as_ref() == Some(t)) {
+                            continue;
+                        }
+                        Some(t.clone())
+                    }
+                };
+                let ack = Ack {
+                    ours: vv.clone(),
+                    theirs,
+                    since_ns: now_ns,
+                };
+                let value =
+                    postcard::to_stdvec(&ack).map_err(|e| bad(format!("encode ack: {e}")))?;
+                acks.insert(key.as_slice(), value.as_slice())
+                    .map_err(dberr)?;
+            }
+
+            // Forget records of paths that are no tombstone any more.
+            let keep: HashSet<&[u8]> = current.iter().map(|(p, _)| p.as_bytes()).collect();
+            let prefix = peer.0.to_be_bytes();
+            let mut stale = Vec::new();
+            for row in acks.range(prefix.as_slice()..).map_err(dberr)? {
+                let (k, _) = row.map_err(dberr)?;
+                let Some(path) = k.value().strip_prefix(prefix.as_slice()) else {
+                    break;
+                };
+                if !keep.contains(path) {
+                    stale.push(k.value().to_vec());
+                }
+            }
+            for k in stale {
+                acks.remove(k.as_slice()).map_err(dberr)?;
+            }
+        }
+        let peers: Vec<ReplicaId> = {
+            let mut table = self.txn.open_table(PEERS).map_err(dberr)?;
+            table.insert(peer.0, now_ns).map_err(dberr)?;
+            let mut peers = Vec::new();
+            for row in table.iter().map_err(dberr)? {
+                peers.push(ReplicaId(row.map_err(dberr)?.0.value()));
+            }
+            peers
+        };
+
+        let retention = i64::try_from(retention.as_nanos()).unwrap_or(i64::MAX);
+        let mut removed = Vec::new();
+        for (path, vv) in current {
+            let mut keys = Vec::new();
+            let mut acked = true;
+            {
+                let acks = self.txn.open_table(ACKS).map_err(dberr)?;
+                for &p in &peers {
+                    let key = ack_key(p, path.as_bytes());
+                    let ack = match acks.get(key.as_slice()).map_err(dberr)? {
+                        Some(v) => decode_ack(&key, v.value())?,
+                        None => {
+                            acked = false;
+                            break;
+                        }
+                    };
+                    if &ack.ours != vv || ack.since_ns.saturating_add(retention) > now_ns {
+                        acked = false;
+                        break;
+                    }
+                    keys.push(key);
+                }
+            }
+            if !acked {
+                continue;
+            }
+            self.remove(path)?;
+            let mut acks = self.txn.open_table(ACKS).map_err(dberr)?;
+            for key in keys {
+                acks.remove(key.as_slice()).map_err(dberr)?;
+            }
+            removed.push(path.clone());
+        }
+        Ok(removed)
+    }
+
     /// Makes every change durable and visible, atomically.
     pub fn commit(self) -> Result<()> {
         {
             let mut meta = self.txn.open_table(META).map_err(dberr)?;
             meta.insert(META_NEXT_SEQ, self.next_seq).map_err(dberr)?;
-            meta.insert(META_MAX_COUNTER, self.max_counter).map_err(dberr)?;
+            meta.insert(META_MAX_COUNTER, self.max_counter)
+                .map_err(dberr)?;
         }
         self.txn.commit().map_err(dberr)
     }
@@ -409,10 +633,12 @@ fn changes_since(
     for row in by_seq.range(from..).map_err(dberr)? {
         let (s, key) = row.map_err(dberr)?;
         let (s, key) = (s.value(), key.value());
-        let value = entries
-            .get(key)
-            .map_err(dberr)?
-            .ok_or_else(|| bad(format!("seq {s} points to missing \"{}\"", key.escape_ascii())))?;
+        let value = entries.get(key).map_err(dberr)?.ok_or_else(|| {
+            bad(format!(
+                "seq {s} points to missing \"{}\"",
+                key.escape_ascii()
+            ))
+        })?;
         let (path, entry) = decode(key, value.value())?;
         if entry.seq != s {
             return Err(bad(format!(
@@ -450,7 +676,12 @@ fn iter_prefix(
     lo.push(b'/');
     let mut hi = prefix.as_bytes().to_vec();
     hi.push(b'/' + 1);
-    push_range(&mut out, entries.range::<&[u8]>(lo.as_slice()..hi.as_slice()).map_err(dberr)?)?;
+    push_range(
+        &mut out,
+        entries
+            .range::<&[u8]>(lo.as_slice()..hi.as_slice())
+            .map_err(dberr)?,
+    )?;
     Ok(out)
 }
 
@@ -512,9 +743,14 @@ mod tests {
             racy: true,
         };
         let kinds = [
-            Kind::File { size: 3, hash: [9; 32] },
+            Kind::File {
+                size: 3,
+                hash: [9; 32],
+            },
             Kind::Dir,
-            Kind::Symlink { target: b"../t\x80".to_vec() },
+            Kind::Symlink {
+                target: b"../t\x80".to_vec(),
+            },
             Kind::Tombstone,
             Kind::Unmanaged(UnmanagedReason::IgnoredLink),
             Kind::Unmanaged(UnmanagedReason::Dangling),
@@ -583,8 +819,14 @@ mod tests {
         txn.put_local(&a, &e).unwrap();
         // A stale seq or a missing entry is refused.
         let stale = e.clone().with_seq(seq + 1);
-        assert!(matches!(txn.put_local(&a, &stale), Err(Error::BadIndex { .. })));
-        assert!(matches!(txn.put_local(&p(b"b"), &e), Err(Error::BadIndex { .. })));
+        assert!(matches!(
+            txn.put_local(&a, &stale),
+            Err(Error::BadIndex { .. })
+        ));
+        assert!(matches!(
+            txn.put_local(&p(b"b"), &e),
+            Err(Error::BadIndex { .. })
+        ));
         txn.commit().unwrap();
         let back = store.get(&a).unwrap().unwrap();
         assert_eq!(back, e);
@@ -600,7 +842,12 @@ mod tests {
         for i in 0..50u64 {
             // Revisit paths so some puts replace earlier ones.
             let path = p(format!("f{}", i % 17).as_bytes());
-            seqs.push((store.put(&path, &mut file(&i.to_le_bytes(), i + 1)).unwrap(), path));
+            seqs.push((
+                store
+                    .put(&path, &mut file(&i.to_le_bytes(), i + 1))
+                    .unwrap(),
+                path,
+            ));
         }
         for (cut, _) in &seqs {
             let changes = store.changes_since(*cut).unwrap();
@@ -620,7 +867,15 @@ mod tests {
     fn iter_prefix_is_component_wise() {
         let (_dir, store) = open();
         for name in [
-            &b"a"[..], b"a/b", b"a/b/c", b"a.txt", b"a0", b"ab", b"a/\xff", b"b", b"b/a",
+            &b"a"[..],
+            b"a/b",
+            b"a/b/c",
+            b"a.txt",
+            b"a0",
+            b"ab",
+            b"a/\xff",
+            b"b",
+            b"b/a",
         ] {
             store.put(&p(name), &mut file(name, 1)).unwrap();
         }
@@ -657,10 +912,16 @@ mod tests {
         let mut txn = store.write().unwrap();
         let s1 = txn.put(&p(b"x"), &mut file(b"x", 5)).unwrap();
         let s2 = txn.put(&p(b"y"), &mut file(b"y", 6)).unwrap();
-        assert_eq!(paths(&txn.changes_since(base).unwrap()), [b"x".to_vec(), b"y".to_vec()]);
+        assert_eq!(
+            paths(&txn.changes_since(base).unwrap()),
+            [b"x".to_vec(), b"y".to_vec()]
+        );
         txn.commit().unwrap();
         assert!(snap.get(&p(b"x")).unwrap().is_none());
-        assert_eq!(paths(&store.changes_since(base).unwrap()), [b"x".to_vec(), b"y".to_vec()]);
+        assert_eq!(
+            paths(&store.changes_since(base).unwrap()),
+            [b"x".to_vec(), b"y".to_vec()]
+        );
         assert_eq!((s1, s2), (base + 1, base + 2));
         assert_eq!(store.max_counter().unwrap(), 6);
 
@@ -688,13 +949,138 @@ mod tests {
             {
                 let mut t = txn.open_table(ENTRIES).unwrap();
                 t.insert(&b"bad"[..], &b"\xff\xff\xff"[..]).unwrap();
-                t.insert(&b"/abs"[..], encode(&file(b"", 1)).unwrap().as_slice()).unwrap();
+                t.insert(&b"/abs"[..], encode(&file(b"", 1)).unwrap().as_slice())
+                    .unwrap();
             }
             txn.commit().unwrap();
         }
         assert!(matches!(store.get(&p(b"bad")), Err(Error::BadIndex { .. })));
-        assert!(matches!(store.iter_prefix(&RelPath::root()), Err(Error::BadIndex { .. })));
+        assert!(matches!(
+            store.iter_prefix(&RelPath::root()),
+            Err(Error::BadIndex { .. })
+        ));
         assert!(store.get(&p(b"ok")).unwrap().is_some());
+    }
+
+    // ----- T18: tombstone GC ---------------------------------------------
+
+    const PEER: ReplicaId = ReplicaId(0x77);
+    const H: Duration = Duration::from_nanos(100);
+
+    fn tomb(store: &IndexStore, path: &[u8], counter: u64) -> VersionVector {
+        let mut vv = VersionVector::new();
+        vv.set(PEER, counter);
+        store
+            .put(&p(path), &mut Entry::new(Kind::Tombstone, 0, 0, vv.clone()))
+            .unwrap();
+        vv
+    }
+
+    fn gc(
+        store: &IndexStore,
+        peer: ReplicaId,
+        seen: &[(&[u8], &VersionVector, PeerState)],
+        now: i64,
+    ) -> Vec<Vec<u8>> {
+        let seen: Vec<_> = seen
+            .iter()
+            .map(|(path, vv, st)| (p(path), (*vv).clone(), st.clone()))
+            .collect();
+        let removed = store.record_sync(peer, &seen, now, H).unwrap();
+        removed.iter().map(|p| p.as_bytes().to_vec()).collect()
+    }
+
+    #[test]
+    fn tombstones_are_collected_after_retention() {
+        let (_dir, store) = open();
+        let (t, a, l) = (
+            tomb(&store, b"t", 1),
+            tomb(&store, b"a", 2),
+            tomb(&store, b"l", 3),
+        );
+        let seen = |st_t| {
+            [
+                (&b"t"[..], &t, st_t),
+                (&b"a"[..], &a, PeerState::Absent),
+                (&b"l"[..], &l, PeerState::Live),
+            ]
+        };
+        // Acknowledged at 1000 (tombstone or nothing at the peer); live: not.
+        assert!(gc(&store, PEER, &seen(PeerState::Tombstone(t.clone())), 1000).is_empty());
+        let r = store.read().unwrap();
+        let ack = r.ack(PEER, &p(b"t")).unwrap().unwrap();
+        assert_eq!(
+            (ack.ours, ack.theirs, ack.since_ns),
+            (t.clone(), Some(t.clone()), 1000)
+        );
+        assert_eq!(r.ack(PEER, &p(b"a")).unwrap().unwrap().theirs, None);
+        assert_eq!(r.ack(PEER, &p(b"l")).unwrap(), None);
+        assert_eq!(r.peers().unwrap(), [(PEER, 1000)]);
+        drop(r);
+
+        // The peer collected its tombstone at "t": the record keeps its time.
+        assert!(gc(&store, PEER, &seen(PeerState::Absent), 1099).is_empty());
+        assert_eq!(
+            gc(&store, PEER, &seen(PeerState::Absent), 1100),
+            [b"t", b"a"]
+        );
+        let r = store.read().unwrap();
+        assert_eq!(r.get(&p(b"t")).unwrap(), None);
+        assert_eq!(r.get(&p(b"a")).unwrap(), None);
+        assert_eq!(r.ack(PEER, &p(b"t")).unwrap(), None);
+        assert_eq!(r.get(&p(b"l")).unwrap().unwrap().kind, Kind::Tombstone);
+        assert_eq!(r.peers().unwrap(), [(PEER, 1100)]);
+    }
+
+    #[test]
+    fn a_changed_vector_or_entry_restarts_or_drops_the_ack() {
+        let (_dir, store) = open();
+        let t = tomb(&store, b"t", 1);
+        let theirs = |n| {
+            let mut vv = VersionVector::new();
+            vv.set(ReplicaId(9), n);
+            vv
+        };
+        gc(
+            &store,
+            PEER,
+            &[(b"t", &t, PeerState::Tombstone(theirs(1)))],
+            1000,
+        );
+        // A different (concurrent) peer tombstone restarts the period.
+        gc(
+            &store,
+            PEER,
+            &[(b"t", &t, PeerState::Tombstone(theirs(2)))],
+            1050,
+        );
+        assert!(gc(&store, PEER, &[(b"t", &t, PeerState::Absent)], 1149).is_empty());
+        // Our tombstone changed since the list was made: ignored.
+        let t2 = tomb(&store, b"t", 5);
+        assert!(gc(&store, PEER, &[(b"t", &t, PeerState::Absent)], 5000).is_empty());
+        assert_eq!(store.read().unwrap().ack(PEER, &p(b"t")).unwrap(), None);
+        gc(&store, PEER, &[(b"t", &t2, PeerState::Absent)], 6000);
+        // The path is live again: its record goes.
+        store.put(&p(b"t"), &mut file(b"back", 6)).unwrap();
+        assert!(gc(&store, PEER, &[], 7000).is_empty());
+        assert_eq!(store.read().unwrap().ack(PEER, &p(b"t")).unwrap(), None);
+        assert!(store.get(&p(b"t")).unwrap().is_some());
+    }
+
+    #[test]
+    fn every_known_peer_must_acknowledge() {
+        let (_dir, store) = open();
+        let t = tomb(&store, b"t", 1);
+        let other = ReplicaId(0x88);
+        gc(&store, other, &[(b"t", &t, PeerState::Live)], 1000);
+        assert!(gc(&store, PEER, &[(b"t", &t, PeerState::Absent)], 1000).is_empty());
+        assert!(gc(&store, PEER, &[(b"t", &t, PeerState::Absent)], 9000).is_empty());
+        gc(&store, other, &[(b"t", &t, PeerState::Absent)], 9000);
+        assert_eq!(
+            gc(&store, PEER, &[(b"t", &t, PeerState::Absent)], 9100),
+            [b"t"]
+        );
+        assert_eq!(store.read().unwrap().ack(other, &p(b"t")).unwrap(), None);
     }
 
     impl Entry {

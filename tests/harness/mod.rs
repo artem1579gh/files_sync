@@ -18,7 +18,7 @@ use crossbeam_channel::Receiver;
 use files_sync::config::{FollowedWrite, ReplicaConfig, ReplicaId, SymlinkPolicy};
 use files_sync::engine::{Engine, Side, SyncReport};
 use files_sync::fs::{FileKind, RelPath, is_reserved};
-use files_sync::index::{Entry, Kind, VersionVector};
+use files_sync::index::{Entry, Kind, PeerState, VersionVector};
 use files_sync::replica::{ContentReader, LocalReplica, Op, Outcome, Precondition, Replica};
 use files_sync::scan::{ScanStats, Scope};
 use files_sync::symlink::{Treatment, classify, unmunge};
@@ -341,6 +341,15 @@ impl Replica for Racing<'_> {
 
     fn adopt(&mut self, path: &RelPath) -> files_sync::Result<bool> {
         self.inner.adopt(path)
+    }
+
+    fn record_sync(
+        &mut self,
+        peer: ReplicaId,
+        tombstones: Vec<(RelPath, VersionVector, PeerState)>,
+        retention: std::time::Duration,
+    ) -> files_sync::Result<Vec<RelPath>> {
+        self.inner.record_sync(peer, tombstones, retention)
     }
 }
 

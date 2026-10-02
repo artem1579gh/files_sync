@@ -153,8 +153,18 @@ impl ReplicaConfig {
 #[serde(deny_unknown_fields)]
 pub struct PairConfig {
     pub name: String,
+    /// How many days a deletion is remembered after both replicas hold it,
+    /// before its tombstones are collected (design §3).
+    #[serde(default = "default_tombstone_retention_days")]
+    pub tombstone_retention_days: u64,
     pub replicas: [ReplicaConfig; 2],
 }
+
+fn default_tombstone_retention_days() -> u64 {
+    crate::index::DEFAULT_TOMBSTONE_RETENTION.as_secs() / SECS_PER_DAY
+}
+
+const SECS_PER_DAY: u64 = 24 * 3600;
 
 impl PairConfig {
     /// A new pair over two absolute roots, with distinct random replica IDs.
@@ -168,6 +178,7 @@ impl PairConfig {
         }
         let cfg = PairConfig {
             name: name.to_owned(),
+            tombstone_retention_days: default_tombstone_retention_days(),
             replicas: [a, b],
         };
         cfg.check().map_err(|reason| Error::InvalidRoot {
@@ -229,6 +240,11 @@ impl PairConfig {
         let path = config_path(state_home, &self.name)?;
         write_atomic(&path, self.to_toml()?.as_bytes(), true)?;
         Ok(path)
+    }
+
+    /// [`PairConfig::tombstone_retention_days`] as a duration.
+    pub fn tombstone_retention(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.tombstone_retention_days.saturating_mul(SECS_PER_DAY))
     }
 
     fn to_toml(&self) -> Result<String> {
@@ -362,7 +378,7 @@ pub fn validate_pair_name(name: &str) -> Result<()> {
 /// Writes `bytes` to `path` via a fsynced temp file in the same directory.
 /// With `replace`, an existing file is atomically replaced; without it, an
 /// existing file makes the call fail with [`Error::ConfigExists`].
-fn write_atomic(path: &Path, bytes: &[u8], replace: bool) -> Result<()> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8], replace: bool) -> Result<()> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
     let dir = path.parent().expect("config path has a parent");

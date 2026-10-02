@@ -20,6 +20,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
+use std::time::Duration;
 
 use crate::engine::conflict::{ConflictCopy, log_resolutions};
 use crate::engine::{
@@ -27,7 +28,7 @@ use crate::engine::{
 };
 use crate::error::{Error, Result};
 use crate::fs::RelPath;
-use crate::index::{Entry, Kind, UnmanagedReason};
+use crate::index::{DEFAULT_TOMBSTONE_RETENTION, Entry, Kind, PeerState, UnmanagedReason};
 use crate::replica::{Op, Outcome, Replica};
 use crate::scan::{ScanStats, Scope};
 
@@ -38,12 +39,14 @@ pub const MAX_ROUNDS: usize = 5;
 #[derive(Clone, Debug)]
 pub struct Engine {
     max_rounds: usize,
+    tombstone_retention: Duration,
 }
 
 impl Default for Engine {
     fn default() -> Engine {
         Engine {
             max_rounds: MAX_ROUNDS,
+            tombstone_retention: DEFAULT_TOMBSTONE_RETENTION,
         }
     }
 }
@@ -70,6 +73,9 @@ pub struct SyncReport {
     /// Paths with work left after the last round (still changing, or still
     /// failing their precondition). The next cycle picks them up.
     pub unresolved: Vec<RelPath>,
+    /// Tombstones garbage-collected at the end of the cycle (design §3), on
+    /// A and on B.
+    pub collected: [usize; 2],
 }
 
 impl SyncReport {
@@ -88,6 +94,13 @@ impl Engine {
     /// Overrides [`MAX_ROUNDS`] (at least 1).
     pub fn max_rounds(mut self, rounds: usize) -> Engine {
         self.max_rounds = rounds.max(1);
+        self
+    }
+
+    /// Overrides [`DEFAULT_TOMBSTONE_RETENTION`]: how long both sides must
+    /// have held a deletion before its tombstones are collected.
+    pub fn tombstone_retention(mut self, retention: Duration) -> Engine {
+        self.tombstone_retention = retention;
         self
     }
 
@@ -115,6 +128,7 @@ impl Engine {
             errors: BTreeMap::new(),
             unmanaged: BTreeSet::new(),
             adopt_asked: BTreeSet::new(),
+            last: None,
         };
         cycle.scan(&scope)?;
         let mut round = 0;
@@ -146,6 +160,9 @@ impl Engine {
                 cycle.report.rounds += 1;
                 cycle.execute(&todo)?;
             }
+        }
+        if let Some((a, b)) = cycle.last.take() {
+            cycle.record_sync(&a, &b, self.tombstone_retention)?;
         }
         let mut report = cycle.report;
         report.errors = cycle.errors.into_iter().collect();
@@ -182,6 +199,9 @@ struct Cycle<'r> {
     unmanaged: BTreeSet<RelPath>,
     /// Symlinks a replica was asked to adopt (`-K`) this cycle.
     adopt_asked: BTreeSet<(Side, RelPath)>,
+    /// The snapshots the last reconcile compared: the state the cycle ends
+    /// in, since nothing ran after it.
+    last: Option<(Snapshot, Snapshot)>,
 }
 
 /// How a step went.
@@ -247,7 +267,34 @@ impl Cycle<'_> {
             }
         }
         log_resolutions(&todo, [self.a.id(), self.b.id()]);
+        self.last = Some((a, b));
         Ok(todo)
+    }
+
+    /// Tells each replica how the cycle ended at its tombstones, so it can
+    /// collect them (design §3).
+    fn record_sync(&mut self, a: &Snapshot, b: &Snapshot, retention: Duration) -> Result<()> {
+        fn seen(
+            ours: &Snapshot,
+            peer: &Snapshot,
+        ) -> Vec<(RelPath, crate::index::VersionVector, PeerState)> {
+            ours.entries()
+                .filter(|(_, e)| e.kind == Kind::Tombstone)
+                .map(|(path, e)| {
+                    let state = match peer.get(path) {
+                        None => PeerState::Absent,
+                        Some(p) if p.kind == Kind::Tombstone => PeerState::Tombstone(p.vv.clone()),
+                        Some(_) => PeerState::Live,
+                    };
+                    (path.clone(), e.vv.clone(), state)
+                })
+                .collect()
+        }
+        let removed = self.a.record_sync(b.replica(), seen(a, b), retention)?;
+        self.report.collected[0] = removed.len();
+        let removed = self.b.record_sync(a.replica(), seen(b, a), retention)?;
+        self.report.collected[1] = removed.len();
+        Ok(())
     }
 
     /// `-K` (design §4.3): where one side has a real directory and the other

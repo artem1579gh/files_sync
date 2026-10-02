@@ -13,7 +13,9 @@ use rustix::fs::{AtFlags, CWD, Mode, OFlags, RenameFlags, ResolveFlags, StatxFla
 use rustix::io::Errno;
 
 use crate::error::{Error, Result};
+use crate::fs::lease::Lease;
 use crate::fs::root::Root;
+use crate::fs::stat::Fingerprint;
 
 /// Name prefix of probe files; inside the reserved `.~fsync.` namespace.
 pub const PROBE_PREFIX: &str = ".~fsync.probe.";
@@ -438,25 +440,10 @@ impl<'a> Probe<'a> {
     /// can be disabled (`fs.leases-enable`), unsupported by the filesystem, or
     /// refused because some other fd has the file open.
     fn probe_leases(&self, name: &[u8]) -> bool {
-        let Ok(fd) = rustix::fs::openat(
-            self.root,
-            name,
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        ) else {
+        let Ok(fp) = Fingerprint::at(self.root, name) else {
             return false;
         };
-        let raw = fd.as_raw_fd();
-        // SAFETY: fcntl on an fd we own, with integer arguments only.
-        unsafe {
-            if libc::fcntl(raw, libc::F_SETLEASE, libc::F_WRLCK) != 0 {
-                tracing::debug!(err = %std::io::Error::last_os_error(), "F_SETLEASE unavailable");
-                return false;
-            }
-            let held = libc::fcntl(raw, libc::F_GETLEASE) == libc::F_WRLCK;
-            libc::fcntl(raw, libc::F_SETLEASE, libc::F_UNLCK);
-            held
-        }
+        Lease::take(self.root, name, &fp).is_some_and(|lease| lease.held())
     }
 
     /// Unlinks every probe name that still holds an inode we created. Anything

@@ -14,6 +14,8 @@ use crate::engine::{Engine, Side, SyncReport};
 use crate::fs::caps::Caps;
 use crate::fs::commit::Quarantine;
 use crate::replica::LocalReplica;
+use crate::sandbox;
+use crate::status::PairStatus;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -21,6 +23,11 @@ use crate::replica::LocalReplica;
     about = "Race-free two-way file synchronizer with rsync symlink semantics"
 )]
 struct Cli {
+    /// With sync, daemon and status: confine the process with landlock, so
+    /// it may write only beneath the pair's replica roots and its state
+    /// directory (Linux ≥ 5.13).
+    #[arg(long, global = true)]
+    sandbox: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -73,8 +80,13 @@ pub fn run() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Sync { once: true, pair } => {
-            let (cfg, [mut a, mut b]) = open_pair(&pair)?;
-            let report = Engine::new().sync_once(&mut a, &mut b)?;
+            let (cfg, pair_dir) = load_pair(&pair)?;
+            if cli.sandbox {
+                sandbox(&cfg, &pair_dir)?;
+            }
+            let [mut a, mut b] = open_pair(&cfg, &pair_dir)?;
+            let engine = Engine::new().tombstone_retention(cfg.tombstone_retention());
+            let report = engine.sync_once(&mut a, &mut b)?;
             drain_quarantine(&mut [&mut a, &mut b]);
             print_report(&cfg, &report);
             if !report.is_converged() {
@@ -89,11 +101,20 @@ pub fn run() -> anyhow::Result<()> {
             bail!("`sync` requires --once; use `daemon` for continuous sync")
         }
         Command::Daemon { pair } => {
-            // Before any thread starts, so every thread inherits the mask.
+            let (cfg, pair_dir) = load_pair(&pair)?;
+            // Before any thread starts, so every thread is confined and
+            // inherits the signal mask.
+            if cli.sandbox {
+                sandbox(&cfg, &pair_dir)?;
+            }
             let stop = daemon::shutdown_signals()?;
-            let (cfg, [mut a, mut b]) = open_pair(&pair)?;
+            let [mut a, mut b] = open_pair(&cfg, &pair_dir)?;
             tracing::info!(pair = %cfg.name, "daemon started");
-            let stats = Daemon::new().run(&mut a, &mut b, &stop)?;
+            let engine = Engine::new().tombstone_retention(cfg.tombstone_retention());
+            let stats = Daemon::new()
+                .engine(engine)
+                .status_dir(pair_dir.clone())
+                .run(&mut a, &mut b, &stop)?;
             drain_quarantine(&mut [&mut a, &mut b]);
             println!(
                 "daemon for {:?} stopped: {} cycle(s), {} change(s) applied, {} conflict(s)",
@@ -101,22 +122,88 @@ pub fn run() -> anyhow::Result<()> {
             );
             Ok(())
         }
-        Command::Status { .. } => not_implemented("status"),
+        Command::Status { pair } => {
+            let (cfg, pair_dir) = load_pair(&pair)?;
+            if cli.sandbox {
+                sandbox(&cfg, &pair_dir)?;
+            }
+            let st = PairStatus::load(&cfg, &pair_dir)?;
+            print_status(&cfg, &st);
+            Ok(())
+        }
     }
 }
 
-/// Loads a pair's config and opens both replicas (which probes, logs and
-/// checks their roots' capabilities).
-fn open_pair(pair: &str) -> anyhow::Result<(PairConfig, [LocalReplica; 2])> {
+/// Loads a pair's config; returns it with the pair's state directory.
+fn load_pair(pair: &str) -> anyhow::Result<(PairConfig, PathBuf)> {
     let state_home = config::state_home()?;
     let cfg = PairConfig::load(&state_home, pair)?;
     let pair_dir = config::pair_dir(&state_home, pair)?;
+    Ok((cfg, pair_dir))
+}
+
+/// Opens both replicas (which probes, logs and checks their roots'
+/// capabilities, and replays their journals).
+fn open_pair(cfg: &PairConfig, pair_dir: &Path) -> anyhow::Result<[LocalReplica; 2]> {
     let open = |r: &config::ReplicaConfig| {
-        LocalReplica::open(r, &pair_dir)
+        LocalReplica::open(r, pair_dir)
             .with_context(|| format!("replica root {}", r.root.display()))
     };
-    let replicas = [open(&cfg.replicas[0])?, open(&cfg.replicas[1])?];
-    Ok((cfg, replicas))
+    Ok([open(&cfg.replicas[0])?, open(&cfg.replicas[1])?])
+}
+
+/// `--sandbox`: from now on, writes only beneath the roots and `pair_dir`.
+fn sandbox(cfg: &PairConfig, pair_dir: &Path) -> anyhow::Result<()> {
+    let dirs = [
+        cfg.replicas[0].root.as_path(),
+        cfg.replicas[1].root.as_path(),
+        pair_dir,
+    ];
+    let abi = sandbox::restrict(&dirs).context("--sandbox")?;
+    tracing::info!(
+        abi,
+        "landlock sandbox: writes confined to the roots and the state directory"
+    );
+    Ok(())
+}
+
+fn print_status(cfg: &PairConfig, st: &PairStatus) {
+    let when = |ns: i64| {
+        jiff::Timestamp::from_nanosecond(i128::from(ns))
+            .map(|t| {
+                t.to_zoned(jiff::tz::TimeZone::system())
+                    .strftime("%Y-%m-%d %H:%M:%S %Z")
+                    .to_string()
+            })
+            .unwrap_or_else(|_| format!("{ns} ns"))
+    };
+    print!("pair {:?}", cfg.name);
+    if st.from_daemon {
+        print!(" (daemon running; its report from {})", when(st.taken_ns));
+    }
+    println!();
+    for ((side, r), s) in ["a", "b"].iter().zip(&cfg.replicas).zip(&st.replicas) {
+        println!("  {side}: {} (replica {})", r.root.display(), r.id);
+        println!(
+            "    index:       {} entries ({} tombstones)",
+            s.entries, s.tombstones
+        );
+        println!("    conflicts:   {}", s.conflicts.len());
+        for c in &s.conflicts {
+            println!("      {c}");
+        }
+        println!("    quarantined: {}", s.quarantined);
+        if s.unfinished > 0 {
+            println!(
+                "    unfinished:  {} (replayed on the next run)",
+                s.unfinished
+            );
+        }
+        match s.last_sync_ns {
+            Some(ns) => println!("    last sync:   {}", when(ns)),
+            None => println!("    last sync:   never"),
+        }
+    }
 }
 
 /// Waits until the replaced old inodes in quarantine can be unlinked
@@ -187,10 +274,6 @@ fn probe_root(root: &Path) -> anyhow::Result<Caps> {
     caps.require_minimum()
         .with_context(|| format!("replica root {}", root.display()))?;
     Ok(caps)
-}
-
-fn not_implemented(what: &str) -> anyhow::Result<()> {
-    bail!("`{what}`: not implemented")
 }
 
 /// Logs to stderr, filtered by `RUST_LOG` (default `info`).

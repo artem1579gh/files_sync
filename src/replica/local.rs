@@ -40,8 +40,8 @@ use crate::fs::commit::{
 use crate::fs::root::{follow_at, path_err};
 use crate::fs::{FileKind, Fingerprint, Recheck, RelPath, Root, StableReader, tmpname};
 use crate::index::{
-    Entry, IndexStore, Intent, IntentId, Kind, LinkInfo, LocalMeta, ReadTxn, UnmanagedReason,
-    VersionVector, sync_mode,
+    Entry, IndexStore, Intent, IntentId, Kind, LinkInfo, LocalMeta, PeerState, ReadTxn,
+    UnmanagedReason, VersionVector, sync_mode,
 };
 use crate::replica::{ContentReader, Op, Outcome, Precondition, Replica, wire};
 use crate::scan::{DEFAULT_RACY_WINDOW, ScanStats, Scanner, Scope};
@@ -1025,6 +1025,26 @@ impl Replica for LocalReplica {
     fn adopt(&mut self, path: &RelPath) -> Result<bool> {
         self.adopt_link(path)
     }
+
+    fn record_sync(
+        &mut self,
+        peer: ReplicaId,
+        tombstones: Vec<(RelPath, VersionVector, PeerState)>,
+        retention: Duration,
+    ) -> Result<Vec<RelPath>> {
+        let removed = self
+            .index
+            .record_sync(peer, &tombstones, now_ns(), retention)?;
+        if !removed.is_empty() {
+            tracing::debug!(root = %self.root.path().display(), count = removed.len(), "tombstones collected");
+        }
+        Ok(removed)
+    }
+}
+
+/// Wall-clock time in ns since the Unix epoch.
+fn now_ns() -> i64 {
+    jiff::Timestamp::now().as_nanosecond() as i64
 }
 
 /// What a commit led to.
@@ -1739,6 +1759,9 @@ mod tests {
         assert_eq!(fx.get("f"), e, "index untouched");
 
         // Modified while we commit (between the check and the exchange).
+        // Without a lease, which would make the hook's open wait for the
+        // lease break time (fs::commit tests that case).
+        fx.r.caps_mut().leases = false;
         fx.scan();
         let e = fx.get("f");
         let user = fx.p("f");

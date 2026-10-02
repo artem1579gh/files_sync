@@ -107,6 +107,26 @@ pub fn parse(name: &[u8]) -> Option<(TmpKind, TmpId)> {
     Some((kind, TmpId(id)))
 }
 
+/// Whether `name` is a conflict copy's name ([`conflict_name`]): it holds
+/// `.sync-conflict-YYYYMMDD-HHMMSS-<ID7>`, followed by its end or a `.`.
+pub fn is_conflict_name(name: &[u8]) -> bool {
+    const MARKER: &[u8] = b".sync-conflict-";
+    let digits = |b: &[u8]| b.iter().all(u8::is_ascii_digit);
+    let hex = |b: &[u8]| b.iter().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'));
+    (0..name.len()).any(|i| {
+        let Some(rest) = name[i..].strip_prefix(MARKER) else {
+            return false;
+        };
+        rest.len() >= 23
+            && digits(&rest[..8])
+            && rest[8] == b'-'
+            && digits(&rest[9..15])
+            && rest[15] == b'-'
+            && hex(&rest[16..23])
+            && matches!(rest.get(23), None | Some(b'.'))
+    })
+}
+
 /// `stem.sync-conflict-YYYYMMDD-HHMMSS-<ID7>.ext` (design §6.2).
 ///
 /// `split_ext` is false for directories and symlinks, which never get an
@@ -216,5 +236,22 @@ mod tests {
         let n = conflict_name(&[&b"a."[..], &long[..]].concat(), true, now, id);
         assert_eq!(n.len(), NAME_MAX);
         assert!(n.ends_with(b"-0000000"));
+    }
+    #[test]
+    fn conflict_names_are_recognised() {
+        let now = DateTime::constant(2026, 10, 2, 13, 4, 5, 0);
+        let id = ReplicaId(0xabcdef0123456789);
+        for (name, split) in [(&b"f.txt"[..], true), (b"dir", false), (b".hidden", true)] {
+            assert!(is_conflict_name(&conflict_name(name, split, now, id)));
+        }
+        for name in [
+            &b"f.txt"[..],
+            b"f.sync-conflict-.txt",
+            b"f.sync-conflict-20261002-130405-abcdef.txt",
+            b"f.sync-conflict-20261002-130405-abcdef0x",
+            b"f.sync-conflict-2026100a-130405-abcdef0",
+        ] {
+            assert!(!is_conflict_name(name), "{}", name.escape_ascii());
+        }
     }
 }

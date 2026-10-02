@@ -384,7 +384,12 @@ struct Run {
 }
 
 fn run(op: Op, v: Variant, caps: Caps, inj: Option<Injection>) -> (World, Run) {
-    let w = World::new(op, caps);
+    let mut w = World::new(op, caps);
+    if v == Variant::Plain {
+        // Nobody has the file open, so replace and delete take a lease and
+        // the sweep unlinks under one (`quarantine.leased`).
+        w.held = None;
+    }
     let outside_before = snapshot(w.outside.path());
     let _trigger = w.arm_trigger(op, v);
     let (guard, flag) = match inj {

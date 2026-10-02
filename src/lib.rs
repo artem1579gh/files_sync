@@ -9,7 +9,9 @@ pub mod error;
 pub mod fs;
 pub mod index;
 pub mod replica;
+pub mod sandbox;
 pub mod scan;
+pub mod status;
 pub mod symlink;
 pub mod watch;
 

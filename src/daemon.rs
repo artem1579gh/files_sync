@@ -10,7 +10,8 @@
 //! - a **retry**: paths a cycle left unresolved are synced again after
 //!   [`Daemon::RETRY_DELAY`], even if no new event names them;
 //! - a **quarantine deadline**: replaced old inodes are swept when their
-//!   grace period ends (§5.3 step 4(f));
+//!   grace period ends (§5.3 step 4(f)); they are also swept right after
+//!   each cycle, which unlinks those a write lease can be taken on;
 //! - the **stop** channel (a message, or its sender dropped).
 //!
 //! Our own writes produce inotify events too. They cause one more cycle
@@ -18,6 +19,7 @@
 //! (§5.3 step 5), so it applies nothing: no echo.
 
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, select};
@@ -27,6 +29,7 @@ use crate::error::{Error, Result};
 use crate::fs::RelPath;
 use crate::replica::{LocalReplica, Replica};
 use crate::scan::Scope;
+use crate::status::PairStatus;
 use crate::watch::Hint;
 
 /// Runs a pair of replicas continuously.
@@ -36,6 +39,7 @@ pub struct Daemon {
     rescan_every: Duration,
     retry_delay: Duration,
     reports: Option<Sender<CycleReport>>,
+    status_dir: Option<PathBuf>,
 }
 
 impl Default for Daemon {
@@ -45,6 +49,7 @@ impl Default for Daemon {
             rescan_every: Daemon::DEFAULT_RESCAN,
             retry_delay: Daemon::RETRY_DELAY,
             reports: None,
+            status_dir: None,
         }
     }
 }
@@ -126,6 +131,21 @@ impl Daemon {
         self
     }
 
+    /// Saves the pair's [`PairStatus`] in `pair_dir` after every cycle and
+    /// quarantine sweep, for `status` (which cannot open the indexes while
+    /// the daemon holds them).
+    pub fn status_dir(mut self, pair_dir: PathBuf) -> Daemon {
+        self.status_dir = Some(pair_dir);
+        self
+    }
+
+    fn save_status(&self, a: &LocalReplica, b: &LocalReplica) {
+        let Some(dir) = &self.status_dir else { return };
+        if let Err(e) = PairStatus::of(a, b).and_then(|st| st.save(dir)) {
+            tracing::warn!(error = %e, "cannot save the status report");
+        }
+    }
+
     /// Syncs `a` and `b` until `stop` receives a message or is closed.
     ///
     /// Fails only when a cycle fails as a whole (an index or root failure);
@@ -146,6 +166,7 @@ impl Daemon {
         let mut next_full = Instant::now() + self.rescan_every;
         let mut retry: Option<(Instant, Vec<RelPath>)> = None;
         loop {
+            let mut changed = false;
             let now = Instant::now();
             if now >= next_full {
                 todo.full = true;
@@ -170,14 +191,21 @@ impl Daemon {
                 if let Some(tx) = &self.reports {
                     let _ = tx.send(report);
                 }
+                changed = true;
             }
+            // Right after a cycle too: what can be leased goes at once.
+            let after_cycle = changed;
             for r in [&mut *a, &mut *b] {
                 if r.quarantine()
                     .next_deadline()
-                    .is_some_and(|d| d <= Instant::now())
+                    .is_some_and(|d| after_cycle || d <= Instant::now())
                 {
                     r.sweep_quarantine();
+                    changed = true;
                 }
+            }
+            if changed {
+                self.save_status(a, b);
             }
 
             let wake = [

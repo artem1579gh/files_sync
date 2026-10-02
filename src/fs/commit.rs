@@ -53,6 +53,7 @@ use crate::config::ReplicaId;
 use crate::error::{Error, Result};
 use crate::fs::caps::Caps;
 use crate::fs::hooks::point;
+use crate::fs::lease::Lease;
 use crate::fs::root::{RESOLVE, RelPath, Root, path_err};
 use crate::fs::stat::{Discard, FileKind, Fingerprint, stable_read};
 use crate::fs::tmpname::{self, TmpId, TmpKind};
@@ -1246,8 +1247,9 @@ fn commit_replace(
     };
     point("replace.pinned");
 
-    // (b) T18: take an F_WRLCK lease on an O_RDONLY fd for `old` here when
-    // `ctx.caps.leases`, and give up with PreconditionFailed if it is refused.
+    // (b) Lease the old file if we can, so (d) can tell whether anyone
+    // opened it in between.
+    let lease = take_lease(ctx, t, &old);
     point("replace.before_exchange");
 
     // (c) Exchange: N goes to `name`, the old occupant to the temp name.
@@ -1270,11 +1272,20 @@ fn commit_replace(
     point("replace.after_exchange");
 
     // (d) Verify what came out.
-    match verify_old(t, &staged.name, &old, expected, "replace.before_rehash") {
+    let verified = verify_old(
+        t,
+        &staged.name,
+        &old,
+        expected,
+        lease.as_ref(),
+        "replace.before_rehash",
+    );
+    drop(lease);
+    match verified {
         Verified::Unchanged => {
             point("replace.verified");
             // (f) Quarantine the old inode.
-            quarantine.add(t, &staged.name, rec.old(), old, pin, rec.id())?;
+            quarantine.add(ctx, t, &staged.name, rec.old(), old, pin, rec.id())?;
             point("replace.quarantined");
         }
         Verified::Gone => {
@@ -1283,6 +1294,16 @@ fn commit_replace(
         Verified::Changed => return undo(ctx, t, staged),
     }
     t.finish(&staged.fp)
+}
+
+/// §5.3 step 4(b): a write lease on the pinned old file `old`, if the
+/// filesystem supports leases and nobody else has the file open. Without one,
+/// the quarantine's grace period covers writers holding an fd (§5.10).
+fn take_lease(ctx: &Ctx<'_>, t: &Target<'_>, old: &Fingerprint) -> Option<Lease> {
+    if !ctx.caps.leases {
+        return None;
+    }
+    Lease::take(t.parent(), t.name, old)
 }
 
 /// §5.3 step 4(a): pins the object at the target name with `O_PATH|O_NOFOLLOW`
@@ -1322,11 +1343,16 @@ enum Verified {
 /// ctime is not compared, since the rename itself bumps it. Errors count as
 /// "changed", so the caller undoes the rename. `rehash_point` is the hook
 /// point reached before a rehash.
+///
+/// With a `lease` (taken on the old file before the rename), the rehash reads
+/// through the lease's fd, and the lease must still be unbroken at the end:
+/// otherwise someone opened the file in between and may be writing to it.
 fn verify_old(
     t: &Target<'_>,
     tmp: &[u8],
     old: &Fingerprint,
     expected: &Expected,
+    lease: Option<&Lease>,
     rehash_point: &'static str,
 ) -> Verified {
     let out = match t.stat(tmp) {
@@ -1345,7 +1371,11 @@ fn verify_old(
         && (expected.racy || old.size < REHASH_BELOW)
     {
         point(rehash_point);
-        match stable_read(t.parent(), tmp, &mut Discard) {
+        let rehashed = match lease {
+            Some(lease) => lease.hash(t.parent(), tmp),
+            None => stable_read(t.parent(), tmp, &mut Discard),
+        };
+        match rehashed {
             Ok((fp, h)) if same_object(old, &fp) && h == hash => {}
             Ok(_) => return Verified::Changed,
             Err(e) => {
@@ -1354,7 +1384,10 @@ fn verify_old(
             }
         }
     }
-    // T18: if a lease was taken, F_GETLEASE must still return F_WRLCK.
+    if lease.is_some_and(|l| !l.held()) {
+        tracing::debug!(path = %t.path, "lease broken: the old file was opened during the commit");
+        return Verified::Changed;
+    }
     Verified::Unchanged
 }
 
@@ -1433,7 +1466,7 @@ fn commit_delete(
     point("delete.pinned");
 
     rec.begin()?;
-    // T18: take an F_WRLCK lease here when `ctx.caps.leases`.
+    let lease = take_lease(ctx, t, &old);
     point("delete.before_rename");
 
     // 2. Move it aside; NOREPLACE so a reserved name is never overwritten.
@@ -1453,11 +1486,20 @@ fn commit_delete(
     point("delete.after_rename");
 
     // 3. Verify what was moved.
-    match verify_old(t, &del, &old, expected, "delete.before_rehash") {
+    let verified = verify_old(
+        t,
+        &del,
+        &old,
+        expected,
+        lease.as_ref(),
+        "delete.before_rehash",
+    );
+    drop(lease);
+    match verified {
         Verified::Unchanged => {
             point("delete.verified");
             // 4. Quarantine rather than unlink, for writers holding an fd.
-            quarantine.add(t, &del, rec.old(), old, pin, rec.id())?;
+            quarantine.add(ctx, t, &del, rec.old(), old, pin, rec.id())?;
             point("delete.quarantined");
         }
         Verified::Gone => {
@@ -1492,7 +1534,8 @@ fn commit_rename(
     point("rename.pinned");
 
     rec.begin()?;
-    // T18: take an F_WRLCK lease here when `ctx.caps.leases`.
+    // No lease: the object stays user data under its new name, so a writer
+    // holding an fd only changes the conflict copy.
     point("rename.before_rename");
 
     // 2. Move it aside to a reserved name, so what we verify next can only
@@ -1513,7 +1556,7 @@ fn commit_rename(
     point("rename.after_rename");
 
     // 3. Verify what was moved; put it back if it was modified.
-    match verify_old(t, &tmp, &old, expected, "rename.before_rehash") {
+    match verify_old(t, &tmp, &old, expected, None, "rename.before_rehash") {
         Verified::Unchanged => point("rename.verified"),
         Verified::Gone => return Err(t.unstable("renamed object vanished from its temp name")),
         Verified::Changed => {
@@ -1671,9 +1714,9 @@ pub fn recover(
         }
         (IntentOp::Replace | IntentOp::Materialize | IntentOp::Delete, Found::Expected(pin)) => {
             let exp = intent.expected.as_ref().expect("found the expected object");
-            match verify_old(&t, tmp, &exp.fp, exp, "recover.before_rehash") {
+            match verify_old(&t, tmp, &exp.fp, exp, None, "recover.before_rehash") {
                 Verified::Unchanged => {
-                    quarantine.add(&t, tmp, quarantine_name(intent), exp.fp, pin, id)?;
+                    quarantine.add(ctx, &t, tmp, quarantine_name(intent), exp.fp, pin, id)?;
                     rep.quarantined += 1;
                 }
                 Verified::Changed => put_back(ctx, &t, tmp, intent, &mut rep)?,
@@ -1688,7 +1731,7 @@ pub fn recover(
             Found::Absent => {}
             Found::Expected(pin) => {
                 let exp = intent.expected.as_ref().expect("found the expected object");
-                quarantine.add(&t, old, old, exp.fp, pin, id)?;
+                quarantine.add(ctx, &t, old, old, exp.fp, pin, id)?;
                 rep.quarantined += 1;
             }
             Found::Staged | Found::Other => {
@@ -1805,9 +1848,15 @@ fn put_back(
 ///
 /// Someone may still hold an fd (or a writable mmap) on a replaced file and
 /// write through it after the exchange. So an old inode is only unlinked once
-/// its grace period has passed with mtime and size unchanged; if it changed,
-/// [`Quarantine::sweep`] renames it to a conflict copy instead. (T18 adds the
-/// faster path: unlink as soon as a write lease can be taken.)
+/// nobody can write to it any more, or its grace period has passed, and in
+/// both cases only with mtime and size unchanged; if it changed,
+/// [`Quarantine::sweep`] renames it to a conflict copy instead.
+///
+/// "Nobody can write to it" means a write lease can be taken on it
+/// ([`Lease`], when the filesystem supports leases): no fd or mmap is left,
+/// and none can be opened until the lease is released. A sweep then checks
+/// and unlinks it while holding the lease, before its deadline if need be,
+/// so no write can slip in between the check and the unlink.
 ///
 /// Each entry belongs to an intent in the journal, which outlives a crash
 /// (§5.8): the caller keeps it while [`Quarantine::holds`] it, and forgets it
@@ -1839,6 +1888,8 @@ struct Pending {
     since: Instant,
     /// The journal intent that records this entry.
     intent: IntentId,
+    /// Try a write lease before unlinking ([`Caps::leases`] of its replica).
+    leases: bool,
 }
 
 /// What a [`Quarantine::sweep`] did.
@@ -1892,7 +1943,7 @@ impl Quarantine {
         self.grace = grace;
     }
 
-    /// When the earliest entry becomes due for unlinking.
+    /// When the earliest entry becomes due for unlinking (without a lease).
     pub fn next_deadline(&self) -> Option<Instant> {
         self.pending.iter().map(|p| p.since + self.grace).min()
     }
@@ -1905,8 +1956,10 @@ impl Quarantine {
     /// Moves the old inode at the target's reserved name `from` to its
     /// quarantine name `to` (unless it is there already) and starts its grace
     /// period.
+    #[allow(clippy::too_many_arguments)]
     fn add(
         &mut self,
+        ctx: &Ctx<'_>,
         t: &Target<'_>,
         from: &[u8],
         to: &[u8],
@@ -1945,13 +1998,15 @@ impl Quarantine {
             _pin: pin,
             since: Instant::now(),
             intent,
+            leases: ctx.caps.leases,
         });
         Ok(())
     }
 
     /// Processes every entry: one modified since the replace becomes a
-    /// conflict copy; one unchanged past its deadline is unlinked; the rest
-    /// wait. Errors are logged and the entry is retried on the next sweep.
+    /// conflict copy; one unchanged that can be leased, or is past its
+    /// deadline, is unlinked; the rest wait. Errors are logged and the entry
+    /// is retried on the next sweep.
     pub fn sweep(&mut self) -> SweepReport {
         let now = Instant::now();
         let grace = self.grace;
@@ -1990,25 +2045,44 @@ impl Quarantine {
 }
 
 impl Pending {
-    fn verdict(&self, due: bool) -> Result<Verdict> {
+    /// Decides what to do with the entry. An `Unlink` comes with the lease it
+    /// was decided under, if any, to hold until the unlink is done.
+    fn verdict(&self, due: bool) -> Result<(Verdict, Option<Lease>)> {
         let Some(fp) = Fingerprint::at_opt(self.parent.as_fd(), &self.name)? else {
-            return Ok(Verdict::Drop);
+            return Ok((Verdict::Drop, None));
         };
         if !fp.same_file(&self.fp) {
-            return Ok(Verdict::Drop);
+            return Ok((Verdict::Drop, None));
         }
         if !same_object(&self.fp, &fp) {
-            return Ok(Verdict::Conflict);
+            return Ok((Verdict::Conflict, None));
         }
-        // T18: also Unlink before the deadline once a write lease can be taken.
-        Ok(if due { Verdict::Unlink } else { Verdict::Keep })
+        let lease = if self.leases {
+            Lease::take(self.parent.as_fd(), &self.name, &self.fp)
+        } else {
+            None
+        };
+        let Some(lease) = lease else {
+            return Ok((if due { Verdict::Unlink } else { Verdict::Keep }, None));
+        };
+        point("quarantine.leased");
+        // Nobody can write now; check for a write before the lease.
+        if !same_object(&self.fp, &lease.fingerprint()?) {
+            Ok((Verdict::Conflict, None))
+        } else if lease.held() {
+            Ok((Verdict::Unlink, Some(lease)))
+        } else {
+            // Opened right after the lease was taken: look again next time.
+            Ok((if due { Verdict::Unlink } else { Verdict::Keep }, None))
+        }
     }
 
     /// Returns whether the entry is finished.
     fn sweep(&self, due: bool, replica: ReplicaId, report: &mut SweepReport) -> Result<bool> {
         let parent = self.parent.as_fd();
         let shown = || format!("{}/{}", self.dir, self.name.escape_ascii());
-        match self.verdict(due)? {
+        let (verdict, _lease) = self.verdict(due)?;
+        match verdict {
             Verdict::Keep => Ok(false),
             Verdict::Drop => {
                 tracing::warn!(name = %shown(), "quarantined object vanished or was replaced; forgetting it");
@@ -2064,10 +2138,20 @@ mod tests {
     }
 
     impl Fx {
+        /// Without leases: most tests open the old file from a hook, which
+        /// would wait for a lease to be released (`leased` tests that).
         fn new() -> Fx {
+            let mut fx = Fx::leased();
+            fx.caps.leases = false;
+            fx
+        }
+
+        /// With the probed capabilities, leases included.
+        fn leased() -> Fx {
             let dir = tempfile::tempdir().unwrap();
             let root = Root::open(dir.path()).unwrap();
             let caps = Caps::probe(root.fd()).unwrap();
+            assert!(caps.leases, "tmpfs supports leases");
             let journal = Rc::new(Journal::in_memory().unwrap());
             Fx {
                 dir,
@@ -2639,6 +2723,163 @@ mod tests {
         assert_eq!(report.dropped, 1);
         assert!(q.is_empty());
         assert_eq!(fs::read(&old).unwrap(), b"someone else's");
+    }
+
+    // ----- T18: leases -------------------------------------------------
+
+    /// Waits until the kernel reports the lease on inode `ino` as breaking
+    /// (someone's `open` is waiting for it).
+    fn wait_for_lease_break(ino: u64) {
+        let t0 = Instant::now();
+        loop {
+            let locks = fs::read_to_string("/proc/locks").unwrap();
+            let pat = format!(":{ino} ");
+            if locks
+                .lines()
+                .any(|l| l.contains("LEASE") && l.contains("BREAKING") && l.contains(&pat))
+            {
+                return;
+            }
+            assert!(
+                t0.elapsed() < Duration::from_secs(10),
+                "no lease break:\n{locks}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// From a hook: a writer opens `path` (blocking on our lease) and
+    /// appends `data` once it gets the file; the hook returns once the open
+    /// is waiting.
+    fn open_during_lease(
+        path: PathBuf,
+        data: &'static [u8],
+    ) -> (
+        impl FnOnce() + 'static,
+        Rc<RefCell<Option<std::thread::JoinHandle<()>>>>,
+    ) {
+        let writer: Rc<RefCell<Option<std::thread::JoinHandle<()>>>> = Rc::default();
+        let slot = writer.clone();
+        let hook = move || {
+            let ino = fs::symlink_metadata(&path).unwrap().ino();
+            let p = path.clone();
+            *slot.borrow_mut() = Some(std::thread::spawn(move || append(&p, data)));
+            wait_for_lease_break(ino);
+        };
+        (hook, writer)
+    }
+
+    #[test]
+    fn leased_replace_and_delete_unlink_at_the_first_sweep() {
+        let fx = Fx::leased();
+        let mut q = Quarantine::new(REPLICA, Duration::from_secs(3600));
+        let exp = fx.user_file("f", b"old");
+        hooks::start_trace();
+        applied(replace(&fx, &mut q, "f", &exp, b"new").unwrap());
+        let exp = fx.user_file("g", b"gone");
+        assert_eq!(del(&fx, &mut q, "g", &exp).unwrap(), Outcome::Removed);
+        assert_eq!(q.len(), 2);
+        let report = q.sweep();
+        assert_eq!(report.removed, 2, "{report:?}");
+        assert!(q.is_empty());
+        assert!(fx.leftovers().is_empty());
+        let trace = hooks::take_trace();
+        assert_eq!(
+            trace.iter().filter(|p| **p == "quarantine.leased").count(),
+            2,
+            "{trace:?}"
+        );
+        assert_eq!(fs::read(fx.p("f")).unwrap(), b"new");
+    }
+
+    /// Done-when: an open fd keeps the old inode quarantined; once it is
+    /// closed, the next sweep unlinks it without waiting for the deadline.
+    #[test]
+    fn open_fd_prevents_the_leased_unlink_until_closed() {
+        let fx = Fx::leased();
+        let mut q = Quarantine::new(REPLICA, Duration::from_secs(3600));
+        let exp = fx.user_file("f", b"old");
+        let reader = fs::File::open(fx.p("f")).unwrap();
+        applied(replace(&fx, &mut q, "f", &exp, b"new").unwrap());
+        assert_eq!(q.sweep(), SweepReport::default());
+        assert_eq!(q.len(), 1);
+        assert_eq!(fx.leftovers().len(), 1);
+        // A read-only fd never writes: once closed, the inode goes.
+        drop(reader);
+        let report = q.sweep();
+        assert_eq!(report.removed, 1, "{report:?}");
+        assert!(fx.leftovers().is_empty());
+
+        // A writer's fd: still a conflict copy after it wrote.
+        let exp = fx.user_file("f.txt", b"old");
+        let mut writer = fs::File::options()
+            .append(true)
+            .open(fx.p("f.txt"))
+            .unwrap();
+        applied(replace(&fx, &mut q, "f.txt", &exp, b"new").unwrap());
+        assert_eq!(q.sweep(), SweepReport::default());
+        writer.write_all(b" late").unwrap();
+        drop(writer);
+        let report = q.sweep();
+        assert_eq!(report.conflicts.len(), 1, "{report:?}");
+        let name = report.conflicts[0]
+            .as_os_str()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(fs::read(fx.p(&name)).unwrap(), b"old late");
+        assert!(q.is_empty());
+    }
+
+    /// Someone opens the old file while we hold the lease (between (b) and
+    /// (c)): the broken lease fails the verification, the exchange is
+    /// undone, and the opener gets the file at its name.
+    #[test]
+    fn open_during_leased_replace_is_undone() {
+        let fx = Fx::leased();
+        let exp = fx.user_file("f", b"old");
+        let (hook, writer) = open_during_lease(fx.p("f"), b"+late");
+        let _g = hooks::once("replace.before_exchange", hook);
+        let mut q = quarantine();
+        assert_eq!(
+            replace(&fx, &mut q, "f", &exp, b"new").unwrap(),
+            Outcome::PreconditionFailed("changed during commit")
+        );
+        writer.borrow_mut().take().unwrap().join().unwrap();
+        assert_eq!(fs::read(fx.p("f")).unwrap(), b"old+late");
+        assert_eq!(fx.p("f").metadata().unwrap().ino(), exp.fp.ino);
+        assert!(q.is_empty());
+        assert!(fx.leftovers().is_empty());
+    }
+
+    #[test]
+    fn open_during_leased_delete_is_restored() {
+        let fx = Fx::leased();
+        let exp = fx.user_file("f", b"old");
+        let (hook, writer) = open_during_lease(fx.p("f"), b"+late");
+        let _g = hooks::once("delete.before_rename", hook);
+        let mut q = quarantine();
+        assert_eq!(
+            del(&fx, &mut q, "f", &exp).unwrap(),
+            Outcome::PreconditionFailed("changed during commit")
+        );
+        writer.borrow_mut().take().unwrap().join().unwrap();
+        assert_eq!(fs::read(fx.p("f")).unwrap(), b"old+late");
+        assert!(q.is_empty());
+        assert!(fx.leftovers().is_empty());
+    }
+
+    /// A symlink cannot be leased: it waits for its grace period.
+    #[test]
+    fn leased_quarantine_keeps_symlinks_for_the_grace_period() {
+        let fx = Fx::leased();
+        symlink("t", fx.p("l")).unwrap();
+        let exp = Expected::from(fx.root.stat(&rp("l")).unwrap());
+        let mut q = Quarantine::new(REPLICA, Duration::from_secs(3600));
+        applied(replace_symlink(&fx.ctx(), &mut q, &rp("l"), &exp, b"u").unwrap());
+        assert_eq!(q.sweep(), SweepReport::default());
+        q.set_grace(Duration::ZERO);
+        assert_eq!(q.sweep().removed, 1);
+        assert!(fx.leftovers().is_empty());
     }
 
     /// Both the old object and ours change around the exchange: the undo

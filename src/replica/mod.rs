@@ -10,6 +10,7 @@ pub mod local;
 pub use local::LocalReplica;
 
 use std::io::Read;
+use std::time::Duration;
 
 use crossbeam_channel::Receiver;
 use serde::{Deserialize, Serialize};
@@ -18,7 +19,7 @@ use crate::config::ReplicaId;
 use crate::error::Result;
 use crate::fs::RelPath;
 use crate::fs::commit::FileMeta;
-use crate::index::{Entry, Kind, LocalMeta, VersionVector};
+use crate::index::{Entry, Kind, LocalMeta, PeerState, VersionVector};
 use crate::scan::{ScanStats, Scope};
 use crate::watch::Hint;
 
@@ -75,6 +76,23 @@ pub trait Replica {
     fn adopt(&mut self, path: &RelPath) -> Result<bool> {
         let _ = path;
         Ok(false)
+    }
+
+    /// Ends a sync cycle with `peer`: records it (the last sync time) and
+    /// collects tombstones (design §3). `tombstones` lists this replica's
+    /// tombstones as the cycle ended, each with its version vector (checked
+    /// against the index, like a precondition) and what the peer held at its
+    /// path. A tombstone that every peer has acknowledged (by holding a
+    /// tombstone or nothing there) for `retention` is removed. Returns the
+    /// paths whose tombstones were removed.
+    fn record_sync(
+        &mut self,
+        peer: ReplicaId,
+        tombstones: Vec<(RelPath, VersionVector, PeerState)>,
+        retention: Duration,
+    ) -> Result<Vec<RelPath>> {
+        let _ = (peer, tombstones, retention);
+        Ok(Vec::new())
     }
 }
 

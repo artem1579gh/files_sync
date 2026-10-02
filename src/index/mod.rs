@@ -7,5 +7,5 @@ pub mod vv;
 
 pub use entry::{Entry, Kind, LinkInfo, LocalMeta, UnmanagedReason, sync_mode};
 pub use journal::{Intent, IntentId, IntentOp, IntentState, Journal};
-pub use store::{IndexStore, ReadTxn, WriteTxn};
+pub use store::{Ack, DEFAULT_TOMBSTONE_RETENTION, IndexStore, PeerState, ReadTxn, WriteTxn};
 pub use vv::{Ord4, VersionVector};

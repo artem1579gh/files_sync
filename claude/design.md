@@ -43,11 +43,13 @@ src/lib.rs
 src/cli.rs         clap: init, sync --once, daemon, status  [serve, --remote later]
 src/config.rs      pair config: roots, ReplicaIds, per-replica symlink policy flags
 src/daemon.rs
+src/status.rs      `status <pair>`: index size, conflict copies, quarantine, last sync (T18)
+src/sandbox.rs     --sandbox: landlock, writes only beneath the roots and the state directory (T18)
 src/fs/      root.rs     Root + openat2 parent resolution, fd-based readdir
              stat.rs     statx Fingerprint
              commit.rs   CAS create/replace/delete/symlink/mkdir/rmdir   <- the ONLY code that mutates replicas
              tmpname.rs  .~fsync.<id> naming
-             lease.rs    F_SETLEASE helpers
+             lease.rs    F_SETLEASE / F_GETLEASE (`Lease`)
              caps.rs     filesystem feature checks (creates and removes its own .~fsync.probe.* files:
                          the one sanctioned mutation outside commit.rs)
              hooks.rs    cfg(test) race-injection points
@@ -75,11 +77,15 @@ tests/       harness/, attack.rs, symlink_matrix.rs, stress.rs, crash.rs
 | logging | `tracing` + `tracing-subscriber` |
 | errors | `thiserror` (lib), `anyhow` (bin) |
 | timestamps in conflict names | `jiff` |
-| self-sandbox | `landlock` (optional) |
+| self-sandbox | raw landlock syscalls through `libc` (the `landlock` crate was not needed) |
 | network (later) | `rustls` (blocking, over std TcpStream) |
 | dev-only | `tempfile`, `proptest` |
 
-**State directory:** `$XDG_STATE_HOME/fsync/<pair>/<replica>.redb` holds the index and journal. It lives outside the replica roots.
+**State directory:** `$XDG_STATE_HOME/fsync/<pair>/<replica>.redb` holds the index and journal. It lives outside the replica roots. A running daemon also writes `status.toml` there (below).
+
+**Status and sandbox (T18):**
+- `status <pair>` reads both indexes directly (it does not open the replicas, which would probe and replay them): entries and tombstones, conflict copies (live entries whose name matches `fs::is_conflict_name`, i.e. `.sync-conflict-YYYYMMDD-HHMMSS-<ID7>` followed by the end or a `.`), quarantined intents (plus other unfinished ones) and the last sync time (the `peers` table, §3). redb locks an index to one process, so while a daemon holds them, `status` shows the `status.toml` report the daemon saves after every cycle and quarantine sweep (with the live quarantine count).
+- `--sandbox` (global flag; used by `sync`, `daemon` and `status`) calls `sandbox::restrict` before any thread starts: a landlock ruleset handling every write right (`WRITE_FILE`, `REMOVE_*`, `MAKE_*`, plus `REFER` from ABI 2 and `TRUNCATE` from ABI 3) allows them beneath the two roots and the pair's state directory only. Reads are not restricted (followed links may point anywhere). Without landlock the command fails rather than run unconfined. Writing through an out-of-tree `-K` link (`keep_dirlinks_unsafe`) then fails with `EACCES`.
 
 **Temp files:** they always live in the same directory as their target (same filesystem, same parent dirfd). They use the reserved prefix `.~fsync.`, which the scanner and watcher always ignore.
 
@@ -116,6 +122,7 @@ struct LocalMeta { dev, ino, ctime_ns, mnt_id, raw_target: Option<Vec<u8>>, via_
 - **What counts as a change (scanner):** kind, content hash or target, and mode; plus mtime for **files only**. A directory's mtime moves with every child and a symlink's is set when it is created, so for those an mtime difference alone is not a change; their stored `mtime_ns` is the one seen at the last logical change (used only to pick a conflict winner). A logical change gets `vv.bump_after(local, max_counter)` and a new seq. A change to `LocalMeta` alone (new inode with the same content, ctime, `racy`) is written **in place with the same seq** (`WriteTxn::put_local`), so peers never re-fetch it.
 - **Scanner errors:** a path that changes while it is scanned (unstable read, symlink swapped into a path, name replaced between two steps) keeps its entry and its whole subtree unchanged and is reported dirty. Other per-path errors (`EACCES`, a mount point inside the root, which `RESOLVE_NO_XDEV` refuses) do the same and are reported as errors. Every index write checks that the entry still has the seq the scan read; otherwise the path is reported dirty.
 - **Tombstones:** a deletion keeps its version vector. A tombstone is garbage-collected when every known replica has an equal version vector and a retention period has passed (default 30 days).
+- **Tombstone GC as implemented (T18):** at the end of every sync cycle, the engine hands each replica its tombstones from the cycle's last snapshots, each with its version vector and what the peer holds there (`PeerState::{Absent, Tombstone(vv), Live}`; `Unmanaged` counts as live), through `Replica::record_sync`. In one non-durable transaction the store (`IndexStore::record_sync`) records the cycle's time as the last sync with that peer (table `peers`) and, per tombstone that still is the stored entry with that vector, an `Ack { ours, theirs, since_ns }` (table `acks`, key = peer ID + path): a peer tombstone or no peer entry acknowledges the deletion, from now or since the earlier record if both vectors are unchanged (a peer that already collected its tombstone keeps its record); a live peer entry withdraws it. A tombstone is removed once every peer in `peers` has acknowledged it for the retention period (`PairConfig::tombstone_retention_days`, default 30; `Engine::tombstone_retention`). "Equal" is relaxed to "any tombstone": concurrent tombstones are never equalised (§6.1), and neither side can resurrect a collected one, since the peer holds nothing live and any later change there dominates or is concurrent with the remaining tombstone, which a modification wins. `SyncReport::collected` counts the removals per side.
 - **`Unmanaged` entries:** these are **not** deletions. The peer keeps its copy, and an incoming change to that path is skipped with a warning. We never overwrite an unmanaged object.
 
 ---
@@ -224,6 +231,7 @@ A link the user made in a munging replica without the prefix is synced with its 
 **Step 4. Replace** (expected state: the indexed entry).
 - **(a) Pin the old inode.** `openat2(parentfd, name, O_PATH|O_NOFOLLOW)` pins the old inode **O**. Check `statx(O)` against the index: ino, ctime, mtime, size and kind must match exactly. If they don't, unlink the temp file and return `PreconditionFailed`.
 - **(b) Optional lease** (T18). Take `F_SETLEASE F_WRLCK` on an `O_RDONLY` fd for O. It is granted only if nobody else has the file open, including writable mmaps.
+  - As implemented: only for a regular file and when `Caps::leases`; the fd is opened by name (`O_NONBLOCK`) and must be the pinned inode. A refused lease (someone has the file open, we don't own it) is **not** a failure: the commit goes on without one and the quarantine's grace period covers that writer, as before. While the lease is held, anyone's `open` of O waits (up to `lease-break-time`, 45 s) and breaks it; the rehash in (d) therefore reads through the lease's own fd (`Lease::hash`: a dup, seeked to 0), since opening O again would break our own lease. The lease is released right after (d). A lease break sends `SIGIO`, which kills by default, so the first `Lease::take` makes the process ignore `SIGIO` unless it has a handler. Delete (§5.6) takes one the same way before its rename; a rename to a conflict name does not (the object stays user data at its new name).
 - **(c) Exchange.** `renameat2(parentfd, tmp, parentfd, name, RENAME_EXCHANGE)`. In one atomic step, N goes to `name` and the old occupant goes to `tmp`.
 - **(d) Verify what came out at `tmp`.**
   - Its ino must equal O, and mtime and size must equal the expected values.
@@ -240,6 +248,7 @@ A link the user made in a munging replica without the prefix is synced with its 
   - Rename `.~fsync.<id>` to `.~fsync.old.<id>`.
   - Unlink it only once a write lease can be taken (no fds or mmaps remain) or a grace period (2 × debounce) has passed with mtime and size unchanged.
   - If it changed meanwhile (a writer still held an fd to it), turn it into a conflict copy.
+  - As implemented (T18): each entry remembers whether its replica has leases. A sweep stats the entry; if unchanged, it tries a lease on it (regular files only). With the lease, it re-checks size and mtime through the lease fd (a change → conflict copy) and unlinks **while holding the lease**, so no write can slip in between the check and the unlink; this happens before the deadline too. Without one (an fd is open, a symlink, no leases), the grace period applies as before. The daemon also sweeps right after every cycle, and `sync --once` sweeps at once, so leased entries go without waiting.
 
 **Step 5. After commit.**
 - `fsync(parentfd)`.
@@ -320,7 +329,9 @@ As implemented (T16, `src/watch/`):
 | Leases need the caller to own the file (or CAP_LEASE) and a local filesystem | Fall back to the grace timer. |
 | Hardlinks | We never write in place, so other links keep the old content. Matches rsync without `-H`; `-H` may come later. |
 | A directory moved out of the root while we hold its fd | Post-commit (dev, ino) check of the parent (§5.1). |
-| A writer holding an fd to a deleted child when its directory is removed | rmdir settles the directory's quarantine early (§5.7), so the grace period is cut short; the stat → unlink window of the sweep remains (T18 leases close it). |
+| A writer holding an fd to a deleted child when its directory is removed | rmdir settles the directory's quarantine early (§5.7), so the grace period is cut short. An unchanged child is unlinked under a lease if one can be taken, but a writer holding an fd refuses the lease, so its write right after the check is lost. |
+| The quarantine sweep's stat → unlink window | Closed by the lease (T18) where one can be taken; without leases, a write through a held fd in that instant is lost. |
+| Holding a lease delays other openers of the old file | Only between (b) and (d) (plus a rehash, up to 1 MiB or a racy file); the kernel revokes it after `lease-break-time` anyway, which (d) then sees as a change. |
 
 ---
 
@@ -374,7 +385,7 @@ Any `PreconditionFailed` marks the path dirty. The loop then rescans the dirty p
 
 **Daemon** (`daemon::Daemon`, T16): `run(a, b, stop)` starts both watchers, then runs a full cycle (watch first, then scan). It then waits for a hint (a cycle scoped to the hinted paths on both replicas, or a full one after an overflow), the rescan timer (full cycle, default 10 minutes), a retry (paths a cycle left `unresolved` are synced again after 1 s), a quarantine deadline (`sweep_quarantine`), or `stop`. Hints that arrive during a cycle join the next one. Our own writes are reported by inotify too; the cycle they cause finds the index already up to date and applies nothing, so each applied change costs one extra, empty scoped cycle. A failing cycle (index or root failure) ends the run with the error. The CLI blocks `SIGINT`/`SIGTERM` before any thread starts and turns them into the stop message (a `sigwait` thread; a second signal exits at once), then drains the quarantines as `sync --once` does.
 
-`sync --once` (CLI) runs one cycle, then waits for both quarantines to drain (sweeping until empty, at most 10 grace periods), so a one-shot run leaves no `.~fsync.old.*` files behind. It exits non-zero if the cycle did not converge.
+`sync --once` (CLI) runs one cycle (with the pair's tombstone retention), then waits for both quarantines to drain (sweeping until empty, at most 10 grace periods), so a one-shot run leaves no `.~fsync.old.*` files behind. It exits non-zero if the cycle did not converge.
 
 Rename detection by inode or hash is an optional later optimization.
 

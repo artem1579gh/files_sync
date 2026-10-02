@@ -66,14 +66,67 @@ fn init_pair(state: &Path, name: &str) -> (tempfile::TempDir, tempfile::TempDir)
     (a, b)
 }
 
+/// Runs `args`, which must succeed; returns stdout.
+fn ok(state: &Path, args: &[&str]) -> String {
+    let out = run(state, args);
+    assert!(
+        out.status.success(),
+        "{args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap()
+}
+
 #[test]
-fn status_is_a_stub() {
+fn status_shows_index_conflicts_quarantine_and_last_sync() {
     let state = tempfile::tempdir().unwrap();
-    init_pair(state.path(), "p");
-    let out = run(state.path(), &["status", "p"]);
-    assert!(!out.status.success());
+    let (a, _b) = init_pair(state.path(), "p");
+    let st = ok(state.path(), &["status", "p"]);
+    assert!(st.contains("0 entries (0 tombstones)"), "{st}");
+    assert!(st.contains("last sync:   never"), "{st}");
+
+    std::fs::write(a.path().join("f"), "x").unwrap();
+    std::fs::write(a.path().join("gone"), "x").unwrap();
+    let copy = "f.sync-conflict-20260101-120000-abcdef0";
+    std::fs::write(a.path().join(copy), "y").unwrap();
+    ok(state.path(), &["sync", "--once", "p"]);
+    std::fs::remove_file(a.path().join("gone")).unwrap();
+    ok(state.path(), &["sync", "--once", "p"]);
+
+    let st = ok(state.path(), &["status", "p"]);
+    assert_eq!(st.matches("3 entries (1 tombstones)").count(), 2, "{st}");
+    assert_eq!(st.matches("conflicts:   1").count(), 2, "{st}");
+    assert_eq!(st.matches(copy).count(), 2, "{st}");
+    assert_eq!(st.matches("quarantined: 0").count(), 2, "{st}");
+    assert!(!st.contains("never") && !st.contains("daemon"), "{st}");
+}
+
+/// `--sandbox` (landlock) still lets a sync write the roots and the state.
+#[test]
+fn sandboxed_sync_and_status() {
+    if files_sync::sandbox::abi().is_none() {
+        eprintln!("landlock unsupported here; skipping");
+        return;
+    }
+    let state = tempfile::tempdir().unwrap();
+    let (a, b) = init_pair(state.path(), "p");
+    std::fs::create_dir(a.path().join("d")).unwrap();
+    std::fs::write(a.path().join("d/f"), "x").unwrap();
+    let out = run(state.path(), &["--sandbox", "sync", "--once", "p"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("not implemented"), "{stderr}");
+    assert!(out.status.success(), "{stderr}");
+    assert!(stderr.contains("landlock sandbox"), "{stderr}");
+    assert_eq!(std::fs::read(b.path().join("d/f")).unwrap(), b"x");
+    // A replace (quarantine), a delete and an rmdir.
+    std::fs::write(b.path().join("d/f"), "y").unwrap();
+    ok(state.path(), &["sync", "--sandbox", "--once", "p"]);
+    assert_eq!(std::fs::read(a.path().join("d/f")).unwrap(), b"y");
+    std::fs::remove_dir_all(a.path().join("d")).unwrap();
+    ok(state.path(), &["--sandbox", "sync", "--once", "p"]);
+    assert!(!b.path().join("d").exists());
+    assert_eq!(names(b.path()), Vec::<String>::new());
+    let st = ok(state.path(), &["--sandbox", "status", "p"]);
+    assert!(st.contains("2 entries (2 tombstones)"), "{st}");
 }
 
 /// The names in `dir`, sorted.
@@ -118,6 +171,15 @@ fn daemon_syncs_until_a_signal_stops_it() {
         wait_for("edits sync", || {
             std::fs::read(b.join("before")).is_ok_and(|c| c == b"2") && a.join("dir/after").exists()
         });
+        // The daemon holds the indexes; `status` shows its report.
+        wait_for("status report", || {
+            ok(state.path(), &["status", "p"])
+                .matches("3 entries")
+                .count()
+                == 2
+        });
+        let st = ok(state.path(), &["status", "p"]);
+        assert!(st.contains("daemon running"), "{st}");
 
         let pid = i32::try_from(child.id()).unwrap();
         // SAFETY: sending a signal to our own child process.

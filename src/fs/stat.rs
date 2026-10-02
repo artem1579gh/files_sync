@@ -324,7 +324,10 @@ pub type Recheck = Box<dyn FnMut(&Fingerprint) -> Result<Option<&'static str>> +
 /// does every later call.
 pub struct StableReader {
     what: Vec<u8>,
-    fd: OwnedFd,
+    /// Closed once the read is verified or failed, so the file is no longer
+    /// open while the content is committed (a lease on it can be taken,
+    /// §5.3 step 4(b)).
+    fd: Option<OwnedFd>,
     f1: Fingerprint,
     hash: [u8; 32],
     hasher: blake3::Hasher,
@@ -386,7 +389,7 @@ impl StableReader {
         }
         Ok(StableReader {
             what: what.to_vec(),
-            fd,
+            fd: Some(fd),
             f1,
             hash,
             hasher: blake3::Hasher::new(),
@@ -404,6 +407,7 @@ impl StableReader {
     fn fail(&mut self, reason: &'static str) -> io::Error {
         tracing::debug!(name = %self.what.escape_ascii(), reason, "unstable streaming read");
         self.state = ReaderState::Failed(reason);
+        self.fd = None;
         self.unstable(reason)
     }
 
@@ -416,7 +420,8 @@ impl StableReader {
 
     /// The EOF checks; `Ok(Some(reason))` if one fails.
     fn verify(&mut self) -> Result<Option<&'static str>> {
-        let f2 = Fingerprint::of_fd(self.fd.as_fd())?;
+        let fd = self.fd.as_ref().expect("open while reading");
+        let f2 = Fingerprint::of_fd(fd.as_fd())?;
         if !self.f1.unchanged(&f2) {
             return Ok(Some("file changed during read"));
         }
@@ -443,8 +448,9 @@ impl Read for StableReader {
         if buf.is_empty() {
             return Ok(0);
         }
+        let fd = self.fd.as_ref().expect("open while reading");
         let n = loop {
-            match rustix::io::read(&self.fd, &mut *buf) {
+            match rustix::io::read(fd, &mut *buf) {
                 Ok(n) => break n,
                 Err(Errno::INTR) => continue,
                 Err(e) => return Err(e.into()),
@@ -454,6 +460,7 @@ impl Read for StableReader {
             return match self.verify() {
                 Ok(None) => {
                     self.state = ReaderState::Verified;
+                    self.fd = None;
                     Ok(0)
                 }
                 Ok(Some(reason)) => Err(self.fail(reason)),
@@ -494,7 +501,10 @@ fn open_err(what: &[u8], e: Errno) -> Error {
 /// `O_RDONLY | O_NOFOLLOW | O_NOATIME`, retrying without `O_NOATIME` on EPERM
 /// (we don't own the file). `O_NONBLOCK` keeps a FIFO or a leased file from
 /// blocking us; it has no effect on reads from regular files.
-fn open_for_read(parent: BorrowedFd<'_>, name: &[u8]) -> std::result::Result<OwnedFd, Errno> {
+pub(crate) fn open_for_read(
+    parent: BorrowedFd<'_>,
+    name: &[u8],
+) -> std::result::Result<OwnedFd, Errno> {
     let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
     match open_beneath(parent, name, flags | OFlags::NOATIME) {
         Err(Errno::PERM) => open_beneath(parent, name, flags),
@@ -708,6 +718,29 @@ mod tests {
             stable_read(root.fd(), b"a/f", &mut Discard),
             Err(Error::InvalidPath { .. })
         ));
+    }
+
+    /// T18: the streaming reader closes the file once it has verified it, so
+    /// a commit of what it read can take a lease on the file.
+    #[test]
+    fn stable_reader_closes_the_file_at_eof() {
+        use crate::fs::lease::Lease;
+        use std::io::Read;
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("f"), b"data").unwrap();
+        let root = root_fd(dir.path());
+        let fp = Fingerprint::at(root.fd(), b"f").unwrap();
+        let parent = rustix::io::fcntl_dupfd_cloexec(root.fd(), 0).unwrap();
+        let mut r = StableReader::open_at(b"f", parent, b"f", 4, hash(b"data")).unwrap();
+        assert!(
+            Lease::take(root.fd(), b"f", &fp).is_none(),
+            "open while reading"
+        );
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"data");
+        assert!(Lease::take(root.fd(), b"f", &fp).is_some(), "closed at EOF");
+        assert_eq!(r.read(&mut [0; 8]).unwrap(), 0);
     }
 
     #[test]
