@@ -111,8 +111,10 @@ struct LocalMeta { dev, ino, ctime_ns, mnt_id, raw_target: Option<Vec<u8>>, via_
 - **Version vectors** are canonical: sorted by replica, no zero counters, every counter ≤ 2^62 (enforced when decoding, so `bump` cannot overflow). `compare` gives `Ord4 { Equal, Dominates, Dominated, Concurrent }`.
 - **Local change:** the replica's counter becomes `max(all counters) + 1`, as in syncthing. `bump_after(id, floor)` also lifts it above `floor`; the store keeps the largest counter ever stored (`max_counter`, a Lamport clock) for that purpose.
 - **Store (redb):** `entries` (path → postcard `(Entry, LocalMeta)`), `by_seq` (seq → path, exactly one row per entry at its current seq), `meta` (schema version, replica ID, `next_seq`, `max_counter`). Every put gets a fresh seq, starting at 1, so `changes_since(0)` returns everything.
-- **Rehash shortcut:** a file is not rehashed if (ino, size, mtime, ctime) are unchanged.
-- **Racily clean entries:** if ctime is within one timestamp tick of the scan start, the entry is marked `racy` and is always rehashed on the next scan. Git uses the same rule.
+- **Rehash shortcut:** a file is not rehashed if (ino, size, mtime, ctime) are unchanged (and, for a followed link, the link is the same inode with the same target).
+- **Racily clean entries:** if ctime is within the racy window of the scan start (or later), the entry is marked `racy` and is always rehashed on the next scan. Git uses the same rule. The window defaults to 1 s (`scan::DEFAULT_RACY_WINDOW`), far above a kernel timestamp tick, to absorb the coarse clock's lag.
+- **What counts as a change (scanner):** kind, content hash or target, and mode; plus mtime for **files only**. A directory's mtime moves with every child and a symlink's is set when it is created, so for those an mtime difference alone is not a change; their stored `mtime_ns` is the one seen at the last logical change (used only to pick a conflict winner). A logical change gets `vv.bump_after(local, max_counter)` and a new seq. A change to `LocalMeta` alone (new inode with the same content, ctime, `racy`) is written **in place with the same seq** (`WriteTxn::put_local`), so peers never re-fetch it.
+- **Scanner errors:** a path that changes while it is scanned (unstable read, symlink swapped into a path, name replaced between two steps) keeps its entry and its whole subtree unchanged and is reported dirty. Other per-path errors (`EACCES`, a mount point inside the root, which `RESOLVE_NO_XDEV` refuses) do the same and are reported as errors. Every index write checks that the entry still has the seq the scan read; otherwise the path is reported dirty.
 - **Tombstones:** a deletion keeps its version vector. A tombstone is garbage-collected when every known replica has an equal version vector and a retention period has passed (default 30 days).
 - **`Unmanaged` entries:** these are **not** deletions. The peer keeps its copy, and an incoming change to that path is skipped with a warning. We never overwrite an unmanaged object.
 
@@ -153,8 +155,10 @@ We port rsync 3.4.1, quirks included (`symlink/safety.rs`), and check it against
 ### 4.5 Edge cases
 
 - **Reading through a followed link:**
-  - Run `readlinkat` before and after reading the referent. If the link was retargeted in between, the read is unstable (§5.2).
-  - In-tree referents are opened with `RESOLVE_BENEATH`. Out-of-tree referents are opened with `RESOLVE_NO_MAGICLINKS` and are **read-only**: we never write to them.
+  - Run `readlinkat` before and after reading the referent. If the link was retargeted in between, the read is unstable (§5.2). In practice the "after" check is a `statx` of the link: a symlink's target cannot change without a new inode, so an unchanged (ino, ctime) means an unchanged target.
+  - In-tree referents are opened with `RESOLVE_BENEATH` (plus `NO_MAGICLINKS | NO_XDEV`), from the root fd and the link's own root-relative path, so the kernel follows the link but cannot leave the root. If that fails with `EXDEV` (the link, or a link it leads to, escapes), the referent is opened from the link's own directory fd with `RESOLVE_NO_MAGICLINKS` only and marked `out_of_tree`. If the in-tree attempt fails otherwise but the direct one succeeds, the two views of the path disagree and the link is unstable. Out-of-tree referents are **read-only**: we never write to them.
+  - A referent is first opened `O_PATH` to learn its kind, so a FIFO or device is never opened for reading. A file referent is then read with `fs::stable_read_with` (the §5.2 checks, plus: still the same inode, link unchanged). A directory referent is opened as `"."` beneath its `O_PATH` fd, so it is exactly the classified inode.
+  - A chain of links that never resolves (`ELOOP`) is `Unmanaged(Loop)` under a following policy.
 - **A followed referent changes:**
   - In-tree referents are already watched.
   - Out-of-tree referents get extra inotify watches.

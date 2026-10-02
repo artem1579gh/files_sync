@@ -301,6 +301,29 @@ impl WriteTxn {
         Ok(seq)
     }
 
+    /// Rewrites the entry at `path` **without** a new seq: for changes to
+    /// [`LocalMeta`] only, which peers never see, so `changes_since` does not
+    /// report the entry again. `entry.seq` must be the stored entry's seq.
+    pub fn put_local(&mut self, path: &RelPath, entry: &Entry) -> Result<()> {
+        let key = path.as_bytes();
+        let value = encode(entry)?;
+        let mut entries = self.entries()?;
+        let stored = entries
+            .get(key)
+            .map_err(dberr)?
+            .map(|old| decode(key, old.value()).map(|(_, e)| e.seq))
+            .transpose()?;
+        if stored != Some(entry.seq) {
+            return Err(bad(format!(
+                "put_local \"{}\": seq {} does not match the stored entry ({stored:?})",
+                key.escape_ascii(),
+                entry.seq
+            )));
+        }
+        entries.insert(key, value.as_slice()).map_err(dberr)?;
+        Ok(())
+    }
+
     /// Removes the entry at `path` (tombstone GC). Returns whether there was one.
     pub fn remove(&mut self, path: &RelPath) -> Result<bool> {
         let key = path.as_bytes();
@@ -528,6 +551,28 @@ mod tests {
         assert_eq!(paths(&store.changes_since(s2).unwrap()), [b"a".to_vec()]);
         assert!(store.changes_since(s3).unwrap().is_empty());
         assert!(store.changes_since(u64::MAX).unwrap().is_empty());
+    }
+
+    #[test]
+    fn put_local_keeps_seq() {
+        let (_dir, store) = open();
+        let a = p(b"a");
+        let mut e = file(b"1", 1);
+        let seq = store.put(&a, &mut e).unwrap();
+        e.local.ino = 77;
+        e.local.racy = true;
+        let mut txn = store.write().unwrap();
+        txn.put_local(&a, &e).unwrap();
+        // A stale seq or a missing entry is refused.
+        let stale = e.clone().with_seq(seq + 1);
+        assert!(matches!(txn.put_local(&a, &stale), Err(Error::BadIndex { .. })));
+        assert!(matches!(txn.put_local(&p(b"b"), &e), Err(Error::BadIndex { .. })));
+        txn.commit().unwrap();
+        let back = store.get(&a).unwrap().unwrap();
+        assert_eq!(back, e);
+        assert_eq!((back.seq, back.local.ino), (seq, 77));
+        assert!(store.changes_since(seq).unwrap().is_empty());
+        assert_eq!(store.next_seq().unwrap(), seq + 1);
     }
 
     #[test]

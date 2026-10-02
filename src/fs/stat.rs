@@ -182,6 +182,40 @@ pub fn stable_read<S: Sink + ?Sized>(
     sink: &mut S,
 ) -> Result<(Fingerprint, [u8; 32])> {
     validate_name(name)?;
+    stable_read_with(
+        name,
+        || open_for_read(parent, name),
+        |f2| match Fingerprint::at(parent, name) {
+            Ok(f3) if f2.same_file(&f3) => Ok(None),
+            Ok(_) => Ok(Some("name replaced during read")),
+            Err(Error::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+                Ok(Some("name removed during read"))
+            }
+            Err(e) => Err(e),
+        },
+        sink,
+    )
+}
+
+/// The general form of [`stable_read`], for files reached some other way
+/// (the scanner reads followed symlink referents with it, design §4.5).
+///
+/// Each attempt calls `open` to get a fresh read fd, then applies the same
+/// checks as [`stable_read`]: a regular file, F1 and F2 unchanged, byte count
+/// equal to the size. `recheck` runs last with F2 and returns why the file is
+/// no longer reachable the way it was opened (`stable_read`'s F3 check), if
+/// it isn't. Errors name `what`.
+pub fn stable_read_with<S, O, C>(
+    what: &[u8],
+    mut open: O,
+    mut recheck: C,
+    sink: &mut S,
+) -> Result<(Fingerprint, [u8; 32])>
+where
+    S: Sink + ?Sized,
+    O: FnMut() -> std::result::Result<OwnedFd, Errno>,
+    C: FnMut(&Fingerprint) -> Result<Option<&'static str>>,
+{
     let mut buf = vec![0u8; CHUNK];
     let mut reason = "";
     for attempt in 0..=STABLE_READ_RETRIES {
@@ -190,29 +224,35 @@ pub fn stable_read<S: Sink + ?Sized>(
             sink.restart()
                 .map_err(|e| Error::io("restart read sink", e))?;
         }
-        match read_once(parent, name, sink, &mut buf)? {
+        match read_once(what, &mut open, &mut recheck, sink, &mut buf)? {
             Ok(done) => return Ok(done),
             Err(why) => {
-                tracing::debug!(name = %name.escape_ascii(), attempt, why, "unstable read");
+                tracing::debug!(name = %what.escape_ascii(), attempt, why, "unstable read");
                 reason = why;
             }
         }
     }
     Err(Error::Unstable {
-        path: name.to_vec(),
+        path: what.to_vec(),
         reason,
     })
 }
 
 /// One attempt: `Ok(Err(reason))` when the file changed under us.
-fn read_once<S: Sink + ?Sized>(
-    parent: BorrowedFd<'_>,
-    name: &[u8],
+fn read_once<S, O, C>(
+    what: &[u8],
+    open: &mut O,
+    recheck: &mut C,
     sink: &mut S,
     buf: &mut [u8],
-) -> Result<std::result::Result<(Fingerprint, [u8; 32]), &'static str>> {
-    let shown = || name.escape_ascii();
-    let fd = match open_for_read(parent, name) {
+) -> Result<std::result::Result<(Fingerprint, [u8; 32]), &'static str>>
+where
+    S: Sink + ?Sized,
+    O: FnMut() -> std::result::Result<OwnedFd, Errno>,
+    C: FnMut(&Fingerprint) -> Result<Option<&'static str>>,
+{
+    let shown = || what.escape_ascii();
+    let fd = match open() {
         Ok(fd) => fd,
         Err(Errno::LOOP) => return Ok(Err("name is a symlink")),
         // Someone holds a lease on it (O_NONBLOCK turns the wait into EAGAIN).
@@ -222,7 +262,7 @@ fn read_once<S: Sink + ?Sized>(
         Err(e) => {
             return Err(match unstable_reason(e) {
                 Some(reason) => Error::Unstable {
-                    path: name.to_vec(),
+                    path: what.to_vec(),
                     reason,
                 },
                 None => Error::io(format!("open {} for reading", shown()), e.into()),
@@ -253,21 +293,14 @@ fn read_once<S: Sink + ?Sized>(
     }
 
     let f2 = Fingerprint::of_fd(fd.as_fd())?;
-    let f3 = match Fingerprint::at(parent, name) {
-        Ok(f3) => f3,
-        Err(Error::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
-            return Ok(Err("name removed during read"));
-        }
-        Err(e) => return Err(e),
-    };
     if !f1.unchanged(&f2) {
         return Ok(Err("file changed during read"));
     }
     if total != f2.size {
         return Ok(Err("byte count differs from size"));
     }
-    if !f2.same_file(&f3) {
-        return Ok(Err("name replaced during read"));
+    if let Some(why) = recheck(&f2)? {
+        return Ok(Err(why));
     }
     Ok(Ok((f2, *hasher.finalize().as_bytes())))
 }
