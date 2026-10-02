@@ -1,7 +1,8 @@
 //! End-to-end tests of the `files_sync` binary.
 
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use files_sync::config::PairConfig;
 
@@ -66,25 +67,83 @@ fn init_pair(state: &Path, name: &str) -> (tempfile::TempDir, tempfile::TempDir)
 }
 
 #[test]
-fn stubs_probe_roots_and_report_not_implemented() {
+fn status_is_a_stub() {
     let state = tempfile::tempdir().unwrap();
-    let (a, b) = init_pair(state.path(), "p");
+    init_pair(state.path(), "p");
+    let out = run(state.path(), &["status", "p"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("not implemented"), "{stderr}");
+}
 
-    for args in [&["daemon", "p"][..], &["status", "p"]] {
-        let out = run(state.path(), args);
-        assert!(!out.status.success(), "{args:?}");
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(stderr.contains("not implemented"), "{args:?}: {stderr}");
-        if args[0] != "status" {
-            assert!(
-                stderr.contains("filesystem capabilities"),
-                "{args:?}: {stderr}"
-            );
-        }
+/// The names in `dir`, sorted.
+fn names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Polls `cond` for up to 10 s.
+fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
+    let t0 = Instant::now();
+    while !cond() {
+        assert!(t0.elapsed() < Duration::from_secs(10), "{what}: timed out");
+        std::thread::sleep(Duration::from_millis(20));
     }
-    // Probing leaves nothing behind in the roots.
-    for root in [&a, &b] {
-        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn daemon_syncs_until_a_signal_stops_it() {
+    for signal in [libc::SIGTERM, libc::SIGINT] {
+        let state = tempfile::tempdir().unwrap();
+        let (a, b) = init_pair(state.path(), "p");
+        std::fs::write(a.path().join("before"), "1").unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_files_sync"))
+            .args(["daemon", "p"])
+            .env("XDG_STATE_HOME", state.path())
+            .env_remove("RUST_LOG")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (a, b) = (a.path(), b.path());
+        wait_for("initial sync", || b.join("before").exists());
+        // A replace leaves an old inode in quarantine, a create does not.
+        std::fs::write(a.join("before"), "2").unwrap();
+        std::fs::create_dir(b.join("dir")).unwrap();
+        std::fs::write(b.join("dir/after"), "x").unwrap();
+        wait_for("edits sync", || {
+            std::fs::read(b.join("before")).is_ok_and(|c| c == b"2") && a.join("dir/after").exists()
+        });
+
+        let pid = i32::try_from(child.id()).unwrap();
+        // SAFETY: sending a signal to our own child process.
+        assert_eq!(unsafe { libc::kill(pid, signal) }, 0);
+        let t0 = Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if t0.elapsed() > Duration::from_secs(10) {
+                child.kill().unwrap();
+                panic!("daemon did not stop on signal {signal}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let out = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(status.success(), "signal {signal}: {status:?}\n{stderr}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("daemon for \"p\" stopped"), "{stdout}");
+        assert!(stderr.contains("shutting down"), "{stderr}");
+        // Shut down cleanly: nothing reserved is left behind.
+        for root in [a, b] {
+            assert_eq!(names(root), ["before", "dir"]);
+            assert_eq!(names(&root.join("dir")), ["after"]);
+        }
     }
 }
 

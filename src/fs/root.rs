@@ -214,6 +214,18 @@ impl Root {
         })
     }
 
+    /// A second handle on the same root directory (a `dup` of its fd, so
+    /// the path is not resolved again).
+    pub fn try_clone(&self) -> Result<Root> {
+        Ok(Root {
+            fd: self
+                .fd
+                .try_clone()
+                .map_err(|e| Error::io("duplicate root fd", e))?,
+            path: self.path.clone(),
+        })
+    }
+
     pub fn fd(&self) -> BorrowedFd<'_> {
         self.fd.as_fd()
     }

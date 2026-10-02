@@ -148,15 +148,20 @@ impl Engine {
         let mut report = cycle.report;
         report.errors = cycle.errors.into_iter().collect();
         report.unmanaged = cycle.unmanaged.into_iter().collect();
-        tracing::info!(
-            rounds = report.rounds,
-            applied = report.applied,
-            retried = report.retried,
-            conflicts = report.conflicts.len(),
-            errors = report.errors.len(),
-            unresolved = report.unresolved.len(),
-            "sync cycle done"
-        );
+        if report.rounds == 0 && report.is_converged() {
+            // Nothing to do (e.g. a daemon cycle triggered by our own writes).
+            tracing::debug!("sync cycle done: nothing to do");
+        } else {
+            tracing::info!(
+                rounds = report.rounds,
+                applied = report.applied,
+                retried = report.retried,
+                conflicts = report.conflicts.len(),
+                errors = report.errors.len(),
+                unresolved = report.unresolved.len(),
+                "sync cycle done"
+            );
+        }
         Ok(report)
     }
 }

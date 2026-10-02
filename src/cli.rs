@@ -9,6 +9,7 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 use crate::config::{self, PairConfig};
+use crate::daemon::{self, Daemon};
 use crate::engine::{Engine, Side, SyncReport};
 use crate::fs::caps::Caps;
 use crate::fs::commit::Quarantine;
@@ -44,7 +45,8 @@ enum Command {
         once: bool,
         pair: String,
     },
-    /// Keep a pair in sync continuously, driven by inotify.
+    /// Keep a pair in sync continuously, driven by inotify; stops cleanly on
+    /// SIGINT or SIGTERM.
     Daemon { pair: String },
     /// Show the state of a pair.
     Status { pair: String },
@@ -87,8 +89,17 @@ pub fn run() -> anyhow::Result<()> {
             bail!("`sync` requires --once; use `daemon` for continuous sync")
         }
         Command::Daemon { pair } => {
-            open_pair(&pair)?;
-            not_implemented("daemon")
+            // Before any thread starts, so every thread inherits the mask.
+            let stop = daemon::shutdown_signals()?;
+            let (cfg, [mut a, mut b]) = open_pair(&pair)?;
+            tracing::info!(pair = %cfg.name, "daemon started");
+            let stats = Daemon::new().run(&mut a, &mut b, &stop)?;
+            drain_quarantine(&mut [&mut a, &mut b]);
+            println!(
+                "daemon for {:?} stopped: {} cycle(s), {} change(s) applied, {} conflict(s)",
+                cfg.name, stats.cycles, stats.applied, stats.conflicts
+            );
+            Ok(())
         }
         Command::Status { .. } => not_implemented("status"),
     }

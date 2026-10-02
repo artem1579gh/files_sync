@@ -34,7 +34,7 @@ use crate::index::{
 use crate::replica::{ContentReader, Op, Outcome, Precondition, Replica, wire};
 use crate::scan::{DEFAULT_RACY_WINDOW, ScanStats, Scanner, Scope};
 use crate::symlink::munge;
-use crate::watch::Hint;
+use crate::watch::{Debouncer, EventSource, Hint, InotifySource, Watcher};
 
 /// A replica rooted at a local directory, with its index in the pair's
 /// state directory.
@@ -45,6 +45,10 @@ pub struct LocalReplica {
     index: IndexStore,
     quarantine: Quarantine,
     racy_window: Duration,
+    /// Replaces inotify as the watcher's event source (tests).
+    event_source: Option<Box<dyn EventSource>>,
+    /// Started by the first [`Replica::watch`]; stopped on drop.
+    watcher: Option<Watcher>,
 }
 
 impl LocalReplica {
@@ -66,6 +70,8 @@ impl LocalReplica {
             index,
             quarantine: Quarantine::new(config.id, Quarantine::DEFAULT_GRACE),
             racy_window: DEFAULT_RACY_WINDOW,
+            event_source: None,
+            watcher: None,
         };
         let pending = replica.index.journal().pending()?;
         if !pending.is_empty() {
@@ -87,6 +93,13 @@ impl LocalReplica {
     pub fn quarantine_grace(mut self, grace: Duration) -> Self {
         self.quarantine.set_grace(grace);
         self
+    }
+
+    /// Makes [`Replica::watch`] read `source` instead of watching the root
+    /// with inotify (to inject events in tests). No effect once the watcher
+    /// runs.
+    pub fn set_event_source(&mut self, source: Box<dyn EventSource>) {
+        self.event_source = Some(source);
     }
 
     /// The probed capabilities, to override in tests (e.g. to force the
@@ -526,8 +539,36 @@ impl Replica for LocalReplica {
         Ok(Outcome::Applied(wire(first.expect("at least one entry"))))
     }
 
+    /// Starts watching (once; later calls return the same hints). The
+    /// watches are in place when this returns, so a scan started afterwards
+    /// misses nothing. `None` if inotify cannot be used; the caller then
+    /// relies on periodic full rescans.
     fn watch(&mut self) -> Option<Receiver<Hint>> {
-        None
+        if self.watcher.is_none() {
+            let root = self.root.path().display().to_string();
+            let source = match self.event_source.take() {
+                Some(source) => source,
+                None => match self.root.try_clone().and_then(InotifySource::new) {
+                    Ok(source) => {
+                        tracing::info!(%root, dirs = source.watches(), "watching");
+                        Box::new(source)
+                    }
+                    Err(e) => {
+                        tracing::warn!(%root, error = %e, "cannot watch; relying on periodic rescans");
+                        return None;
+                    }
+                },
+            };
+            let name = format!("{:.7}", self.config.id.to_string());
+            match Watcher::spawn(&name, source, Debouncer::default()) {
+                Ok(w) => self.watcher = Some(w),
+                Err(e) => {
+                    tracing::warn!(%root, error = %e, "cannot watch; relying on periodic rescans");
+                    return None;
+                }
+            }
+        }
+        self.watcher.as_ref().map(Watcher::hints)
     }
 }
 
@@ -1489,7 +1530,21 @@ mod tests {
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].1.local, LocalMeta::default());
         assert_eq!(changes[0].1.kind, fx.get("f").kind);
-        assert!(fx.r.watch().is_none());
         assert_eq!(fx.r.id(), ME);
+    }
+
+    #[test]
+    fn watch_reports_changed_paths() {
+        let mut fx = Fx::new();
+        let hints = fx.r.watch().expect("inotify works on tmpfs and ext4");
+        user_file(&fx, "g", b"y");
+        let hint = hints.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(hint, Hint::Paths(vec![RelPath::new("g").unwrap()]));
+        // The same watcher: a second call does not start another one.
+        let again = fx.r.watch().unwrap();
+        user_file(&fx, "h", b"z");
+        let hint = again.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(hint, Hint::Paths(vec![RelPath::new("h").unwrap()]));
+        assert!(hints.is_empty());
     }
 }

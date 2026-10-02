@@ -465,7 +465,7 @@ The design lives in [`design.md`](design.md); §N.M below refers to its sections
 
 ## M5: daemon
 
-### [ ] T16: Watcher and daemon
+### [x] T16: Watcher and daemon
 - **Depends on:** T13 (T15 recommended)
 - **Read:** §5.9, §6.4
 - **Files:** `src/watch/{mod,inotify,debounce}.rs`, `src/daemon.rs`, `src/replica/local.rs` (`watch()`), `src/cli.rs`, `tests/daemon.rs`
@@ -487,6 +487,21 @@ The design lives in [`design.md`](design.md); §N.M below refers to its sections
   - an injected overflow → full rescan and convergence;
   - a quiet tree → no actions for 5 s after convergence.
 - **Notes:**
+  - **API (design §5.9, §6.4 updated):**
+    - `watch`: `Event { Dirty(RelPath), Overflow }`; `EventSource: Send` with `wait(timeout) -> Result<Vec<Event>>`; `ChannelSource::new() -> (Sender<Event>, ChannelSource)` for injection; `Debouncer` (pure; `QUIET` 200 ms, `MAX_DELAY` 2 s, `MAX_PATHS` 10 000 → `FullRescan`; `push(event, now)`, `deadline`, `take_due(now)`, `take`); `Watcher::spawn(name, source, debouncer)` (thread, 100 ms tick, stopped and joined on drop; a source error counts as an overflow); `InotifySource::new(Root)` (`watches()`, `LIMIT_POLL` 60 s).
+    - `LocalReplica`: `watch()` starts the watcher once (later calls return the same hints; `None` with a warning if inotify fails); `set_event_source(Box<dyn EventSource>)` replaces inotify (a `&mut self` setter rather than a builder, so tests can set it on a harness replica). The watcher is owned by the replica and stops with it.
+    - `fs::Root::try_clone` (a `dup`; the watcher gets its own root fd without resolving the path again).
+    - `daemon::Daemon` (builders `engine`, `rescan_every`, `retry_delay`, `reports(Sender<CycleReport>)`): `run(&mut LocalReplica, &mut LocalReplica, &Receiver<()>) -> Result<DaemonStats { cycles, full_cycles, applied, conflicts, unconverged }>`. `CycleReport { full, paths, report }`. `daemon::shutdown_signals()` blocks SIGINT/SIGTERM and turns them into the stop message from a `sigwait` thread (a second signal exits at once with 128+sig).
+  - **Inotify details:** watches go on `/proc/self/fd/<fd>` of a directory opened with `Root::open_dir` (beneath, no symlinks). New directories are watched breadth first, each watch added before its directory is listed; the event itself makes the whole subtree dirty, scanned by the next cycle. A directory's `MOVED_FROM`/`DELETE` removes the watches of its subtree and `MOVED_TO`/`CREATE` re-adds them, so no watch reports under a stale path; `MOVE_SELF` on a still-mapped directory dirties its parent (design), on the root it is an overflow. `IN_IGNORED` drops the mapping. Reserved names are ignored.
+  - **Daemon:** watch first, then the initial full cycle. Scoped cycles scan the hinted paths of **both** sides on both replicas (cheap; keeps `Engine::sync` unchanged). Unresolved paths are retried after 1 s even without a new event. The quarantine is swept at its next deadline. Our own writes cause one empty scoped cycle each (no action; tested). A cycle that fails as a whole (`Db`, `BadIndex`, root) ends `run` with the error, no backoff. The engine now logs a cycle with nothing to do at `debug` instead of `info`.
+  - **CLI:** `daemon <pair>` blocks the signals before opening the replicas (no thread exists yet), runs until SIGINT/SIGTERM, drains the quarantines, prints totals and exits 0.
+  - **Tests:** unit: debouncer (3), watcher thread with injected events (1), inotify (5: existing tree, reserved names and symlinks skipped, burst `mkdir -p` fully watched, moves within/out of the tree, delete, synthetic `MOVE_SELF`/overflow), `LocalReplica::watch` (1). `tests/daemon.rs` (6, ~7 s): edit A→B (≈220 ms; exactly one action, followed by an empty echo cycle), burst of a 3-level tree (4×4×4 dirs, 84 files) plus a later edit deep inside it, injected overflow (A's watcher is a `ChannelSource`; an unseen edit and delete arrive only after the injected `Overflow`, via a full cycle), the periodic timer (1 s) with no watcher events, a quiet tree (no cycle at all for 5 s after convergence), concurrent edits → conflict copy. Each ends with `assert_converged`. `tests/cli.rs`: `daemon` syncs, then stops cleanly on SIGTERM and on SIGINT with no reserved names left (the old "daemon is a stub" test now only covers `status`). Stable over 8 repeated runs and under concurrent CPU load.
+  - **Mutation check** (by hand): not watching new directories → the burst test fails (the later deep edit never arrives). This needed the test to wait out the echo cycles first, whose scans would otherwise pick up the edit anyway.
+  - **Follow-ups:**
+    - **T17:** no watches for followed links' referents. Changes beneath a followed directory link are indexed under the link's path (`l/x`), but in-tree events name the real path. So they are only picked up by a full rescan. Out-of-tree referents are not watched at all.
+    - Every cycle reconciles the whole indexes (`changes_since(0)`), so each empty echo cycle still costs O(index). Incremental exchange by `seq` is T20.
+    - The root's fd follows the directory: a root that is moved away keeps syncing at its new place (the `MOVE_SELF` only triggers a full rescan). A deleted root scans as empty after its contents were deleted (as with `sync --once`).
+    - **T18** `status` could report `DaemonStats` and the last cycle time; the daemon has no state file yet.
 
 ## M6: symlinks complete
 
