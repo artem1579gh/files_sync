@@ -315,23 +315,35 @@ Take the union of paths over both indexes. For each path, given entries `ea` and
 | concurrent, tombstone vs modification | the modification wins (resurrect) |
 | concurrent, otherwise | **conflict** |
 
+Details of the table, as implemented by `engine::reconcile` (T12):
+- **Purity:** `reconcile(a: &dyn IndexView, b: &dyn IndexView, now)` does no I/O. `now`, the local wall-clock time, is only used for conflict names. `engine::Snapshot` is the in-memory `IndexView` (e.g. from `changes_since(0)`). The root path is never an action.
+- **Same content** means the same kind (with hash or target) and mode, as above. **Equal vectors** also promise the same mtime for a file (the only synced mtime, §3); a file differing only in mtime is therefore also "inconsistent → rescan".
+- **Concurrent, same content:** both sides record the merged vector and the newer mtime (`SetMeta`, which rewrites the older file as a copy).
+- **Tombstone vs tombstone:** never an action, even when the vectors differ (`SetMeta` cannot apply to a tombstone). Tombstone GC (T18) has to handle such pairs.
+- **`Unmanaged`:** a `Skip` action (worth a warning) only when the other side has a live entry; otherwise no action. Every action beneath a path that is `Unmanaged` on either side is skipped too: the peer keeps the whole subtree.
+- **A push of the same content** (a dominating vector, but the same hash or target, or two directories) is a `SetMeta`: metadata and vector only, no transfer.
+
 ### 6.2 Conflicts
 
 - **Winner:** the newer mtime; a tie goes to the higher ReplicaId. For type conflicts, Dir > File > Symlink.
-- **Loser:** renamed on its own replica to `stem.sync-conflict-YYYYMMDD-HHMMSS-<ID7>.ext`, where `<ID7>` is the first 7 characters of the replica ID. Directories, symlinks and names without an extension get no extension split. If the name is taken, the timestamp is bumped by a second and retried. The helper is `fs::tmpname::conflict_name` (in `fs/`, because `fs::commit` needs it too).
-- The conflict copy gets a fresh version vector and syncs to both sides like any other file. The winner gets the merged version vector plus a bump.
-- **Renaming the loser** (`commit::rename_to`, `Op::RenameToConflict`, T11): pin and check as for a delete, move aside to a reserved name with `NOREPLACE`, verify (restore on failure, as in §5.6), then rename on to the conflict name with `NOREPLACE` (if it was taken, restore → `PreconditionFailed`), then the step 5 checks at the new name. Files and symlinks only. Since Dir wins every type conflict, a directory loses only a dir-vs-dir conflict (mode), which T12 should resolve without a rename.
+- **Loser:** renamed on its own replica to `stem.sync-conflict-YYYYMMDD-HHMMSS-<ID7>.ext`, where `<ID7>` is the first 7 characters of the loser's replica ID. Directories, symlinks and names without an extension get no extension split. If the name is taken (live on either side's index, or already chosen in this reconcile), the timestamp is bumped by a second and retried; a name taken on disk only makes the rename fail (`PreconditionFailed`, rescan). The helper is `fs::tmpname::conflict_name` (in `fs/`, because `fs::commit` needs it too).
+- The conflict copy gets a fresh version vector and syncs to both sides like any other file (in the next round: the rename assigns its vector).
+- **The winner's version** gets the merged version vector plus a bump by the winner's replica. It is written **only to the loser side**: first the loser is renamed away, then the winner's content is created there with that vector (`Absent`). The winner side learns the vector in the next round, through an ordinary dominating push of identical content (an index-only `SetMeta`). This way no side ever records "has seen the loser's change" without holding the result: if the rename fails, the create fails too (`Absent`), and nothing dominates the loser.
+- **Dir-vs-dir conflicts** (only the mode differs): no rename. The loser directory gets the winner's mode (`SetMeta`, a `fchmod`, §5.4) with the bumped vector.
+- **Renaming the loser** (`commit::rename_to`, `Op::RenameToConflict`, T11): pin and check as for a delete, move aside to a reserved name with `NOREPLACE`, verify (restore on failure, as in §5.6), then rename on to the conflict name with `NOREPLACE` (if it was taken, restore → `PreconditionFailed`), then the step 5 checks at the new name. Files and symlinks only. Since Dir wins every type conflict, a directory loses only a dir-vs-dir conflict (mode), which is resolved without a rename (above).
 
 ### 6.3 Ordering
 
 - Creates and updates: depth ascending (directories before their children).
 - Deletes: depth descending (children before their directory).
 - A type change becomes a delete in the delete phase plus a create in the create phase.
-- A directory delete is skipped (the directory is resurrected) if the deleting side has any live descendant not dominated by the tombstone.
+- A type change to or from a directory: the delete leaves a tombstone with the **target's old** version vector, so if the create does not happen, the pushed entry still dominates and the next round retries it.
+- A directory delete is skipped (the directory is resurrected) if the deleting side has any live descendant not dominated by the tombstone. Precisely (T12, decided in `reconcile`): a directory removal on side S (a pushed tombstone, or a type change to a file or symlink) is blocked if S would still hold anything beneath the directory after this round: a live or `Unmanaged` object it is not told to delete, or one it is told to create. Checked deepest first, so a kept directory keeps its ancestors too. A blocked removal becomes a `Resurrect` action, resolved like a conflict that S's directory wins: the merged vector plus S's bump goes to the other side, whose tombstone is replaced by the directory, or whose file or symlink is first renamed to a conflict copy.
+- **Plan** (`engine::plan`): three phases, run in order: `Conflicts` (renames of losers), `Deletes` (depth descending), `Creates` (creates, updates and `SetMeta`, depth ascending). A path has at most one step per phase and side. When a step does not apply, the executor marks the path dirty and skips its later steps (a later step's precondition would fail anyway).
 
 ### 6.4 Convergence loop
 
-Any `PreconditionFailed` marks the path dirty. The loop then rescans the dirty paths on both replicas and runs another round, up to 5 rounds per sync cycle. Paths still unresolved wait for the next cycle.
+Any `PreconditionFailed` marks the path dirty. The loop then rescans the dirty paths on both replicas and runs another round, up to 5 rounds per sync cycle. Paths still unresolved wait for the next cycle. A round with a conflict or a resurrection needs a following round even when nothing failed: the conflict copies and the winner's merged vector propagate then. So the loop runs while `reconcile` still yields steps (the T12 model test converges in at most 3 rounds without concurrent edits).
 
 Rename detection by inode or hash is an optional later optimization.
 

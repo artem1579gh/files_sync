@@ -324,7 +324,7 @@ The design lives in [`design.md`](design.md); §N.M below refers to its sections
     - invalid ops; `changes_since` without `LocalMeta`.
   - Plus 6 in `commit.rs`: rename trace and refusals, an edit before the move → restored, the name taken after verify → restored; chmod trace and refusals, a dir swapped after the pin → only the pinned one changed.
 
-### [ ] T12: Reconciler and planner (pure)
+### [x] T12: Reconciler and planner (pure)
 - **Depends on:** T08
 - **Read:** §6 (all)
 - **Files:** `src/engine/{mod,reconcile,plan}.rs`
@@ -337,6 +337,28 @@ The design lives in [`design.md`](design.md); §N.M below refers to its sections
   - an ordering test passes;
   - a resurrection test passes.
 - **Notes:**
+  - **API deviations (design §6.1–§6.4 updated):**
+    - `reconcile(a, b, now: jiff::civil::DateTime)`: `now` (local wall-clock time) is only for conflict names, so the function stays pure. T13 passes `jiff::Zoned::now().datetime()`.
+    - `IndexView` (new trait in `engine/mod.rs`): `replica`, `get`, `entries` (path order), `descendants`. `engine::Snapshot::new(id, entries)` is the in-memory one; T13 builds it from `changes_since(0)`. `Side { A, B }` names the replicas.
+    - `ActionKind`: `Push{from, entry, target}` (`to` is `from.other()`; `target` is the precondition entry), `MergeVv{vv, mtime_ns, a, b}`, `Conflict(Resolution)`, `Resurrect(Resolution)`, `Skip(SkipReason)`, `Rescan`. `Resolution{winner, entry, vv, loser, conflict_name: Option<RelPath>}` replaces the task's `Conflict{winner, loser_side, conflict_name}`. `SkipReason::{Unmanaged(Side), BeneathUnmanaged(RelPath)}`.
+    - **Resurrection is decided in `reconcile`, not `plan`:** a resurrected type change needs a conflict name, and the check needs the views. `plan(&[Action]) -> Vec<Phase>` only orders and splits. `Phase{kind: Conflicts|Deletes|Creates, steps}` (non-empty phases only); `Step{side, path, op: Op, pre: Precondition, source: Option<Entry>}`, where `source` is the other side's entry to `open_read` for a `WriteFile`.
+  - **Semantics** (all in design §6):
+    - **Conflicts write only to the loser side:** rename it away, then create the winner's version there with merged + bump (`Absent`). The winner records that vector in the **next** round (a dominating push of identical content → index-only `SetMeta`). So nothing ever dominates the loser unless the loser side really holds the winner's version, whatever the executor does after a failure. Dir-vs-dir (mode) conflicts: the loser gets the winner's mode via `SetMeta`.
+    - Equal vectors with a different file mtime → `Rescan`. Concurrent with the same content → `MergeVv` with the newer mtime. Tombstone vs tombstone → no action, even with different vectors (**T18:** GC must cope with such pairs). A push of the same content → `SetMeta`, no transfer.
+    - `Unmanaged` vs live → `Skip`; vs absent or tombstone → nothing. Every action beneath an unmanaged path → `Skip(BeneathUnmanaged)`. The root path is ignored.
+    - The delete half of a type change keeps the **target's** vector, so a failed create is retried next round.
+    - Resurrection: a dir removal on side S is blocked if S would still hold anything beneath it after the round (present and not deleted, `Unmanaged` included, or created). Deepest first, so ancestors follow. Over a type change, the other side's file or symlink is renamed to a conflict copy first.
+    - Conflict names: `<ID7>` of the loser's replica; a name live in either index, or already chosen in this call, moves on by one second.
+  - **For T13:**
+    - Run phases in order. After a step fails, skip that path's later steps and mark it dirty.
+    - `Rescan` actions are dirty paths too.
+    - Keep looping while `reconcile` yields non-`Skip` actions, not only while paths are dirty: conflicts and resurrections need a second round.
+    - `Skip(Unmanaged(_))` deserves a warning.
+  - **Tests** (13 in `engine/`):
+    - `decision_table_is_exhaustive`: {absent, file, dir, symlink, tombstone, unmanaged}² × {equal, a>b, b>a, concurrent} × {same, different content} = 288 cases, checked against a separate written-out oracle. Each case also checks the entries the action carries (merged + bumped vv dominates both, conflict-name format) and that it can be planned.
+    - Unit tests: mtime rules; winner rules (mtime, ID tie-break, type rank, bumped vv, dir-vs-dir); conflict names that dodge live names (but not tombstones) and each other (long names that truncate to the same stem); an unmanaged subtree; resurrection (nested, untouched siblings still deleted); resurrection over a type change and over an unmanaged child; root ignored; `descendants` with siblings that sort inside a prefix (`d-x`, `d.x`).
+    - `plan`: a push matrix (every target kind under every pushed kind → ops, phases, preconditions, vectors, source); an ordering test (rename → deletes depth-descending → creates depth-ascending, including a dir→file type change and `MergeVv`); a resurrection plan.
+    - `engine/sim.rs` (proptest, 512 cases): two in-memory replicas that mirror `LocalReplica`'s index semantics (incl. `InvalidOp` as a failure). It runs random edits on a synced base, then concurrent random edits on both sides, then syncs. It asserts convergence in ≤ 3 rounds (limit 5), equal live entries, no failed steps, and that every file version survives unless the peer's vector dominates it. Mutation-checked: disabling resurrection or the conflict rename makes it fail.
 
 ### [ ] T13: Executor, conflicts, `sync --once`, test harness
 - **Depends on:** T11, T12
