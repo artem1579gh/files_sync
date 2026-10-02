@@ -488,7 +488,8 @@ enum Outcome { Applied(Entry), PreconditionFailed(Option<Entry>), Preserved{ con
 | M6 | full symlink matrix | T17 |
 | M7 | hardening: leases, GC, landlock, stress test | T18–T19 |
 | M8 | network: **production variant** | T20–T22 |
-| M9 | follow-ups: crash-suite flake, block-level delta transfer | T23–T24 |
+| M9 | follow-ups: crash-suite flake, block-level delta transfer | T23–T25 |
+| M10 | usability fixes found while writing `docs/usage.md`: broken pipe, server-side `status`, delta visibility | T26–T28 |
 
 ---
 

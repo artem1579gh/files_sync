@@ -1,15 +1,17 @@
 # CLAUDE.md
 
-`files_sync` is a race-free, two-way file synchronizer for Linux, written in Rust: "syncthing-style sync with rsync symlink semantics". It is built local-first (two directories), and a network transport comes later.
+`files_sync` is a race-free, two-way file synchronizer for Linux, written in Rust: "syncthing-style sync with rsync symlink semantics". It syncs two local directories, or two directories over the network (`serve`, mutual TLS, block-level deltas). Milestones M0–M9 are implemented. Open: T25 (a long verification run) and the M10 usability fixes (T26–T28).
 
 - **Design:** [`claude/design.md`](claude/design.md). It is the source of truth; keep it updated when you deviate from it.
 - **Task list:** [`claude/tasks.md`](claude/tasks.md). Its tasks are designed to be done one per session, without prior context.
+- **User guide:** [`docs/usage.md`](docs/usage.md). It describes the CLI, the config file and the user-visible behaviour. Keep it in sync when you change any of these.
 
 ## How to work in a session
 
 1. Open `claude/tasks.md` and take the first unchecked task whose dependencies are checked, unless the user names another task.
 2. Read only the `design.md` sections that task lists, then the code it touches.
 3. Implement the task, make its "Done when" criteria pass, tick the box and fill in Notes, then commit as `T<NN>: <title>`.
+4. If the task changed the CLI, the config or the output, update `docs/usage.md` and `README.md` too.
 
 ## Commands
 
@@ -19,7 +21,10 @@ cargo test                                   # unit + integration
 cargo test --features hooks                  # includes race-injection suites (tests/attack.rs, crash.rs)
 cargo clippy --all-targets -- -D warnings
 cargo test --release --test stress -- --ignored   # long concurrent stress test
+cargo build --release                             # binary for manual checks
 ```
+
+To try the binary by hand, follow `docs/usage.md`. Its ```` ```sh ```` blocks form one runnable demo; ```` ```bash ```` blocks are illustrative and not run. Run it under `/tmp`, with `XDG_STATE_HOME` pointing there too, so `~/.local/state` is not touched.
 
 ## Hard rules (these protect race-freedom; do not break them)
 

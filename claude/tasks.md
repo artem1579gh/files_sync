@@ -791,3 +791,54 @@ The design lives in [`design.md`](design.md); §N.M below refers to its sections
 - **Do:** run `for i in $(seq 50); do cargo test -q --features hooks --test crash || break; done` (~25 min; T23 stopped after 3 runs). On a failure, capture the failing case and `RUST_LOG=files_sync=debug` output, and reopen T23.
 - **Done when:** 50 consecutive runs pass, and the result is recorded in T23's Notes.
 - **Notes:**
+
+## M10: usability fixes (found while writing `docs/usage.md`)
+
+### [ ] T26: Exit quietly on a closed stdout (broken pipe)
+- **Depends on:** —
+- **Read:** —
+- **Files:** `src/cli.rs` (maybe `src/main.rs`), `tests/cli.rs`
+- **Do:**
+  - Reproduce: `files_sync status <pair> | head -3` prints three lines, then panics: `failed printing to stdout: Broken pipe (os error 32)`. Rust ignores `SIGPIPE`, so `println!` panics when the reader has gone. Every command that prints (`init`, `sync --once`, `status`, `serve`'s address line, `daemon`'s summary) is affected.
+  - Make a closed stdout end the process quietly, with the conventional status (141, i.e. 128 + SIGPIPE, or 0; pick one and note it), and with no panic message. A suggested approach: print through `writeln!` on a locked stdout and treat `ErrorKind::BrokenPipe` as "stop printing, exit". Do **not** blindly reset `SIGPIPE` to `SIG_DFL` for the whole process: `serve`, `daemon` and a remote `sync` write to TCP sockets, and a peer that hangs up must remain a `Connection` error, not kill the process. If you do reset it, first verify that every socket write uses `MSG_NOSIGNAL` (std's `TcpStream` on Linux, and anything rustls writes through), and say so in Notes.
+  - A daemon or `serve` whose stdout goes away must keep running. Only its final summary line is lost.
+- **Done when:**
+  - a `tests/cli.rs` test runs `status` (and `sync --once`) with stdout connected to a pipe whose reader is closed at once. The test asserts no panic (`panicked` is absent from stderr) and the exit status chosen above;
+  - `cargo test` and clippy pass.
+- **Notes:**
+
+### [ ] T27: `status` on the host that serves a replica
+- **Depends on:** —
+- **Read:** §2 (Status and sandbox), §7.1 (Network as implemented: Deployment, Daemon and status over the network)
+- **Files:** `src/status.rs`, `src/cli.rs`, `src/server.rs`, `docs/usage.md`, `tests/net.rs` or `tests/cli.rs`
+- **Do:**
+  - Reproduce (as in `docs/usage.md` §7): init a pair with `--b-remote 127.0.0.1:PORT` under one `XDG_STATE_HOME` ("laptop"), copy `config.toml` and B's `.crt`/`.key` to a second state home ("server"), run `serve paper b` there, then `sync --once` from the laptop. Then run `status paper` with the **server's** state home. It prints:
+    - replica B as `served at 127.0.0.1:PORT (run \`status\` there)`, though this *is* that host, and its index `<B>.redb` is right there;
+    - replica A (the laptop's root path) as a local replica with `0 entries`, `last sync: never`, because A's index is not on this host (`PairStatus::load` treats a missing index as "never synced").
+  - The laptop's `status` is correct. The `remote` key describes the pair from the client's side, and the server's copy of the config is identical.
+  - Make `status` useful on the serving host:
+    - **Which replica is served here.** Decide how `status` knows. Options: (a) a remote replica whose index `<id>.redb` exists in this pair directory is served here (after the first `serve`; this is how the laptop/server split already shows on disk); (b) a `status --side a|b` flag. A key file alone does not work: `init` leaves both keys on the client host. Write the choice into §2.
+    - **Its state while `serve` runs.** `serve` holds the redb lock, so reading the index fails with `DatabaseAlreadyOpen`, and only a daemon writes `status.toml` today. Have `serve` save a report as the daemon does: after each `RecordSync` and each quarantine sweep, for its own replica. `status` then reads it, as it does for a daemon.
+    - **The other replica.** A replica that is local in the config but has no index on this host, while the peer is served here, is shown as "on the client host, not here" (or left out), not as an empty, never-synced replica.
+  - Keep the plain local case unchanged: a fresh local pair still shows `never` before its first sync.
+- **Done when:**
+  - a test with two state homes (served B and a client, as above) checks the server-side `status`, both while `serve` runs (from its report) and after it stopped (from the index). It must show B's real entry count and last sync, and must not claim A was "never synced";
+  - the existing `status` tests pass unchanged;
+  - `docs/usage.md` §7 shows the server-side status. Its §12 row about `status` on the server host is removed;
+  - `cargo test` and clippy pass.
+- **Notes:**
+
+### [ ] T28: Show delta transfers in the CLI output
+- **Depends on:** T24
+- **Read:** §7.1 (Block-level delta transfer: Engine, Traffic)
+- **Files:** `src/cli.rs` (`print_report`, the daemon summary), `src/daemon.rs` (`DaemonStats`), `tests/net.rs` or `tests/cli.rs`, `docs/usage.md`
+- **Do:**
+  - Today nothing a user sees shows that a delta was used. `SyncReport::deltas` is counted but never printed, `DaemonStats` has no such field, and no log line mentions it. `docs/usage.md` §7 therefore cannot show it: its 1-byte-change example looks exactly like a whole-file transfer.
+  - `sync --once`: when `report.deltas > 0`, print it in the summary line, e.g. `synced "paper": 1 change(s) applied in 1 round(s), 1 sent as delta`. Keep the line unchanged when it is 0, so local pairs print as before.
+  - `daemon`: add `deltas` to `DaemonStats` (summed per cycle), print it in the stop summary when non-zero, and include it in the per-cycle `sync cycle done` log line (`executor`).
+  - Optional, if cheap: the bytes moved by a remote replica (`RemoteReplica::traffic()`), at `debug` level.
+- **Done when:**
+  - a CLI-level test over loopback (`serve` + `sync --once`, as in `docs/usage.md` §7) changes 1 byte of a file above `DELTA_MIN_SIZE` and asserts `1 sent as delta` in the output. A local pair's output has no delta text;
+  - `docs/usage.md` §7 shows the new line in its expected output. Rerun the guide's `sh` blocks under `/tmp` (see `CLAUDE.md`) and check the line matches;
+  - `cargo test` and clippy pass.
+- **Notes:**
