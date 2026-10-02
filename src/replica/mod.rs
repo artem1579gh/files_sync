@@ -7,21 +7,25 @@
 //! maps that to its own physical fingerprint.
 pub mod local;
 pub mod proto;
+pub mod remote;
 
 pub use local::LocalReplica;
+pub use remote::RemoteReplica;
 
 use std::io::Read;
-use std::time::Duration;
+use std::path::Path;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
 use serde::{Deserialize, Serialize};
 
-use crate::config::ReplicaId;
+use crate::config::{PairConfig, ReplicaId};
 use crate::error::Result;
 use crate::fs::RelPath;
 use crate::fs::commit::FileMeta;
 use crate::index::{Entry, Kind, LocalMeta, PeerState, VersionVector};
 use crate::scan::{ScanStats, Scope};
+use crate::status::ReplicaStatus;
 use crate::watch::Hint;
 
 /// File content streamed out of a replica by [`Replica::open_read`].
@@ -94,6 +98,146 @@ pub trait Replica {
     ) -> Result<Vec<RelPath>> {
         let _ = (peer, tombstones, retention);
         Ok(Vec::new())
+    }
+}
+
+/// What a process that runs sync cycles does with a replica besides the
+/// [`Replica`] calls: housekeeping and status (the daemon, `sync --once`).
+pub trait Housekeeping: Replica {
+    /// When the next quarantined old inode is due to be swept (§5.3 step
+    /// 4(f)); `None` if none is waiting here (a remote replica's server
+    /// sweeps its own).
+    fn next_sweep(&self) -> Option<Instant>;
+
+    /// Sweeps the quarantine (see [`LocalReplica::sweep_quarantine`]).
+    fn sweep(&mut self);
+
+    /// The replica's state for `status`, with `peer` the other replica.
+    fn status(&self, peer: ReplicaId) -> Result<ReplicaStatus>;
+}
+
+impl Housekeeping for LocalReplica {
+    fn next_sweep(&self) -> Option<Instant> {
+        self.quarantine().next_deadline()
+    }
+
+    fn sweep(&mut self) {
+        self.sweep_quarantine();
+    }
+
+    fn status(&self, peer: ReplicaId) -> Result<ReplicaStatus> {
+        ReplicaStatus::of(self, peer)
+    }
+}
+
+impl Housekeeping for RemoteReplica {
+    fn next_sweep(&self) -> Option<Instant> {
+        None
+    }
+
+    fn sweep(&mut self) {}
+
+    fn status(&self, _peer: ReplicaId) -> Result<ReplicaStatus> {
+        Ok(ReplicaStatus::remote(self.addr()))
+    }
+}
+
+/// One replica of a pair as a syncing process has it: opened here, or
+/// reached at the `serve` process that runs it (design §7.1).
+// A process holds two of them; boxing would buy nothing.
+#[allow(clippy::large_enum_variant)]
+pub enum PairReplica {
+    Local(LocalReplica),
+    Remote(RemoteReplica),
+}
+
+impl PairReplica {
+    /// Opens replica `side` (0 = A, 1 = B) of `cfg`: locally, or, if the
+    /// config gives it a remote address, by connecting to its server on
+    /// behalf of the other replica.
+    pub fn open(cfg: &PairConfig, side: usize, pair_dir: &Path) -> Result<PairReplica> {
+        let r = &cfg.replicas[side];
+        if r.is_remote() {
+            let peer = &cfg.replicas[1 - side];
+            Ok(PairReplica::Remote(RemoteReplica::connect(
+                r, peer, pair_dir,
+            )?))
+        } else {
+            Ok(PairReplica::Local(LocalReplica::open(r, pair_dir)?))
+        }
+    }
+
+    fn get(&self) -> &dyn Housekeeping {
+        match self {
+            PairReplica::Local(r) => r,
+            PairReplica::Remote(r) => r,
+        }
+    }
+
+    fn get_mut(&mut self) -> &mut dyn Housekeeping {
+        match self {
+            PairReplica::Local(r) => r,
+            PairReplica::Remote(r) => r,
+        }
+    }
+}
+
+impl Replica for PairReplica {
+    fn id(&self) -> ReplicaId {
+        self.get().id()
+    }
+
+    fn scan(&mut self, scope: Scope) -> Result<ScanStats> {
+        self.get_mut().scan(scope)
+    }
+
+    fn changes_since(&self, seq: u64) -> Result<Vec<(RelPath, Entry)>> {
+        self.get().changes_since(seq)
+    }
+
+    fn open_read(&self, path: &RelPath, expect: &Entry) -> Result<Box<dyn ContentReader>> {
+        self.get().open_read(path, expect)
+    }
+
+    fn apply(
+        &mut self,
+        path: &RelPath,
+        op: Op,
+        pre: Precondition,
+        content: Option<&mut dyn Read>,
+    ) -> Result<Outcome> {
+        self.get_mut().apply(path, op, pre, content)
+    }
+
+    fn watch(&mut self) -> Option<Receiver<Hint>> {
+        self.get_mut().watch()
+    }
+
+    fn adopt(&mut self, path: &RelPath) -> Result<bool> {
+        self.get_mut().adopt(path)
+    }
+
+    fn record_sync(
+        &mut self,
+        peer: ReplicaId,
+        tombstones: Vec<(RelPath, VersionVector, PeerState)>,
+        retention: Duration,
+    ) -> Result<Vec<RelPath>> {
+        self.get_mut().record_sync(peer, tombstones, retention)
+    }
+}
+
+impl Housekeeping for PairReplica {
+    fn next_sweep(&self) -> Option<Instant> {
+        self.get().next_sweep()
+    }
+
+    fn sweep(&mut self) {
+        self.get_mut().sweep()
+    }
+
+    fn status(&self, peer: ReplicaId) -> Result<ReplicaStatus> {
+        self.get().status(peer)
     }
 }
 

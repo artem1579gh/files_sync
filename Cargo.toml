@@ -11,8 +11,10 @@ crossbeam-channel = "0.5.17"
 jiff = "0.2.37"
 libc = "0.2.189"
 postcard = { version = "1.1.3", features = ["use-std"] }
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring"] }
 redb = "4.3.0"
-rustix = { version = "1.1.5", features = ["event", "fs", "rand"] }
+rustix = { version = "1.1.5", features = ["event", "fs", "net", "rand"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std"] }
 serde = { version = "1.0.229", features = ["derive"] }
 smallvec = { version = "1.16.2", features = ["serde"] }
 thiserror = "2.0.21"

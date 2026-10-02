@@ -11,8 +11,10 @@ pub mod index;
 pub mod replica;
 pub mod sandbox;
 pub mod scan;
+pub mod server;
 pub mod status;
 pub mod symlink;
+pub mod tls;
 pub mod watch;
 
 pub use error::{Error, RemoteKind, Result};

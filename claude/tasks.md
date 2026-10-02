@@ -640,7 +640,7 @@ The design lives in [`design.md`](design.md); §N.M below refers to its sections
   - **Pre-existing flake (not fixed, not caused by T20):** `cargo test --features hooks --test crash` fails about 1 run in 6–10, on this branch and on a clean T19 checkout alike (1 of 10 there). Always scenario 14 ("materialize"), at varying hook points (`stage.synced`, `commit.synced`, `scan.stat`): the harness's final rescan of A reports `d/e/l` dirty (`dirty: [RelPath("d/e/l")]`, no changes). Looks timing-dependent; worth a look by whoever touches T15/T17 code next.
   - **For T21:** the server must answer requests in order and drain an `Apply`'s content before answering when `apply` did not consume it. A client that drops an `open_read` reader before EOF must `drain` it (or close the connection); there is no cancel message. The client side of hints needs a reader that demultiplexes `Response::Hint` from answers (`ContentStream`'s filter does this inside a stream). Map `Request::RecordSync` batches back to one `record_sync` call (same `peer` and `retention`).
 
-### [ ] T21: RemoteReplica, server, TLS
+### [x] T21: RemoteReplica, server, TLS
 - **Depends on:** T20
 - **Read:** §7.1
 - **Files:** `src/replica/remote.rs`, `src/server.rs`, `src/cli.rs`, `src/config.rs`
@@ -655,6 +655,26 @@ The design lives in [`design.md`](design.md); §N.M below refers to its sections
   - Incremental `changes_since(seq)` exchange.
 - **Done when:** `sync --once` and `daemon` work between two processes over 127.0.0.1, and a wrong peer certificate is rejected.
 - **Notes:**
+  - **Design:** §7.1 "Network as implemented (T21)": identities and pinning, deployment, server, hint connections, client connections, errors, incremental index exchange, daemon/status. §2 layout and crates updated.
+  - **New crates:** `rustls` 0.23.45 (`ring` + `std` only; TLS 1.3 only) and `rcgen` 0.14.10 (`crypto` + `ring`); `rustix` gained the `net` feature (keepalive, `TCP_NODELAY`).
+  - **Modules:**
+    - `src/tls.rs`: `DeviceId` (blake3 of the cert DER, 64 hex digits, serde as a string), `Identity` (`generate`, `save`/`load` as `<pair>/<replica>.crt`/`.key`, `load` checks the pin, `server_config`/`client_config`), the `Pinned` verifier for both directions.
+    - `src/server.rs`: `Server::{new, open(cfg, side, pair_dir), spawn(listener)}` → `ServerHandle::{local_addr, replica, sweep, close_connections, shutdown, into_replica}`.
+    - `src/replica/remote.rs`: `RemoteReplica::{connect(remote_cfg, local_cfg, pair_dir), with_tls(addr, local, remote, tls), addr, entries_received, connections}`.
+    - `src/replica/mod.rs`: `Housekeeping` trait (`next_sweep`, `sweep`, `status`) for `LocalReplica`, `RemoteReplica`, `PairReplica`; `PairReplica::open(cfg, side, pair_dir)` (local or remote by config).
+  - **Config:** `ReplicaConfig.device: Option<DeviceId>` and `.remote: Option<String>` (both omitted from the TOML when unset, so older configs load). `init` now writes both identities (config first, so an existing pair is never touched). `config::init_with(state_home, pair, [NewReplica; 2])` for remote replicas; a remote root must be absolute and is not checked locally; the overlap check only applies when both replicas are local; `ReplicaConfig::device()` errors with `Error::Tls` for a pre-T21 pair.
+  - **CLI:** `init --a-remote/--b-remote HOST:PORT` (prints device IDs and what to copy to the server host); `serve <pair> <a|b> [--listen ADDR]` (default address: the replica's `remote`; prints `serving replica … on ADDR`; sweeps the quarantine; SIGINT/SIGTERM stop it cleanly); `sync --once`/`daemon` open `PairReplica`s; `status` shows a remote replica as "served at ADDR"; `--sandbox` covers `serve` (the served root is allowed even though the shared config marks it remote — a bug found by hand and covered by `sandboxed_serve_and_sync`).
+  - **Errors:** new `Error::Connection { peer, reason }` (any transport failure; `RemoteKind::Protocol`, so fatal for the cycle; `is_disconnected()`) and `Error::Tls { reason }`. `Daemon` takes `&mut dyn Housekeeping` and retries a disconnected cycle after `RECONNECT_DELAY` (5 s) with a full cycle; existing callers with `LocalReplica`s compile unchanged.
+  - **Deviations:**
+    - Hints use a separate connection: `Watch` turns its connection into a hint stream (blocking rustls cannot read and write one TLS connection from two threads, and a client idle in the daemon would not read pushed hints on its request connection). Request connections are strictly request/response. Compatible with the T20 messages.
+    - The task text's `serve --listen addr <pair-side>` is `serve <pair> <a|b> [--listen addr]`.
+    - Each replica (not each host) has a certificate: a client presents the identity of the replica it acts for, so the server pins exactly one device (the peer's). Moving a replica to another host means copying its `.crt`/`.key` there.
+  - **Tests:**
+    - `tests/remote.rs` (6, in-process over 127.0.0.1): sync both ways (dirs, symlink, non-UTF-8 name, empty and 300 KB files, edits, delete, conflict) with a no-op cycle transferring no entries and the delta bounded, all over one connection; remote index order and `changes_since(seq)`, reads (small reader dropped early → drained, connection kept; large → closed; a request during a read uses a second connection; error classes `Unstable`/`Remote` survive); wrong client certificate, wrong pinned server device, wrong replica ID rejected; hints pushed, then `FullRescan` after the connections were cut; server restart at the same address (cycle fails with `Connection`, the next reconnects, mirror starts over); the daemon with a remote B (hints alone carry B's change; a cut connection is retried).
+    - `tests/net.rs` (3, two processes, separate state homes as two hosts): `serve` + `sync --once` + `status` + `daemon` (both directions, SIGTERM) + server certificate not the pinned one (`is not the pinned`) + client certificate not pinned (fails; the server logs `rejected: TLS handshake failed`) + `serve` stops cleanly on SIGTERM; `serve` without an address or identity, sync with nothing listening; `--sandbox` on both sides (skipped without landlock).
+    - Unit: `tls` (device ID text, identity save/load/pin/permissions), `config::init_with_a_remote_replica`; `init_round_trips` now expects the identity files.
+    - Mutation-checked by hand: a verifier that accepts any certificate fails both `wrong_certificates_are_rejected` and the two-process test. 15 consecutive runs of `remote` + `net`: no flake.
+  - **Follow-ups (T22 / later):** the harness can serve a replica in-process with `Server::new(..).spawn(TcpListener::bind("127.0.0.1:0"))` and `ServerHandle::into_replica`; the crash/attack hooks are not reachable through a remote replica's process boundary unless the server runs in-process. No retry of a request on a connection that dies mid-request (the cycle fails and is retried as a whole). Block-level delta transfer (§7.1) is still open. The pre-existing `crash` flake noted under T20 was not looked at.
 
 ### [ ] T22: Network test parity
 - **Depends on:** T21, T14, T17, T19

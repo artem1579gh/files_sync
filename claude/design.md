@@ -40,11 +40,13 @@ Task breakdown: [`tasks.md`](tasks.md). Section numbers (§N.M) are referenced f
 ```
 src/main.rs        binary entry, calls into lib
 src/lib.rs
-src/cli.rs         clap: init, sync --once, daemon, status  [serve, --remote later]
-src/config.rs      pair config: roots, ReplicaIds, per-replica symlink policy flags
+src/cli.rs         clap: init (--a-remote/--b-remote), sync --once, daemon, status, serve
+src/config.rs      pair config: roots, ReplicaIds, per-replica symlink policy flags, pinned device IDs, remote addresses
 src/daemon.rs
 src/status.rs      `status <pair>`: index size, conflict copies, quarantine, last sync (T18)
 src/sandbox.rs     --sandbox: landlock, writes only beneath the roots and the state directory (T18)
+src/server.rs      `serve`: a LocalReplica answering the wire protocol over TLS (T21)
+src/tls.rs         per-replica self-signed identities, DeviceId, pinned-certificate verifiers (T21)
 src/fs/      root.rs     Root + openat2 parent resolution, fd-based readdir
              stat.rs     statx Fingerprint
              commit.rs   CAS create/replace/delete/symlink/mkdir/rmdir   <- the ONLY code that mutates replicas
@@ -57,9 +59,9 @@ src/index/   entry.rs, vv.rs (version vectors), store.rs (redb), journal.rs (int
 src/symlink/ policy.rs, safety.rs (port of rsync unsafe_symlink), munge.rs
 src/scan/    scanner.rs, hasher.rs
 src/watch/   inotify.rs, debounce.rs
-src/replica/ mod.rs (trait), local.rs, proto/{mod,messages,framing}.rs (wire protocol, T20)   [remote.rs later]
+src/replica/ mod.rs (trait, Housekeeping, PairReplica), local.rs, remote.rs (T21), proto/{mod,messages,framing}.rs (wire protocol, T20)
 src/engine/  reconcile.rs, plan.rs, executor.rs, conflict.rs
-tests/       harness/, attack.rs, symlink_matrix.rs, stress.rs, crash.rs
+tests/       harness/, attack.rs, symlink_matrix.rs, stress.rs, crash.rs, remote.rs, net.rs
 ```
 
 **Crates (one choice for each need):**
@@ -78,7 +80,7 @@ tests/       harness/, attack.rs, symlink_matrix.rs, stress.rs, crash.rs
 | errors | `thiserror` (lib), `anyhow` (bin) |
 | timestamps in conflict names | `jiff` |
 | self-sandbox | raw landlock syscalls through `libc` (the `landlock` crate was not needed) |
-| network (later) | `rustls` (blocking, over std TcpStream) |
+| network | `rustls` 0.23 (blocking `StreamOwned` over std `TcpStream`, `ring` provider, TLS 1.3 only); certificates generated with `rcgen` |
 | dev-only | `tempfile`, `proptest` |
 
 **State directory:** `$XDG_STATE_HOME/fsync/<pair>/<replica>.redb` holds the index and journal. It lives outside the replica roots. A running daemon also writes `status.toml` there (below).
@@ -435,6 +437,17 @@ enum Outcome { Applied(Entry), PreconditionFailed(Option<Entry>), Preserved{ con
 - **Batches:** the potentially huge lists (`Changes`, the tombstones of `RecordSync`, `Collected`) go in batches of about `BATCH_BYTES` (1 MiB) encoded, each with a `more` flag (`batches()` splits by `postcard::experimental::serialized_size`). `ScanStats` and `Hint::Paths` are single messages (bounded by `MAX_FRAME`).
 - **Content:** `Chunk(bytes)` of up to `CHUNK_SIZE` (64 KiB, encoded as a byte string), then `End { hash }` (blake3 of all chunks) or `Abort(WireError)` if the sender's source fails mid-stream (e.g. a `StableReader` that sees the file change). `send_content` sends a stream and tells a source error (stream ended with `Abort`, connection still in step) from a connection error. `ContentStream` reads one as a plain `Read`: EOF only after `End` with a matching hash; an `Abort` fails with the sender's error (so an `Unstable` on the server is `is_unstable()` on the client, and `TempFile::copy_from` → `apply` returns `Err(Unstable)` with nothing committed, as locally); a filter closure sets aside interleaved messages (pushed hints). `drain()` consumes an unread rest, so the connection stays in step: the server must drain an `Apply`'s content even when the precondition fails before reading it.
 - **Errors:** `WireError { kind: RemoteKind, message }`; `RemoteKind` (`Unstable`, `NotFound`, `InvalidOp`, `InvalidPath`, `Index`, `Protocol`, `Other`) keeps the class the executor acts on. The receiving side gets `Error::Remote { kind, message }`; `Error::is_unstable`/`is_not_found` recognise it, and the executor treats `Index` and `Protocol` (local or remote) as fatal, like `Db`/`BadIndex`.
+
+**Network as implemented (T21: `src/tls.rs`, `src/server.rs`, `src/replica/remote.rs`):**
+- **Identities.** `init` generates a self-signed ECDSA P-256 certificate per replica (`rcgen`), stored as DER in the state directory: `<pair>/<replica-id>.crt` and `<replica-id>.key` (mode 0600; never replaced). Device ID = blake3 of the certificate DER, 64 hex digits. The config pins each replica's `device`; loading an identity checks it against the pin. A replica entry may carry `remote = "host:port"`: the address where `serve` runs it (its `root` is then a path on that host and is not checked locally, nor for overlap).
+- **Who presents what.** A connection to replica X's server is made on behalf of X's peer: the client presents the peer replica's certificate. Each side accepts exactly the other's pinned device ID (custom rustls verifiers; no CA, name or validity check; TLS 1.3 only, so the handshake signature proves possession of the pinned key). Then the protocol handshake checks replica IDs. A pair made before T21 (no `device`) still works locally; over the network it fails with `Error::Tls`.
+- **Deployment.** `init <pair> --a DIR --b DIR --b-remote HOST:PORT` on the client host, then copy `config.toml`, `<B>.crt` and `<B>.key` to the same `$XDG_STATE_HOME/fsync/<pair>/` on the server host and run `serve <pair> b [--listen ADDR]` there (default: the replica's `remote`; port 0 picks one; the address is printed on stdout). `sync --once` and `daemon` open each replica locally or, if it has `remote`, connect to it (`PairReplica`); both may be remote. Each side keeps its own index in its own state directory.
+- **Server.** An accept thread, one thread per connection. Every request is answered in order under the `LocalReplica`'s mutex (CAS checks run there, unchanged). `Apply` content is read as a `ContentStream` and drained if `apply` did not consume it; `RecordSync` batches are joined into one call, after which the quarantine is swept (the end of the peer's cycle); `serve` also sweeps when grace periods end. On SIGINT/SIGTERM: stop accepting, close connections, wait for the request in progress, drain the quarantine. TLS 1.3 checks the client certificate after the client finished, so a rejected client sees the server's alert at the protocol handshake; the server logs `rejected: TLS handshake failed: …`.
+- **Hints (deviation from T20's sketch).** `Watch` turns its connection into a hint stream: after `Watching(true)` the server only pushes `Hint`s and reads no more requests. The client uses a separate connection for it, so request connections stay strictly request/response (blocking rustls cannot read and write one connection from two threads). The server subscribes the connection before starting the replica's watcher (once; one fan-out thread copies its hints to every hint connection), so nothing between `Watching(true)` and the client's scan is lost. The client's hint thread reconnects with backoff (0.5 s … 30 s) when the hint connection drops, then sends `FullRescan`.
+- **Client connections.** One idle request connection, reused; it is checked with a non-blocking `peek` before reuse (EOF or unexpected bytes, e.g. a stopped server's `close_notify`, mean reconnect). An `open_read` reader takes the connection along and gives it back at the end of the stream; dropped early, it drains a file of at most 1 MiB and closes the connection otherwise. A request while a reader holds the connection opens another one, so misuse cannot desynchronise the protocol. TCP keepalive (60 s idle, 6 × 10 s) and `TCP_NODELAY` on both sides; connect timeout 10 s, TLS + protocol handshake timeout 30 s, no timeouts afterwards (scans may be long).
+- **Errors.** Any transport failure (I/O, TLS, malformed or unexpected message) closes the connection and becomes `Error::Connection { peer, reason }` (`RemoteKind::Protocol`, so the executor aborts the cycle); the next call reconnects. `Daemon::run` treats `is_disconnected()` as transient: it waits `RECONNECT_DELAY` (5 s) and runs a full cycle. A source that fails mid-`Apply` (stream ended with `Abort`) is returned as that source error.
+- **Incremental index exchange.** `RemoteReplica` mirrors the server's index (wire form) and sends `ChangesSince { seq: last seen }`; the engine's `changes_since(0)` is answered from the mirror, so a no-op cycle transfers no entries. Entries only disappear through `record_sync`, whose collected paths are removed from the mirror. The mirror starts over on every new connection (the server's index may have been replaced).
+- **Daemon and status over the network.** The daemon and `drain_quarantine` work on the `Housekeeping` trait (`next_sweep`, `sweep`, `status`), implemented by `LocalReplica`, `RemoteReplica` (no quarantine here) and `PairReplica`. `status` shows a remote replica as "served at ADDR"; its state is shown by `status` on its host. `--sandbox` confines writes to the local roots and the state directory (and works for `serve`).
 
 ---
 

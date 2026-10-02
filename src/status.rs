@@ -15,7 +15,7 @@ use crate::config::{PairConfig, ReplicaId};
 use crate::error::{Error, Result};
 use crate::fs::{RelPath, is_conflict_name};
 use crate::index::{IndexStore, IntentState, Kind};
-use crate::replica::{LocalReplica, Replica};
+use crate::replica::{Housekeeping, LocalReplica};
 
 /// File name of the daemon's status report in the pair's state directory.
 pub const STATUS_FILE: &str = "status.toml";
@@ -37,6 +37,10 @@ pub struct ReplicaStatus {
     pub unfinished: u64,
     /// End of the last sync cycle with the peer (ns since the Unix epoch).
     pub last_sync_ns: Option<i64>,
+    /// The replica runs in a `serve` process at this address; its state is
+    /// not known here (see `status` on its host).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
 }
 
 impl ReplicaStatus {
@@ -77,6 +81,14 @@ impl ReplicaStatus {
         Ok(st)
     }
 
+    /// A replica served elsewhere, at `addr`.
+    pub fn remote(addr: &str) -> ReplicaStatus {
+        ReplicaStatus {
+            remote: Some(addr.to_owned()),
+            ..ReplicaStatus::default()
+        }
+    }
+
     /// The state of an open replica, with its live quarantine.
     pub fn of(replica: &LocalReplica, peer: ReplicaId) -> Result<ReplicaStatus> {
         let q = replica.quarantine().len() as u64;
@@ -98,11 +110,11 @@ pub struct PairStatus {
 
 impl PairStatus {
     /// The state of two open replicas.
-    pub fn of(a: &LocalReplica, b: &LocalReplica) -> Result<PairStatus> {
+    pub fn of(a: &dyn Housekeeping, b: &dyn Housekeeping) -> Result<PairStatus> {
         Ok(PairStatus {
             taken_ns: now_ns(),
             from_daemon: false,
-            replicas: [ReplicaStatus::of(a, b.id())?, ReplicaStatus::of(b, a.id())?],
+            replicas: [a.status(b.id())?, b.status(a.id())?],
         })
     }
 
@@ -113,6 +125,10 @@ impl PairStatus {
         let ids = [cfg.replicas[0].id, cfg.replicas[1].id];
         let mut replicas: [ReplicaStatus; 2] = Default::default();
         for (i, st) in replicas.iter_mut().enumerate() {
+            if let Some(addr) = &cfg.replicas[i].remote {
+                *st = ReplicaStatus::remote(addr);
+                continue;
+            }
             let path = IndexStore::path_for(pair_dir, ids[i]);
             if !path.exists() {
                 continue;

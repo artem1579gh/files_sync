@@ -14,6 +14,12 @@
 //!   each cycle, which unlinks those a write lease can be taken on;
 //! - the **stop** channel (a message, or its sender dropped).
 //!
+//! A remote replica (design §7.1) whose connection is lost fails the cycle
+//! with [`Error::Connection`]; the daemon then waits
+//! [`Daemon::RECONNECT_DELAY`] and runs a full cycle, which connects again.
+//! Its hints come from the server; after the hint connection was lost and
+//! made again, a full rescan is asked for.
+//!
 //! Our own writes produce inotify events too. They cause one more cycle
 //! scoped to the written paths, whose scan finds the index already up to date
 //! (§5.3 step 5), so it applies nothing: no echo.
@@ -27,7 +33,7 @@ use crossbeam_channel::{Receiver, Sender, select};
 use crate::engine::{Engine, SyncReport};
 use crate::error::{Error, Result};
 use crate::fs::RelPath;
-use crate::replica::{LocalReplica, Replica};
+use crate::replica::Housekeeping;
 use crate::scan::Scope;
 use crate::status::PairStatus;
 use crate::watch::Hint;
@@ -102,6 +108,9 @@ impl Daemon {
     pub const DEFAULT_RESCAN: Duration = Duration::from_secs(10 * 60);
     /// Delay before paths a cycle left unresolved are tried again.
     pub const RETRY_DELAY: Duration = Duration::from_secs(1);
+    /// Delay before a full cycle after a remote replica's connection was
+    /// lost.
+    pub const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 
     pub fn new() -> Daemon {
         Daemon::default()
@@ -139,7 +148,7 @@ impl Daemon {
         self
     }
 
-    fn save_status(&self, a: &LocalReplica, b: &LocalReplica) {
+    fn save_status(&self, a: &dyn Housekeeping, b: &dyn Housekeeping) {
         let Some(dir) = &self.status_dir else { return };
         if let Err(e) = PairStatus::of(a, b).and_then(|st| st.save(dir)) {
             tracing::warn!(error = %e, "cannot save the status report");
@@ -148,13 +157,14 @@ impl Daemon {
 
     /// Syncs `a` and `b` until `stop` receives a message or is closed.
     ///
-    /// Fails only when a cycle fails as a whole (an index or root failure);
-    /// per-path problems are logged and retried. Quarantined files may be
-    /// left when it returns: sweep them before exiting.
+    /// Fails only when a cycle fails as a whole (an index or root failure;
+    /// a lost connection is retried); per-path problems are logged and
+    /// retried. Quarantined files may be left when it returns: sweep them
+    /// before exiting.
     pub fn run(
         &self,
-        a: &mut LocalReplica,
-        b: &mut LocalReplica,
+        a: &mut dyn Housekeeping,
+        b: &mut dyn Housekeeping,
         stop: &Receiver<()>,
     ) -> Result<DaemonStats> {
         let mut hints = [a.watch(), b.watch()].map(|h| h.unwrap_or_else(crossbeam_channel::never));
@@ -177,7 +187,16 @@ impl Daemon {
             }
             if !todo.is_empty() {
                 let cycle = std::mem::take(&mut todo);
-                let report = self.cycle(a, b, cycle, &mut stats)?;
+                let report = match self.cycle(a, b, cycle, &mut stats) {
+                    Ok(report) => report,
+                    Err(e) if e.is_disconnected() => {
+                        tracing::warn!(error = %e, delay = ?Self::RECONNECT_DELAY, "sync cycle failed; trying again");
+                        stats.unconverged += 1;
+                        next_full = Instant::now() + Self::RECONNECT_DELAY;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
                 if report.full {
                     next_full = Instant::now() + self.rescan_every;
                 }
@@ -195,15 +214,16 @@ impl Daemon {
             }
             // Right after a cycle too: what can be leased goes at once.
             let after_cycle = changed;
-            for r in [&mut *a, &mut *b] {
-                if r.quarantine()
-                    .next_deadline()
+            let mut sweep = |r: &mut dyn Housekeeping| {
+                if r.next_sweep()
                     .is_some_and(|d| after_cycle || d <= Instant::now())
                 {
-                    r.sweep_quarantine();
+                    r.sweep();
                     changed = true;
                 }
-            }
+            };
+            sweep(a);
+            sweep(b);
             if changed {
                 self.save_status(a, b);
             }
@@ -211,8 +231,8 @@ impl Daemon {
             let wake = [
                 Some(next_full),
                 retry.as_ref().map(|(at, _)| *at),
-                a.quarantine().next_deadline(),
-                b.quarantine().next_deadline(),
+                a.next_sweep(),
+                b.next_sweep(),
             ]
             .into_iter()
             .flatten()
@@ -256,8 +276,8 @@ impl Daemon {
     /// Runs one cycle for `todo`.
     fn cycle(
         &self,
-        a: &mut LocalReplica,
-        b: &mut LocalReplica,
+        a: &mut dyn Housekeeping,
+        b: &mut dyn Housekeeping,
         todo: Todo,
         stats: &mut DaemonStats,
     ) -> Result<CycleReport> {

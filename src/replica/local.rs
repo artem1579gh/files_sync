@@ -1513,6 +1513,8 @@ mod tests {
                 keep_dirlinks: false,
                 keep_dirlinks_unsafe: false,
                 followed_write: Default::default(),
+                device: None,
+                remote: None,
             };
             let r = LocalReplica::open(&cfg, state.path())
                 .unwrap()

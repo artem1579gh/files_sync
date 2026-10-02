@@ -92,6 +92,17 @@ pub enum Error {
     #[error("protocol error: {reason}")]
     Protocol { reason: String },
 
+    /// The connection to a remote replica could not be made (refused, TLS
+    /// or handshake failure, a peer certificate that is not the pinned one)
+    /// or was lost. Nothing about one path: the cycle fails, and a daemon
+    /// tries again later (design §7.1).
+    #[error("connection to {peer}: {reason}")]
+    Connection { peer: String, reason: String },
+
+    /// A TLS identity (certificate and key) cannot be made, read or used.
+    #[error("TLS identity: {reason}")]
+    Tls { reason: String },
+
     /// Neither `$XDG_STATE_HOME` nor `$HOME` gives a usable state directory.
     #[error("cannot determine state directory: set XDG_STATE_HOME or HOME to an absolute path")]
     NoStateHome,
@@ -163,6 +174,11 @@ impl Error {
         }
     }
 
+    /// The connection to a remote replica failed ([`Error::Connection`]).
+    pub fn is_disconnected(&self) -> bool {
+        matches!(self, Error::Connection { .. })
+    }
+
     /// The class this error is sent over the wire with.
     pub fn remote_kind(&self) -> RemoteKind {
         match self {
@@ -170,7 +186,7 @@ impl Error {
             Error::InvalidOp { .. } => RemoteKind::InvalidOp,
             Error::InvalidPath { .. } => RemoteKind::InvalidPath,
             Error::Db(_) | Error::BadIndex { .. } => RemoteKind::Index,
-            Error::Protocol { .. } => RemoteKind::Protocol,
+            Error::Protocol { .. } | Error::Connection { .. } => RemoteKind::Protocol,
             Error::Remote { kind, .. } => *kind,
             e if e.is_not_found() => RemoteKind::NotFound,
             _ => RemoteKind::Other,
