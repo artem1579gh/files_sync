@@ -15,7 +15,7 @@ The design lives in [`design.md`](design.md); §N.M below refers to its sections
 
 ## M0: foundations
 
-### [ ] T01: Scaffolding
+### [x] T01: Scaffolding
 - **Depends on:** —
 - **Read:** §1, §2
 - **Files:** `Cargo.toml`, `src/lib.rs`, `src/main.rs`, `src/cli.rs`, `src/config.rs`, `src/error.rs`, empty `mod.rs` stubs for every module in §2
@@ -32,6 +32,15 @@ The design lives in [`design.md`](design.md); §N.M below refers to its sections
   - Add an `error.rs` `Error` enum with `thiserror`.
 - **Done when:** `cargo run -- --help` lists the subcommands, `init` writes a config that loads back, and clippy is clean.
 - **Notes:**
+  - Deps as listed; `rustix` has features `fs` + `rand` (`rand` is used for `getrandom`, so no `rand` crate is needed). `postcard` uses `use-std`, `tracing-subscriber` uses `env-filter`. Edition 2024.
+  - Module stubs: `fs`, `index`, `symlink`, `scan`, `watch`, `replica`, `engine` (`mod.rs` holding only a doc comment) plus `src/daemon.rs`. Submodule files (`root.rs` etc.) are left to their own tasks.
+  - `cli::run()` returns `anyhow::Result` because `cli.rs` is the binary's front end; the rest of the library uses `crate::Error`. Stub subcommands exit 1 with "Error: `<cmd>`: not implemented". `sync` without `--once` is rejected and points to `daemon`. Logging goes to stderr via `RUST_LOG` (default `info`).
+  - Config: `ReplicaId` is serialized as a 16-digit hex **string** in TOML, because TOML integers are i64 and random u64 IDs would not round-trip. `ReplicaId` itself is `serde(transparent)` u64, so postcard/index stay compact. `Display` is also 16-digit hex, so ID7 = the first 7 chars.
+  - `SymlinkPolicy` is serialized in kebab-case (`links`, `copy-unsafe-links`, …) and defaults to `Links` (rsync `-a`). `symlinks`, `munge_links` and `keep_dirlinks` are optional in the file. `deny_unknown_fields` is on.
+  - The config API takes `state_home` explicitly (`PairConfig::load/create/save`, `config::init`); `config::state_home()` reads `$XDG_STATE_HOME`, else `$HOME/.local/state` (relative values are ignored, per the XDG spec). This keeps tests independent of the environment.
+  - `config::init` canonicalises both roots and rejects: a missing root or a non-directory, overlapping or nested roots, a state dir inside a root, an existing pair (installed via `link(2)`, so no overwrite even under a race), and non-UTF-8 root paths (TOML can't store them; follow-up if needed). Pair names are restricted to `[A-Za-z0-9._-]`, ≤64 bytes, no leading `.`.
+  - Config writes are atomic (temp file + fsync + rename/link + dir fsync), with dir mode 0700 and file mode 0600. These use `std::fs`, which is fine because the state dir is never inside a replica.
+  - Tests: 8 unit tests in `config.rs`, plus `tests/cli.rs` (help lists the subcommands, `init` round-trips through the real binary, stubs report "not implemented").
 
 ### [ ] T02: Filesystem feature checks (`fs/caps.rs`)
 - **Depends on:** T01
