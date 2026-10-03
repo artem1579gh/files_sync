@@ -553,6 +553,8 @@ Edit it while no `sync`, `daemon` or `serve` for the pair is running. Unknown ke
 | `pair already initialised` | `init` never overwrites. Delete the pair's state directory to start over: this forgets the sync history, not your files. |
 | A required filesystem feature is missing | The root is on an unsupported filesystem (e.g. `/mnt/c` under WSL, NFS). Move it to ext4, xfs, btrfs or tmpfs. |
 | `index database: Database already open. Cannot acquire lock.` | Another `sync`, `daemon` or `serve` for the same pair holds the index. Run one at a time. |
+| `status`: `index in use (a daemon?), and no report at …` (or ``index in use (by `serve`?)``) | Another process holds the index but has not saved a status report, e.g. a `sync --once` that is still running. Run `status` again when it has finished. |
+| A command exits with status 141 | Its stdout was closed early (e.g. `files_sync status docs \| head -3`). Its work was done; only the rest of its output was dropped. See [§9](#9-command-reference). |
 | `not settled (changed during the sync), retry: <path>` | The file kept changing while it was being synced. Nothing was lost; the next run (or the daemon, after 1 s) retries it. |
 | `.sync-conflict-` files appear | Both sides changed the file between syncs. See [§4](#4-conflicts). |
 | `.~fsync.*` files remain after a crash | They are recovered or removed automatically by the next `sync`, `daemon` or `serve` of the pair. |
