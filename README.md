@@ -69,6 +69,7 @@ files_sync status docs
 files_sync init paper --a ~/paper --b /srv/paper --b-remote server:7777
 #   copy config.toml and B's .crt/.key to the server, then on the server:
 files_sync serve paper b
+files_sync status paper            # there: the served replica's state
 #   and on this host, as usual:
 files_sync daemon paper
 ```

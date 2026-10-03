@@ -78,6 +78,8 @@ pub struct DaemonStats {
     pub full_cycles: u64,
     /// Steps applied (the action counter).
     pub applied: u64,
+    /// Files written as a block-level delta (design §7.1), among `applied`.
+    pub deltas: u64,
     pub conflicts: u64,
     /// Cycles that left paths unresolved or failed.
     pub unconverged: u64,
@@ -296,6 +298,7 @@ impl Daemon {
         stats.cycles += 1;
         stats.full_cycles += u64::from(full);
         stats.applied += report.applied as u64;
+        stats.deltas += report.deltas as u64;
         stats.conflicts += report.conflicts.len() as u64;
         if !report.is_converged() {
             stats.unconverged += 1;

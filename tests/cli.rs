@@ -247,6 +247,23 @@ fn sync_once_syncs_two_directories() {
     }
 }
 
+/// A local pair sends whole files, so its summary never mentions deltas
+/// (T28), even for a replaced file above the delta threshold.
+#[test]
+fn local_sync_prints_no_delta() {
+    let state = tempfile::tempdir().unwrap();
+    let (a, b) = init_pair(state.path(), "p");
+    let mut data = vec![1u8; 2 << 20];
+    std::fs::write(a.path().join("big"), &data).unwrap();
+    ok(state.path(), &["sync", "--once", "p"]);
+    data[1000] = 2;
+    std::fs::write(a.path().join("big"), &data).unwrap();
+    let out = ok(state.path(), &["sync", "--once", "p"]);
+    assert!(out.contains("1 change(s) applied in 1 round(s)\n"), "{out}");
+    assert!(!out.contains("delta"), "{out}");
+    assert_eq!(std::fs::read(b.path().join("big")).unwrap(), data);
+}
+
 #[test]
 fn sync_requires_initialised_pair() {
     let state = tempfile::tempdir().unwrap();
@@ -254,4 +271,58 @@ fn sync_requires_initialised_pair() {
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("not initialised"), "{stderr}");
+}
+
+/// Runs `args` with stdout on a pipe whose reader is already closed.
+fn run_closed_stdout(state: &Path, args: &[&str]) -> Output {
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    Command::new(env!("CARGO_BIN_EXE_files_sync"))
+        .args(args)
+        .env("XDG_STATE_HOME", state)
+        .env_remove("RUST_LOG")
+        .stdout(writer)
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap()
+}
+
+/// A closed stdout (`status p | head -0`) ends the command quietly with
+/// 141 (128 + SIGPIPE), after it did its work; it does not panic.
+#[test]
+fn closed_stdout_exits_quietly() {
+    let state = tempfile::tempdir().unwrap();
+    let (a, b) = init_pair(state.path(), "p");
+    std::fs::write(a.path().join("f"), "x").unwrap();
+    for args in [&["sync", "--once", "p"][..], &["status", "p"]] {
+        let out = run_closed_stdout(state.path(), args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!stderr.contains("panicked"), "{args:?}: {stderr}");
+        assert!(!stderr.contains("Error"), "{args:?}: {stderr}");
+        assert_eq!(out.status.code(), Some(141), "{args:?}: {stderr}");
+    }
+    assert_eq!(std::fs::read(b.path().join("f")).unwrap(), b"x");
+
+    // A daemon keeps syncing; only its stop summary is lost.
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_files_sync"))
+        .args(["daemon", "p"])
+        .env("XDG_STATE_HOME", state.path())
+        .env_remove("RUST_LOG")
+        .stdout(writer)
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::fs::write(a.path().join("g"), "y").unwrap();
+    wait_for("daemon sync", || b.path().join("g").exists());
+    let pid = i32::try_from(child.id()).unwrap();
+    // SAFETY: sending a signal to our own child process.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    wait_for("daemon stop", || child.try_wait().unwrap().is_some());
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert!(stderr.contains("daemon stopped"), "{stderr}");
+    assert_eq!(out.status.code(), Some(141), "{stderr}");
 }

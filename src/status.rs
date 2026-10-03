@@ -6,8 +6,15 @@
 //! daemon holds both indexes open, and redb locks them to one process, so
 //! the daemon writes the same report to `<pair>/status.toml` after every
 //! cycle ([`PairStatus::save`]); [`PairStatus::load`] falls back to it.
+//!
+//! On the host that serves a replica (T27, design §2): a replica the config
+//! marks remote, but whose index is in this pair directory, is served here
+//! (`serve` created the index). It is read like a local one; while `serve`
+//! holds its index, from the report `serve` saves to
+//! `<pair>/status-<replica>.toml` ([`ServedReport`]). Its peer, local in
+//! the config but without an index here, is on the client host.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -41,6 +48,25 @@ pub struct ReplicaStatus {
     /// not known here (see `status` on its host).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote: Option<String>,
+    /// This host serves the replica, which the config marks remote; the
+    /// fields above are its state here.
+    #[serde(skip)]
+    pub served: Option<Served>,
+    /// The replica is local in the config, but its index is not on this
+    /// host, which serves its peer: it lives on the client host.
+    #[serde(skip)]
+    pub on_client: bool,
+}
+
+/// How this host serves a replica.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Served {
+    /// The address: the one `serve` listens on while it runs, else the
+    /// config's.
+    pub addr: String,
+    /// `serve` runs (it holds the index): when its report was taken (ns
+    /// since the Unix epoch).
+    pub report_ns: Option<i64>,
 }
 
 impl ReplicaStatus {
@@ -96,6 +122,54 @@ impl ReplicaStatus {
     }
 }
 
+/// What `serve` saves for `status` about the replica it runs (its index is
+/// locked meanwhile), in `<pair>/status-<replica>.toml`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServedReport {
+    /// When it was taken (ns since the Unix epoch).
+    pub taken_ns: i64,
+    /// The address `serve` listens on.
+    pub addr: String,
+    pub replica: ReplicaStatus,
+}
+
+impl ServedReport {
+    /// The report on `replica` (served on `addr` to `peer`), taken now.
+    pub fn of(replica: &LocalReplica, peer: ReplicaId, addr: &str) -> Result<ServedReport> {
+        Ok(ServedReport {
+            taken_ns: now_ns(),
+            addr: addr.to_owned(),
+            replica: ReplicaStatus::of(replica, peer)?,
+        })
+    }
+
+    /// Where `serve` saves the report on replica `id`.
+    pub fn path(pair_dir: &Path, id: ReplicaId) -> PathBuf {
+        pair_dir.join(format!("status-{id}.toml"))
+    }
+
+    /// Saves it (atomically) for replica `id`.
+    pub fn save(&self, pair_dir: &Path, id: ReplicaId) -> Result<()> {
+        let text = toml::to_string(self)?;
+        crate::config::write_atomic(&Self::path(pair_dir, id), text.as_bytes(), true)
+    }
+
+    fn load(pair_dir: &Path, id: ReplicaId) -> Result<ServedReport> {
+        let path = Self::path(pair_dir, id);
+        read_toml(&path, "index in use (by `serve`?)")
+    }
+}
+
+/// Reads a report; `busy` says why the index could not be read instead.
+fn read_toml<T: serde::de::DeserializeOwned>(path: &Path, busy: &str) -> Result<T> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| Error::io(format!("{busy}, and no report at {}", path.display()), e))?;
+    toml::from_str(&text).map_err(|e| Error::InvalidConfig {
+        path: path.to_owned(),
+        reason: e.to_string(),
+    })
+}
+
 /// A pair's state.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairStatus {
@@ -121,48 +195,73 @@ impl PairStatus {
     /// The state of the pair `cfg`, from its indexes in `pair_dir`; or, if
     /// a daemon holds them, from the report it saved. A missing index (never
     /// synced) counts as empty.
+    ///
+    /// A remote replica whose index is here is served by this host: it is
+    /// read too, from the report of `serve` if that holds its index. A
+    /// local replica without an index here, whose peer is served here, is
+    /// on the client host.
     pub fn load(cfg: &PairConfig, pair_dir: &Path) -> Result<PairStatus> {
         let ids = [cfg.replicas[0].id, cfg.replicas[1].id];
-        let mut replicas: [ReplicaStatus; 2] = Default::default();
-        for (i, st) in replicas.iter_mut().enumerate() {
-            if let Some(addr) = &cfg.replicas[i].remote {
-                *st = ReplicaStatus::remote(addr);
-                continue;
-            }
-            let path = IndexStore::path_for(pair_dir, ids[i]);
-            if !path.exists() {
-                continue;
-            }
-            match IndexStore::open(&path, ids[i]) {
-                Ok(index) => *st = ReplicaStatus::from_index(&index, ids[1 - i], None)?,
-                Err(Error::Db(redb::Error::DatabaseAlreadyOpen)) => {
-                    return Self::load_report(pair_dir);
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(PairStatus {
+        let paths = ids.map(|id| IndexStore::path_for(pair_dir, id));
+        let served_here = [0, 1].map(|i| cfg.replicas[i].is_remote() && paths[i].exists());
+        let mut st = PairStatus {
             taken_ns: now_ns(),
             from_daemon: false,
-            replicas,
-        })
+            replicas: Default::default(),
+        };
+        let mut daemon: Option<PairStatus> = None;
+        for i in 0..2 {
+            let config = &cfg.replicas[i];
+            if let Some(addr) = &config.remote
+                && !served_here[i]
+            {
+                st.replicas[i] = ReplicaStatus::remote(addr);
+                continue;
+            }
+            if !paths[i].exists() {
+                st.replicas[i].on_client = served_here[1 - i];
+                continue;
+            }
+            let rs = match IndexStore::open(&paths[i], ids[i]) {
+                Ok(index) => {
+                    let mut rs = ReplicaStatus::from_index(&index, ids[1 - i], None)?;
+                    if let Some(addr) = &config.remote {
+                        rs.served = Some(Served {
+                            addr: addr.clone(),
+                            report_ns: None,
+                        });
+                    }
+                    rs
+                }
+                Err(Error::Db(redb::Error::DatabaseAlreadyOpen)) if served_here[i] => {
+                    let report = ServedReport::load(pair_dir, ids[i])?;
+                    ReplicaStatus {
+                        served: Some(Served {
+                            addr: report.addr,
+                            report_ns: Some(report.taken_ns),
+                        }),
+                        ..report.replica
+                    }
+                }
+                Err(Error::Db(redb::Error::DatabaseAlreadyOpen)) => {
+                    let report = match &daemon {
+                        Some(report) => report,
+                        None => daemon.insert(Self::load_report(pair_dir)?),
+                    };
+                    st.from_daemon = true;
+                    st.taken_ns = report.taken_ns;
+                    report.replicas[i].clone()
+                }
+                Err(e) => return Err(e),
+            };
+            st.replicas[i] = rs;
+        }
+        Ok(st)
     }
 
     fn load_report(pair_dir: &Path) -> Result<PairStatus> {
         let path = pair_dir.join(STATUS_FILE);
-        let text = std::fs::read_to_string(&path).map_err(|e| {
-            Error::io(
-                format!(
-                    "index in use (a daemon?), and no report at {}",
-                    path.display()
-                ),
-                e,
-            )
-        })?;
-        let mut st: PairStatus = toml::from_str(&text).map_err(|e| Error::InvalidConfig {
-            path: path.clone(),
-            reason: e.to_string(),
-        })?;
+        let mut st: PairStatus = read_toml(&path, "index in use (a daemon?)")?;
         st.from_daemon = true;
         Ok(st)
     }

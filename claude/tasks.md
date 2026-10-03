@@ -794,7 +794,7 @@ The design lives in [`design.md`](design.md); §N.M below refers to its sections
 
 ## M10: usability fixes (found while writing `docs/usage.md`)
 
-### [ ] T26: Exit quietly on a closed stdout (broken pipe)
+### [x] T26: Exit quietly on a closed stdout (broken pipe)
 - **Depends on:** —
 - **Read:** —
 - **Files:** `src/cli.rs` (maybe `src/main.rs`), `tests/cli.rs`
@@ -806,8 +806,14 @@ The design lives in [`design.md`](design.md); §N.M below refers to its sections
   - a `tests/cli.rs` test runs `status` (and `sync --once`) with stdout connected to a pipe whose reader is closed at once. The test asserts no panic (`panicked` is absent from stderr) and the exit status chosen above;
   - `cargo test` and clippy pass.
 - **Notes:**
+  - **Exit status: 141** (128 + SIGPIPE), what a shell shows for coreutils killed by the signal, so `set -o pipefail` treats truncated output the same way. Chosen over 0. Written down in design §2 ("Closed stdout") and `docs/usage.md` §9.
+  - **How:** every `println!`/`print!` in `src/cli.rs` became `outln!`, which calls `cli::out`: `write_fmt` + `flush` on the locked stdout. The first failed write sets a flag and nothing more is printed; the command runs to its normal end (so `sync --once` still drains the quarantine and fails on an unconverged report, and a daemon or `serve` keeps running). `EPIPE` sets `stdout_closed()`; `main` (now returning `ExitCode`) then exits 141. Any other write error (e.g. `>/dev/full`) is logged once and `run` fails with "cannot write to stdout" (exit 1). `main` prints an error as `Error: {e:?}`, as before, through `writeln!` to stderr, so a closed stderr cannot panic either. `print_status` builds its header line in a string instead of two `print!`s.
+  - **`SIGPIPE` is not reset:** it stays ignored (Rust's default), so socket writes get `EPIPE` and a peer that hangs up stays `Error::Connection`. No `MSG_NOSIGNAL` audit was needed.
+  - `--help | head` was already fine: clap ignores its own print errors.
+  - **Test:** `tests/cli.rs` `closed_stdout_exits_quietly` gives the child a pipe (`std::io::pipe`) whose reader is dropped before the spawn (deterministic, no race). `sync --once` and `status` exit 141 with no `panicked`/`Error` on stderr, and the sync happened; a `daemon` on such a stdout keeps syncing, stops on SIGTERM, and exits 141.
+  - Checked by hand: `sync --once p | head -0` → 141, `status p | head -3` → three lines, 141; before the fix `status | head -3` panicked (exit 101).
 
-### [ ] T27: `status` on the host that serves a replica
+### [x] T27: `status` on the host that serves a replica
 - **Depends on:** —
 - **Read:** §2 (Status and sandbox), §7.1 (Network as implemented: Deployment, Daemon and status over the network)
 - **Files:** `src/status.rs`, `src/cli.rs`, `src/server.rs`, `docs/usage.md`, `tests/net.rs` or `tests/cli.rs`
@@ -827,8 +833,14 @@ The design lives in [`design.md`](design.md); §N.M below refers to its sections
   - `docs/usage.md` §7 shows the server-side status. Its §12 row about `status` on the server host is removed;
   - `cargo test` and clippy pass.
 - **Notes:**
+  - **Which replica is served here: option (a).** A replica the config marks `remote` whose index `<id>.redb` is in this pair directory is served here (`serve` creates the index when it opens the replica; a client never writes an index for a remote replica). No `--side` flag. Before the first `serve` on a host, `status` there still shows the client's view. Written into design §2 ("`status` on the serving host").
+  - **`serve` saves a report** (`status::ServedReport`: state, listen address, time) to `<pair>/status-<replica>.toml`: at start (so `status` works before the first sync), after every `RecordSync` (after its sweep, **before** answering, so the report is current when the client's `sync --once` returns; a test depends on that), and after every sweep in `ServerHandle::sweep`. Enabled by `Server::status_dir` (the CLI sets it; the test harness doesn't). A file per served replica, not `status.toml`, so a daemon and a `serve` sharing one state directory don't overwrite each other.
+  - **`PairStatus::load`** now decides per replica: remote and not served here → "served at ADDR (run `status` there)" (unchanged); served here → from the index, or from the `serve` report if the index is locked; local without an index while the peer is served here → `on_client` ("on the client host, not here"); else as before (a missing index is "never"; a locked one takes that replica from the daemon's `status.toml`). `ReplicaStatus` has two new `#[serde(skip)]` fields, `served: Option<Served { addr, report_ns }>` and `on_client`, so `status.toml` keeps its format.
+  - **Output** on the server: `served here on ADDR (`serve` running; its report from …)` or `served here at ADDR (`serve` not running)` (the config's address), then the usual index lines.
+  - **Test:** `tests/net.rs` `status_on_the_serving_host` (two state homes): the server's `status` before any sync (from serve's first report), after a client sync while `serve` runs (B: 3 entries, a last-sync time, "served here on ADDR"; A: "on the client host", no entries, no "never"), and after `serve` stopped (same, from the index); the client's view is unchanged. The existing `status` tests pass unchanged.
+  - **Docs:** `docs/usage.md` §7 has a new "Status on each host" part with the server-side output (rerun under `/tmp`); §2 lists the new file; §9 describes it; the §12 row is gone. README shows `status` on the server.
 
-### [ ] T28: Show delta transfers in the CLI output
+### [x] T28: Show delta transfers in the CLI output
 - **Depends on:** T24
 - **Read:** §7.1 (Block-level delta transfer: Engine, Traffic)
 - **Files:** `src/cli.rs` (`print_report`, the daemon summary), `src/daemon.rs` (`DaemonStats`), `tests/net.rs` or `tests/cli.rs`, `docs/usage.md`
@@ -842,3 +854,8 @@ The design lives in [`design.md`](design.md); §N.M below refers to its sections
   - `docs/usage.md` §7 shows the new line in its expected output. Rerun the guide's `sh` blocks under `/tmp` (see `CLAUDE.md`) and check the line matches;
   - `cargo test` and clippy pass.
 - **Notes:**
+  - **Output:** `sync --once` prints `synced "p": N change(s) applied in R round(s), D sent as delta` when D > 0, and the line is unchanged otherwise (`cli::deltas_note`). The daemon's stop summary gets the same `, D sent as delta` after the applied count (`DaemonStats::deltas`, summed per cycle). The `sync cycle done` info line logs `deltas`.
+  - **Optional part done:** `sync --once` and `daemon` log each remote replica's `traffic()` (bytes sent/received) at `debug` when they end ("network traffic").
+  - **Tests:** `tests/net.rs` `sync_once_reports_delta_transfers`: `serve` + `sync --once`, a 2 MiB file (create: no delta text), then 1 byte changed → `1 change(s) applied in 1 round(s), 1 sent as delta`, content equal. `tests/cli.rs` `local_sync_prints_no_delta`: the same change on a local pair prints the line without delta text.
+  - **Docs:** `docs/usage.md` §7 shows `1 sent as delta` and explains it; §9 mentions it. The guide's `sh` blocks were rerun under `/tmp/fsync-demo` with the release binary: the line matches. (The §7 demo block that changed one byte no longer stops `serve`; the new status block after it does.)
+  - **Results (T26–T28):** `cargo test`, `cargo test --features hooks` and clippy (with and without `hooks`) pass.

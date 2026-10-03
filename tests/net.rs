@@ -296,3 +296,87 @@ fn sandboxed_serve_and_sync() {
     terminate(server);
     assert!(hosts.log().contains("landlock sandbox"), "{}", hosts.log());
 }
+
+/// Changing one byte of a file above `DELTA_MIN_SIZE` sends it as a
+/// block-level delta, and `sync --once` says so (T28).
+#[test]
+fn sync_once_reports_delta_transfers() {
+    let hosts = Hosts::new();
+    let (ra, rb) = (hosts.ra.path(), hosts.rb.path());
+    let (server, addr) = hosts.serve();
+    let mut cfg = hosts.cfg();
+    cfg.replicas[1].remote = Some(addr);
+    hosts.set_cfg(&cfg);
+
+    let size = 2 * files_sync::engine::executor::DELTA_MIN_SIZE as usize;
+    let mut data: Vec<u8> = (0..size).map(|i| (i * 7 % 251) as u8).collect();
+    fs::write(ra.join("data.bin"), &data).unwrap();
+    let out = ok(hosts.client.path(), &["sync", "--once", "p"]);
+    assert!(out.contains("1 change(s) applied"), "{out}");
+    assert!(!out.contains("delta"), "a create goes whole: {out}");
+
+    data[1_000_000] ^= 0xff;
+    fs::write(ra.join("data.bin"), &data).unwrap();
+    let out = ok(hosts.client.path(), &["sync", "--once", "p"]);
+    assert!(
+        out.contains("1 change(s) applied in 1 round(s), 1 sent as delta"),
+        "{out}"
+    );
+    assert_eq!(fs::read(rb.join("data.bin")).unwrap(), data);
+    terminate(server);
+}
+
+/// `status` on the host that serves B (T27): B is read from the report of
+/// the running `serve`, then from its index; A is on the client host, not
+/// "never synced".
+#[test]
+fn status_on_the_serving_host() {
+    let hosts = Hosts::new();
+    let (ra, rb) = (hosts.ra.path(), hosts.rb.path());
+    let (client, server_home) = (hosts.client.path(), hosts.server.path());
+    let (server, addr) = hosts.serve();
+    let mut cfg = hosts.cfg();
+    cfg.replicas[1].remote = Some(addr.clone());
+    hosts.set_cfg(&cfg);
+
+    // Before any sync: serve's first report.
+    let st = ok(server_home, &["status", "p"]);
+    assert!(st.contains("0 entries (0 tombstones)"), "{st}");
+    assert!(st.contains("last sync:   never"), "{st}");
+
+    fs::create_dir(ra.join("d")).unwrap();
+    fs::write(ra.join("d/a"), b"1").unwrap();
+    fs::write(rb.join("b"), b"2").unwrap();
+    ok(client, &["sync", "--once", "p"]);
+
+    let check = |st: &str, served: &str| {
+        let (a, b) = st.split_once("\n  b: ").unwrap_or_else(|| panic!("{st}"));
+        assert!(
+            a.contains("on the client host, not here (run `status` there)"),
+            "{st}"
+        );
+        assert!(!a.contains("entries") && !a.contains("never"), "{st}");
+        assert!(b.contains(served), "{st}");
+        assert!(b.contains("3 entries (0 tombstones)"), "{st}");
+        assert!(b.contains("last sync:") && !b.contains("never"), "{st}");
+        assert!(!st.contains("daemon"), "{st}");
+    };
+    let st = ok(server_home, &["status", "p"]);
+    check(
+        &st,
+        &format!("served here on {addr} (`serve` running; its report from "),
+    );
+
+    terminate(server);
+    let st = ok(server_home, &["status", "p"]);
+    check(&st, "served here at 127.0.0.1:9 (`serve` not running)");
+
+    // The client's view is unchanged.
+    let st = ok(client, &["status", "p"]);
+    assert!(
+        st.contains(&format!("served at {addr} (run `status` there)")),
+        "{st}"
+    );
+    assert!(st.contains("3 entries (0 tombstones)"), "{st}");
+    assert!(!st.contains("served here") && !st.contains("never"), "{st}");
+}

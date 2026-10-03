@@ -43,7 +43,7 @@ Both replica directories must be on a local filesystem: ext4, xfs, btrfs or tmpf
   - `config.toml`, the pair's settings ([§10](#10-config-file-reference));
   - `<replica-id>.redb`, the index (what was last seen and synced) and the crash-recovery journal of each local replica;
   - `<replica-id>.crt` / `.key`, a TLS identity per replica (used only for network sync);
-  - `status.toml`, written by a running daemon.
+  - `status.toml`, written by a running daemon, and `status-<replica-id>.toml`, written by a running `serve`.
 
   The state directory never lives inside a replica.
 - **Version vectors:** per-file causal history, as in syncthing. They tell an ordinary update ("B has seen A's last change and edited it again") from a real conflict ("both sides changed the file independently").
@@ -408,17 +408,41 @@ Change one byte of the 3 MiB file and sync again. This time only one block of it
 printf 'X' | dd of=net/laptop/work/data.bin bs=1 seek=1000000 conv=notrunc status=none
 XDG_STATE_HOME="$DEMO/net/laptop-state" files_sync sync --once paper
 cmp net/laptop/work/data.bin net/server/mirror/data.bin && echo identical
+```
+
+```text
+synced "paper": 1 change(s) applied in 1 round(s), 1 sent as delta
+identical
+```
+
+`1 sent as delta` means that the file was rebuilt on the server from the blocks it already had plus the changed one. Files sent whole (new files, files under 1 MiB, and every file of a local pair) are not mentioned.
+
+### Status on each host
+
+On the laptop, `status` shows the remote replica as ``served at 127.0.0.1:47771 (run `status` there)``: the server's index is not readable from the laptop.
+
+On the server, `status` shows the served replica. While `serve` runs, it holds the index, so `status` reads the report that `serve` saves at start and after each sync cycle:
+
+```sh
+XDG_STATE_HOME="$DEMO/net/server-state" files_sync status paper
 kill -INT %1
 wait
 ```
 
 ```text
-synced "paper": 1 change(s) applied in 1 round(s)
-identical
+pair "paper"
+  a: /tmp/fsync-demo/net/laptop/work (replica 5d0b6a3b8c9e1f27)
+    on the client host, not here (run `status` there)
+  b: /tmp/fsync-demo/net/server/mirror (replica c9c5677860a0d25b)
+    served here on 127.0.0.1:47771 (`serve` running; its report from 2026-10-03 20:31:07 CEST)
+    index:       2 entries (0 tombstones)
+    conflicts:   0
+    quarantined: 0
+    last sync:   2026-10-03 20:31:07 CEST
 stopped serving "paper"
 ```
 
-On the laptop, `status` shows the remote replica as `served at 127.0.0.1:47771`. The server's index is not readable from the laptop.
+After `serve` stopped, `status` reads the index itself and says ``served here at 127.0.0.1:47771 (`serve` not running)``. `status` knows that this host serves B because B's index is in this host's state directory: the first `serve` created it. A replica that the config marks remote, and whose index is not here, is served elsewhere.
 
 ## 8. Sandboxing and logging
 
@@ -437,7 +461,7 @@ sandboxed
 
 **Logging** goes to stderr and is controlled by `RUST_LOG`. The default is `info`, which also prints each replica's filesystem feature check and a one-line summary per sync cycle. Some useful values:
 - `RUST_LOG=warn`: warnings and errors only.
-- `RUST_LOG=files_sync=debug`: detailed per-path decisions, for bug reports.
+- `RUST_LOG=files_sync=debug`: detailed per-path decisions, for bug reports, and the bytes sent and received over the network.
 
 ## 9. Command reference
 
@@ -459,12 +483,18 @@ daemon <PAIR>
 
 status <PAIR>
     Index size, tombstones, conflict copies, quarantined files, last sync time.
-    Reads the daemon's latest report while a daemon runs.
+    Reads the daemon's latest report while a daemon runs. On the host that
+    serves a replica, shows that replica (from the report of `serve` while it
+    runs) and the other one as being on the client host.
 
 serve <PAIR> <a|b> [--listen HOST:PORT]
     Serve one replica to its peer over mutual TLS. --listen defaults to the
     replica's `remote` address; port 0 picks a free port (the address is printed).
 ```
+
+`sync --once` and `daemon` add `, N sent as delta` to their summary when files were sent as block-level deltas.
+
+If the reader of stdout goes away (`files_sync status docs | head -3`), a command stops printing and exits with status 141 (128 + SIGPIPE, as a shell shows for a program killed by the signal) after finishing its work. A `daemon` or `serve` keeps running; only its output is lost.
 
 ## 10. Config file reference
 
@@ -526,4 +556,3 @@ Edit it while no `sync`, `daemon` or `serve` for the pair is running. Unknown ke
 | `not settled (changed during the sync), retry: <path>` | The file kept changing while it was being synced. Nothing was lost; the next run (or the daemon, after 1 s) retries it. |
 | `.sync-conflict-` files appear | Both sides changed the file between syncs. See [§4](#4-conflicts). |
 | `.~fsync.*` files remain after a crash | They are recovered or removed automatically by the next `sync`, `daemon` or `serve` of the pair. |
-| `status` on the **server** host shows the served replica as "served at …" and the other one as never synced | `status` reads the config from the client's point of view. Use `status` on the client host. |

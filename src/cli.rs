@@ -1,8 +1,10 @@
 //! Command-line interface. This is the binary's front end, so it reports
 //! errors with `anyhow` rather than the library [`Error`](crate::Error).
 
+use std::io::{ErrorKind, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
@@ -15,11 +17,58 @@ use crate::daemon::{self, Daemon};
 use crate::engine::{Engine, Side, SyncReport};
 use crate::fs::caps::Caps;
 use crate::fs::commit::Quarantine;
-use crate::replica::{Housekeeping, PairReplica};
+use crate::replica::{Housekeeping, PairReplica, Replica};
 use crate::sandbox;
 use crate::server::Server;
 use crate::status::PairStatus;
 use crate::tls::Identity;
+
+/// `println!` that survives a closed stdout: see [`out`].
+macro_rules! outln {
+    () => {
+        out(format_args!("\n"))
+    };
+    ($($arg:tt)*) => {
+        out(format_args!("{}\n", format_args!($($arg)*)))
+    };
+}
+
+/// Set once a write to stdout failed; nothing more is printed.
+static STDOUT_FAILED: AtomicBool = AtomicBool::new(false);
+/// The failure was `EPIPE`: the reader went away (e.g. `status | head`).
+static STDOUT_CLOSED: AtomicBool = AtomicBool::new(false);
+
+/// Prints to stdout, flushed at once. Rust ignores `SIGPIPE`, so `println!`
+/// would panic once the reader has gone; here a failed write only stops the
+/// printing, and the command runs to its end (a daemon or `serve` keeps
+/// running). [`stdout_closed`] then tells `main` to exit with 141; any
+/// other write error is logged once and fails the command in [`run`].
+/// `SIGPIPE` stays ignored, so a peer that hangs up on a socket is still a
+/// connection error, not a signal.
+fn out(args: std::fmt::Arguments<'_>) {
+    if STDOUT_FAILED.load(Ordering::Relaxed) {
+        return;
+    }
+    let mut stdout = std::io::stdout().lock();
+    if let Err(e) = stdout.write_fmt(args).and_then(|()| stdout.flush()) {
+        STDOUT_FAILED.store(true, Ordering::Relaxed);
+        if e.kind() == ErrorKind::BrokenPipe {
+            STDOUT_CLOSED.store(true, Ordering::Relaxed);
+        } else {
+            tracing::error!(error = %e, "cannot write to stdout; output stops here");
+        }
+    }
+}
+
+/// Stdout was closed by its reader while the command printed (see [`out`]).
+/// The binary then exits with [`EXIT_STDOUT_CLOSED`].
+pub fn stdout_closed() -> bool {
+    STDOUT_CLOSED.load(Ordering::Relaxed)
+}
+
+/// Exit status after a closed stdout: 128 + `SIGPIPE`, what a shell shows
+/// for a C program killed by the signal.
+pub const EXIT_STDOUT_CLOSED: u8 = 141;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -104,9 +153,20 @@ impl SideArg {
 }
 
 /// Parses the command line and runs the selected subcommand.
+///
+/// A stdout closed by its reader is not an error here (see
+/// [`stdout_closed`]); any other failure to write it is.
 pub fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_logging();
+    run_command(cli)?;
+    if STDOUT_FAILED.load(Ordering::Relaxed) && !stdout_closed() {
+        bail!("cannot write to stdout; output is incomplete");
+    }
+    Ok(())
+}
+
+fn run_command(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::Init {
             pair,
@@ -133,16 +193,16 @@ pub fn run() -> anyhow::Result<()> {
                 },
             ];
             let (cfg, path) = config::init_with(&state_home, &pair, replicas)?;
-            println!("initialised pair {:?}: {}", cfg.name, path.display());
+            outln!("initialised pair {:?}: {}", cfg.name, path.display());
             let pair_dir = config::pair_dir(&state_home, &pair)?;
             for (side, r) in ["a", "b"].iter().zip(&cfg.replicas) {
-                println!("  {side}: {} (replica {})", r.root.display(), r.id);
+                outln!("  {side}: {} (replica {})", r.root.display(), r.id);
                 if let Some(device) = r.device {
-                    println!("     device {device}");
+                    outln!("     device {device}");
                 }
                 if let Some(addr) = &r.remote {
                     let (crt, key) = Identity::paths(&pair_dir, r.id);
-                    println!(
+                    outln!(
                         "     served at {addr}: copy {}, {} and {} to {} on that host, \
                          then run `serve {pair} {side}` there",
                         path.display(),
@@ -167,6 +227,7 @@ pub fn run() -> anyhow::Result<()> {
             let engine = Engine::new().tombstone_retention(cfg.tombstone_retention());
             let report = engine.sync_once(&mut a, &mut b)?;
             drain_quarantine(&mut [&mut a, &mut b]);
+            log_traffic(&[&a, &b]);
             print_report(&cfg, &report);
             if !report.is_converged() {
                 bail!(
@@ -199,9 +260,14 @@ pub fn run() -> anyhow::Result<()> {
                 .status_dir(pair_dir.clone())
                 .run(&mut a, &mut b, &stop)?;
             drain_quarantine(&mut [&mut a, &mut b]);
-            println!(
-                "daemon for {:?} stopped: {} cycle(s), {} change(s) applied, {} conflict(s)",
-                cfg.name, stats.cycles, stats.applied, stats.conflicts
+            log_traffic(&[&a, &b]);
+            outln!(
+                "daemon for {:?} stopped: {} cycle(s), {} change(s) applied{}, {} conflict(s)",
+                cfg.name,
+                stats.cycles,
+                stats.applied,
+                deltas_note(stats.deltas),
+                stats.conflicts
             );
             Ok(())
         }
@@ -233,10 +299,11 @@ pub fn run() -> anyhow::Result<()> {
             }
             let stop = daemon::shutdown_signals()?;
             let server = Server::open(&cfg, i, &pair_dir)
-                .with_context(|| format!("replica root {}", r.root.display()))?;
+                .with_context(|| format!("replica root {}", r.root.display()))?
+                .status_dir(pair_dir.clone());
             let listener = TcpListener::bind(&addr).with_context(|| format!("listen on {addr}"))?;
             let mut handle = server.spawn(listener)?;
-            println!(
+            outln!(
                 "serving replica {} of {:?} ({}) on {}",
                 r.id,
                 cfg.name,
@@ -258,7 +325,7 @@ pub fn run() -> anyhow::Result<()> {
             // Waits for a request still being answered.
             let mut replica = handle.replica();
             drain_quarantine(&mut [&mut *replica]);
-            println!("stopped serving {:?}", cfg.name);
+            outln!("stopped serving {:?}", cfg.name);
             Ok(())
         }
     }
@@ -313,35 +380,50 @@ fn print_status(cfg: &PairConfig, st: &PairStatus) {
             })
             .unwrap_or_else(|_| format!("{ns} ns"))
     };
-    print!("pair {:?}", cfg.name);
+    let mut header = format!("pair {:?}", cfg.name);
     if st.from_daemon {
-        print!(" (daemon running; its report from {})", when(st.taken_ns));
+        header += &format!(" (daemon running; its report from {})", when(st.taken_ns));
     }
-    println!();
+    outln!("{header}");
     for ((side, r), s) in ["a", "b"].iter().zip(&cfg.replicas).zip(&st.replicas) {
-        println!("  {side}: {} (replica {})", r.root.display(), r.id);
+        outln!("  {side}: {} (replica {})", r.root.display(), r.id);
         if let Some(addr) = &s.remote {
-            println!("    served at {addr} (run `status` there)");
+            outln!("    served at {addr} (run `status` there)");
             continue;
         }
-        println!(
-            "    index:       {} entries ({} tombstones)",
-            s.entries, s.tombstones
-        );
-        println!("    conflicts:   {}", s.conflicts.len());
-        for c in &s.conflicts {
-            println!("      {c}");
+        if s.on_client {
+            outln!("    on the client host, not here (run `status` there)");
+            continue;
         }
-        println!("    quarantined: {}", s.quarantined);
+        if let Some(served) = &s.served {
+            match served.report_ns {
+                Some(ns) => outln!(
+                    "    served here on {} (`serve` running; its report from {})",
+                    served.addr,
+                    when(ns)
+                ),
+                None => outln!("    served here at {} (`serve` not running)", served.addr),
+            }
+        }
+        outln!(
+            "    index:       {} entries ({} tombstones)",
+            s.entries,
+            s.tombstones
+        );
+        outln!("    conflicts:   {}", s.conflicts.len());
+        for c in &s.conflicts {
+            outln!("      {c}");
+        }
+        outln!("    quarantined: {}", s.quarantined);
         if s.unfinished > 0 {
-            println!(
+            outln!(
                 "    unfinished:  {} (replayed on the next run)",
                 s.unfinished
             );
         }
         match s.last_sync_ns {
-            Some(ns) => println!("    last sync:   {}", when(ns)),
-            None => println!("    last sync:   never"),
+            Some(ns) => outln!("    last sync:   {}", when(ns)),
+            None => outln!("    last sync:   never"),
         }
     }
 }
@@ -369,17 +451,40 @@ fn drain_quarantine(replicas: &mut [&mut dyn Housekeeping]) {
     }
 }
 
+/// `", N sent as delta"` after the count of applied changes; nothing when
+/// no file went as a block-level delta (always so for a local pair).
+fn deltas_note(deltas: u64) -> String {
+    if deltas == 0 {
+        String::new()
+    } else {
+        format!(", {deltas} sent as delta")
+    }
+}
+
+/// Logs the bytes each remote replica's connections moved (`debug`).
+fn log_traffic(replicas: &[&PairReplica]) {
+    for r in replicas {
+        if let PairReplica::Remote(r) = r {
+            let (sent, received) = r.traffic();
+            tracing::debug!(replica = %r.id(), sent, received, "network traffic");
+        }
+    }
+}
+
 fn print_report(cfg: &PairConfig, report: &SyncReport) {
     let root = |side: Side| match side {
         Side::A => &cfg.replicas[0].root,
         Side::B => &cfg.replicas[1].root,
     };
-    println!(
-        "synced {:?}: {} change(s) applied in {} round(s)",
-        cfg.name, report.applied, report.rounds
+    outln!(
+        "synced {:?}: {} change(s) applied in {} round(s){}",
+        cfg.name,
+        report.applied,
+        report.rounds,
+        deltas_note(report.deltas as u64)
     );
     for c in &report.conflicts {
-        println!(
+        outln!(
             "  conflict at {}: the version in {} is kept as {}",
             c.path,
             root(c.side).display(),
@@ -387,16 +492,16 @@ fn print_report(cfg: &PairConfig, report: &SyncReport) {
         );
     }
     for p in &report.resurrected {
-        println!("  kept deleted directory {p}: it holds unseen changes");
+        outln!("  kept deleted directory {p}: it holds unseen changes");
     }
     for p in &report.unmanaged {
-        println!("  not synced (unmanaged): {p}");
+        outln!("  not synced (unmanaged): {p}");
     }
     for (p, e) in &report.errors {
-        println!("  error: {p}: {e}");
+        outln!("  error: {p}: {e}");
     }
     for p in &report.unresolved {
-        println!("  not settled (changed during the sync), retry: {p}");
+        outln!("  not settled (changed during the sync), retry: {p}");
     }
 }
 

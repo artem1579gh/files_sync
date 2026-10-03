@@ -15,11 +15,14 @@
 //!
 //! Quarantined old inodes are swept after every `RecordSync` (the end of a
 //! peer's sync cycle) and when their grace period ends ([`ServerHandle::sweep`]).
+//! With [`Server::status_dir`], a [`ServedReport`] for `status` is saved at
+//! start, after every `RecordSync` and after every sweep (the index is
+//! locked while the server runs).
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -37,6 +40,7 @@ use crate::replica::proto::{
 };
 use crate::replica::remote::{HANDSHAKE_TIMEOUT, tune_socket};
 use crate::replica::{ContentReader, LocalReplica, Replica};
+use crate::status::ServedReport;
 use crate::tls::Identity;
 use crate::watch::Hint;
 
@@ -48,6 +52,7 @@ pub struct Server {
     peer: ReplicaId,
     tls: Arc<ServerConfig>,
     max_version: u32,
+    status_dir: Option<PathBuf>,
 }
 
 impl Server {
@@ -59,7 +64,16 @@ impl Server {
             peer,
             tls,
             max_version: PROTOCOL_VERSION,
+            status_dir: None,
         }
+    }
+
+    /// Saves a [`ServedReport`] in `pair_dir` at start, after every
+    /// `RecordSync` and after every quarantine sweep, for `status` (which
+    /// cannot open the index while the server holds it).
+    pub fn status_dir(mut self, pair_dir: PathBuf) -> Server {
+        self.status_dir = Some(pair_dir);
+        self
     }
 
     /// Speaks protocol versions up to `version` only (tests force older
@@ -91,6 +105,8 @@ impl Server {
             replica: Mutex::new(self.replica),
             tls: self.tls,
             max_version: self.max_version,
+            status_dir: self.status_dir,
+            addr,
             subscribers: Arc::new(Mutex::new(Vec::new())),
             fanout: AtomicBool::new(false),
             conns: Mutex::new(BTreeMap::new()),
@@ -105,6 +121,7 @@ impl Server {
                 .spawn(move || accept_loop(&shared, listener))
                 .map_err(|e| Error::io("spawn accept thread", e))?
         };
+        shared.save_status(&shared.replica());
         tracing::info!(%addr, replica = %shared.id, peer = %shared.peer, "serving");
         Ok(ServerHandle {
             shared,
@@ -146,6 +163,7 @@ impl ServerHandle {
             .is_some_and(|d| d <= Instant::now())
         {
             replica.sweep_quarantine();
+            self.shared.save_status(&replica);
         }
         replica.quarantine().next_deadline()
     }
@@ -206,6 +224,10 @@ struct Shared {
     tls: Arc<ServerConfig>,
     /// The highest protocol version spoken.
     max_version: u32,
+    /// Where the status report goes, if anywhere.
+    status_dir: Option<PathBuf>,
+    /// The address it listens on.
+    addr: SocketAddr,
     /// The hint connections' channels.
     subscribers: Arc<Mutex<Vec<Sender<Hint>>>>,
     /// The fan-out thread runs.
@@ -225,6 +247,17 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 impl Shared {
     fn replica(&self) -> MutexGuard<'_, LocalReplica> {
         lock(&self.replica)
+    }
+
+    /// Saves the status report on `replica` (this server's, locked by the
+    /// caller), if [`Server::status_dir`] asked for one.
+    fn save_status(&self, replica: &LocalReplica) {
+        let Some(dir) = &self.status_dir else { return };
+        let addr = self.addr.to_string();
+        let saved = ServedReport::of(replica, self.peer, &addr).and_then(|r| r.save(dir, self.id));
+        if let Err(e) = saved {
+            tracing::warn!(error = %e, "cannot save the status report");
+        }
     }
 }
 
@@ -443,6 +476,9 @@ fn serve(shared: &Shared, tls: &mut Tls, version: u32, req: Request) -> Result<b
                 if replica.quarantine().next_deadline().is_some() {
                     replica.sweep_quarantine();
                 }
+                // Before the answer: when the peer's cycle ends, the report
+                // is current.
+                shared.save_status(&replica);
                 removed
             };
             match removed {

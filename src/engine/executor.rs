@@ -195,6 +195,7 @@ impl Engine {
             tracing::info!(
                 rounds = report.rounds,
                 applied = report.applied,
+                deltas = report.deltas,
                 retried = report.retried,
                 conflicts = report.conflicts.len(),
                 errors = report.errors.len(),
