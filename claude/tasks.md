@@ -735,6 +735,7 @@ The design lives in [`design.md`](design.md); §N.M below refers to its sections
     - Mutation-checked: with `SCOPED_RETRIES = 0`, `raced_dotdot_lookup_is_retried` and the scanner test fail (`dirty: [RelPath("d/e/l")]`, the flake's exact report).
   - **Design:** §4.5 (in-tree referents: the `EAGAIN` retry) and §9 (fault points).
   - **Results:** after the fix, 30 runs of `materialize` alone showed no unstable lookup or read at all (the debug prints stayed silent); then 3 consecutive runs of the whole `--test crash` (~30 s each), and `cargo test --features hooks` and clippy (with and without `hooks`) pass. Before the fix, the same materialize-only loop failed 3 of 30 times. **The "50 consecutive runs" criterion was cut short at the user's request** (too long, ~25 min), so it is not met as written → **T25**. The statistical evidence is the 30 + 3 clean runs, plus a debug trace that showed no `EAGAIN` at all after the fix. The deterministic tests above carry the regression.
+  - **T25 (2026-10-03): 50 consecutive runs of `cargo test -q --features hooks --test crash` passed** (21:00–21:26, at commit `1f5c9e9`; 3 tests each, 26–43 s per run, 30 s on average). No failure, so T23 stays closed and the criterion is met.
 
 ### [x] T24: Block-level delta transfer
 - **Depends on:** T22
@@ -785,12 +786,13 @@ The design lives in [`design.md`](design.md); §N.M below refers to its sections
     - The delta request carries the full new block list (needed to verify reused blocks), so a 1-byte change in a 64 GiB file still costs about 3 × 16 MiB of lists.
     - `serve` and `sync` use v2 automatically; there is no CLI switch to force v1 (only the test API).
 
-### [ ] T25: Confirm the T23 fix with 50 crash-suite runs
+### [x] T25: Confirm the T23 fix with 50 crash-suite runs
 - **Depends on:** T23
 - **Read:** T23's Notes
 - **Do:** run `for i in $(seq 50); do cargo test -q --features hooks --test crash || break; done` (~25 min; T23 stopped after 3 runs). On a failure, capture the failing case and `RUST_LOG=files_sync=debug` output, and reopen T23.
 - **Done when:** 50 consecutive runs pass, and the result is recorded in T23's Notes.
 - **Notes:**
+  - Ran on 2026-10-03, at commit `1f5c9e9` (after T26–T28), on WSL2 (kernel 6.18): **50 of 50 runs passed** (`crash`: 3 tests each, 26–43 s per run, 30 s on average, about 25 min in all). The loop would have stopped at the first failure and kept its output; there was none. Recorded in T23's Notes.
 
 ## M10: usability fixes (found while writing `docs/usage.md`)
 
