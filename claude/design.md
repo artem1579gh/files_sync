@@ -215,7 +215,7 @@ A link the user made in a munging replica without the prefix is synced with its 
   - **`LocalReplica::open`** (also under `serve`), right after opening the index (`ensure_root_marker`): a marker present → OK (and recorded). Missing, with `root_marker` recorded → `Error::RootMarkerMissing`. Missing in an index without the record (new, or from before markers): if the index lists a live entry while the root holds nothing but reserved names, refuse in the same way (the issue's case for an existing pair); else create it (`commit::create_root_marker`: `O_CREAT|O_EXCL|O_NOFOLLOW` at the root fd, never over anything, written and fsynced, then the root fsynced; no journal, since a marker cut short by a crash is still a marker; hook points `marker.created`, `marker.written`), check it, and record it.
   - **`Replica::scan`** checks the marker before the scanner runs (a refused scan indexes nothing) and after it (a root removed during the scan, `rm -rf` taking the marker along, fails the cycle before reconcile). A scan error aborts the cycle, and ends a daemon (§6.4); a served replica's error reaches the client the same way.
   - The error tells the user to mount the disk or fix the path, or, if the directory is the replica, to create the marker by hand (`touch`). Deleting the replica's index instead makes it start over, which copies the peer's files in and deletes nothing.
-  - **Not done:** a guard against cycles that delete most of a replica (unison's `confirmbigdeletes`), and a trash directory for synced deletions. The marker covers a root that is replaced or missing, but not a mass deletion inside a real root, which is a user's change like any other.
+  - The mass-deletion guard (§6.4, T30) is the second net, for a root that is not replaced but emptied.
 - **Residual case: a directory moved out of the root.** `mv root/a /tmp/x` while we hold a dirfd for `a` puts our write into the moved directory. This is not privilege escalation: an attacker can only redirect writes into a directory they could already move. Mitigation: after each commit, re-resolve the parent and compare (dev, ino); a mismatch triggers a rescan. The test invariant is **"never create anything in a directory that was never inside the root."**
 
 ### 5.2 Read path: stable reads
@@ -403,6 +403,8 @@ Any `PreconditionFailed` marks the path dirty. The loop then rescans the dirty p
 
 `sync --once` (CLI) runs one cycle (with the pair's tombstone retention), then waits for both quarantines to drain (sweeping until empty, at most 10 grace periods), so a one-shot run leaves no `.~fsync.old.*` files behind. It exits non-zero if the cycle did not converge.
 
+**Mass-deletion guard (T30, issue #1).** A deletion on side S is a `Push` to S whose target is live and whose entry is a tombstone, or a directory there replaced by a file or symlink (`executor::deletes_on`). After each reconcile, before planning, `Cycle::hold_mass_deletes` counts them per side: if there are more than `MASS_DELETE_MIN` (10) and more than `Engine::max_delete_percent` (default 50; `PairConfig::max_delete_percent`; 100 turns it off) of S's live entries in that round's snapshot, the guard **trips** for S. For the rest of the cycle every deletion on S is then taken out of the actions (so the share cannot sneak under the limit after other steps applied), with a warning. Everything else is planned as usual. Holding all of them keeps the plan consistent: a directory's removal is held together with its children's. The cycle ends in `SyncReport::held_back` (`HeldBack { side, live, paths }`), which makes `is_converged` false but is not `unresolved`, so a daemon does not retry it at once. The deleting side keeps its tombstones, and S keeps its live entries: each later cycle holds them back again, until a cycle runs with the guard off (`sync --once --allow-mass-delete`) or S changes them (a modification wins over the concurrent tombstone). A daemon logs the warning and keeps running. Tombstone GC needs no change: a live peer entry withdraws the ack.
+
 Rename detection by inode or hash is an optional later optimization.
 
 ---
@@ -503,7 +505,7 @@ enum Outcome { Applied(Entry), PreconditionFailed(Option<Entry>), Preserved{ con
 | M8 | network: **production variant** | T20–T22 |
 | M9 | follow-ups: crash-suite flake, block-level delta transfer | T23–T25 |
 | M10 | usability fixes found while writing `docs/usage.md`: broken pipe, server-side `status`, delta visibility | T26–T28 |
-| M11 | bug fixes from GitHub issues: root marker (issue #1) | T29 |
+| M11 | bug fixes from GitHub issues: root marker, mass-deletion guard (issue #1) | T29–T30 |
 
 ---
 

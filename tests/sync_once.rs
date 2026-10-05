@@ -433,6 +433,81 @@ fn concurrent_tombstones_are_collected(m: Mode) {
     p.assert_converged();
 }
 
+/// The mass-deletion guard (§6.4): deleting most of a replica holds every
+/// deletion there back for the cycle, while the rest syncs; with the guard
+/// off they apply. The deleting side keeps its tombstones, so nothing is
+/// lost and nothing comes back.
+fn mass_deletion_is_held_back(m: Mode) {
+    let mut p = pair(m);
+    p.a.mkdir("d");
+    for i in 0..20 {
+        p.a.write(&format!("d/f{i:02}"), "x");
+    }
+    p.a.write("keep", "k");
+    p.sync();
+    // 22 live entries on B; 21 deletions (d and its files).
+    p.a.rm("d");
+    p.a.write("new", "n");
+    p.b.write("keep", "edited on b");
+    let r = p.try_sync();
+    assert!(!r.is_converged());
+    assert_eq!(r.held_back.len(), 1, "{r:#?}");
+    let h = &r.held_back[0];
+    assert_eq!((h.side, h.live, h.paths.len()), (Side::B, 22, 21));
+    assert_eq!(h.paths[0].to_string(), "d");
+    assert!(r.unresolved.is_empty() && r.errors.is_empty(), "{r:#?}");
+    assert_eq!(p.b.read("d/f07"), "x", "nothing deleted on B");
+    assert_eq!(p.b.read("new"), "n", "the rest syncs");
+    assert_eq!(p.a.read("keep"), "edited on b");
+    // Still held back by the next cycle, and A does not get them back.
+    let r = p.try_sync();
+    assert_eq!((r.applied, r.held_back.len()), (0, 1));
+    assert!(!p.a.exists("d"));
+
+    p.engine = p.engine.clone().max_delete_percent(100);
+    let r = p.sync();
+    assert_eq!(r.applied, 21);
+    assert!(!p.b.exists("d"));
+    p.assert_converged();
+}
+
+/// Small deletions, or ones below the share, are not held back; a directory
+/// replaced by a file counts with everything beneath it.
+fn small_or_partial_deletions_apply(m: Mode) {
+    let mut p = pair(m);
+    for i in 0..12 {
+        p.a.write(&format!("f{i:02}"), "x");
+    }
+    p.sync();
+    // 10 of 12: no more than MASS_DELETE_MIN.
+    for i in 0..10 {
+        p.a.rm(&format!("f{i:02}"));
+    }
+    assert_eq!(p.sync().applied, 10);
+    // 11 of 30 (less than half).
+    p.a.mkdir("d");
+    for i in 0..27 {
+        p.a.write(&format!("d/g{i:02}"), "x");
+    }
+    p.sync();
+    for i in 0..11 {
+        p.a.rm(&format!("d/g{i:02}"));
+    }
+    assert_eq!(p.sync().applied, 11);
+    p.assert_converged();
+    // The directory (with its 16 files) replaced by a file: 17 of 19.
+    p.a.rm("d");
+    p.a.write("d", "now a file");
+    let r = p.try_sync();
+    assert_eq!(r.held_back.len(), 1, "{r:#?}");
+    assert_eq!(r.held_back[0].paths.len(), 17);
+    assert!(p.b.is_dir("d"));
+    p.engine = p.engine.clone().max_delete_percent(100);
+    p.sync();
+    assert_eq!(p.b.read("d"), "now a file");
+    p.assert_converged();
+}
+
 both_modes! {
     create_on_each_side,
     modify_on_each_side,
@@ -452,4 +527,6 @@ both_modes! {
     directory_filled_during_delete_is_kept,
     tombstones_are_collected_after_the_retention_period,
     concurrent_tombstones_are_collected,
+    mass_deletion_is_held_back,
+    small_or_partial_deletions_apply,
 }

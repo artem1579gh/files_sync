@@ -187,11 +187,21 @@ pub struct PairConfig {
     /// before its tombstones are collected (design §3).
     #[serde(default = "default_tombstone_retention_days")]
     pub tombstone_retention_days: u64,
+    /// The mass-deletion guard (design §6.4): a sync cycle that would delete
+    /// more than this percentage of a replica's entries (and more than
+    /// [`MASS_DELETE_MIN`](crate::engine::MASS_DELETE_MIN)) applies none of
+    /// those deletions. 100 turns the guard off.
+    #[serde(default = "default_max_delete_percent")]
+    pub max_delete_percent: u8,
     pub replicas: [ReplicaConfig; 2],
 }
 
 fn default_tombstone_retention_days() -> u64 {
     crate::index::DEFAULT_TOMBSTONE_RETENTION.as_secs() / SECS_PER_DAY
+}
+
+fn default_max_delete_percent() -> u8 {
+    crate::engine::DEFAULT_MAX_DELETE_PERCENT
 }
 
 const SECS_PER_DAY: u64 = 24 * 3600;
@@ -214,6 +224,7 @@ impl PairConfig {
         let mut cfg = PairConfig {
             name: name.to_owned(),
             tombstone_retention_days: default_tombstone_retention_days(),
+            max_delete_percent: default_max_delete_percent(),
             replicas: [a, b],
         };
         adjust(&mut cfg);
@@ -289,6 +300,12 @@ impl PairConfig {
 
     /// Checks the invariants that do not depend on the filesystem.
     fn check(&self) -> Result<(), String> {
+        if self.max_delete_percent > 100 {
+            return Err(format!(
+                "max_delete_percent is {}, at most 100",
+                self.max_delete_percent
+            ));
+        }
         let [a, b] = &self.replicas;
         for r in [a, b] {
             if r.id.0 == 0 {
@@ -789,6 +806,12 @@ mod tests {
                 replica("0000000000000001", "/a"),
                 replica("0000000000000002", "/b")
             ),
+            // A percentage above 100.
+            format!(
+                "name = \"p\"\nmax_delete_percent = 101\n{}{}",
+                replica("0000000000000001", "/a"),
+                replica("0000000000000002", "/b")
+            ),
         ];
         for text in &cases {
             fs::write(&path, text).unwrap();
@@ -817,6 +840,18 @@ mod tests {
                 replica("0000000000000002", "/b")
             ),
         ];
+        // A config from before the guard gets its default.
+        fs::write(
+            &path,
+            format!(
+                "name = \"p\"\n{}{}",
+                replica("0000000000000001", "/a"),
+                replica("0000000000000002", "/b")
+            ),
+        )
+        .unwrap();
+        let cfg = PairConfig::load_from(&path).unwrap();
+        assert_eq!(cfg.max_delete_percent, 50);
         for text in &parse_errors {
             fs::write(&path, text).unwrap();
             let err = PairConfig::load_from(&path).unwrap_err();

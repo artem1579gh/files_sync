@@ -885,5 +885,40 @@ The design lives in [`design.md`](design.md); §N.M below refers to its sections
     - `Replica::scan` checks the marker before the scanner (nothing indexed) and after it (a root removed mid-scan fails the cycle before reconcile). A daemon whose root loses its marker stops with the error.
   - **Error:** `Error::RootMarkerMissing { path, marker, reason }`. Its message suggests mounting the disk, or `touch`ing the marker if it is the right directory. `docs/usage.md` §2 adds the third way out: delete the replica's index, so it starts over from the peer without deleting anything.
   - **Tests:** reserved-name checks (harness `walk`, `crash.rs`, `attack.rs`, `local.rs` `leftovers`, `cli.rs` `names`) leave out the root marker at the top of a root. `docs/usage.md`'s `find` listings leave out `.~fsync.*`.
-  - **Not done** (suggested in the issue): a mass-deletion guard (`--force`) and a trash directory. With the marker, a replaced or missing root is caught. A mass deletion inside a real root is a user's change; a guard against it would need a policy for the daemon (refuse every cycle until forced?). Left for a separate task.
+  - **Not done here** (suggested in the issue): a mass-deletion guard and a trash directory. They were done as T30 and T31.
   - **Results:** the issue's shell reproduction, run with release binaries: before the fix (2632a68), the second sync prints `5 change(s) applied`, exits 0 and leaves A empty. After it, the sync exits 1 with the marker error and A keeps its files. Upgrade checked by hand: a pair synced by the old binary is refused by the new one while B is an empty directory, and gets its markers once B is back (0 changes). `cargo test`, `cargo test --features hooks` and clippy (with and without `hooks`) pass. The guide's `sh` blocks were rerun under `/tmp/fsync-demo`; only the `--sandbox` block failed, because that kernel has no Landlock.
+
+### [x] T30: Mass-deletion guard (issue #1)
+- **Depends on:** T29
+- **Read:** §6.1, §6.3, §6.4 (Mass-deletion guard)
+- **Files:** `src/engine/executor.rs`, `src/config.rs`, `src/cli.rs`, `tests/sync_once.rs`, `tests/cli.rs`, `docs/usage.md`
+- **Do:**
+  - The issue's second suggestion, as unison's `confirmbigdeletes`: refuse a cycle that would delete more than some share of a replica's live entries, unless forced.
+  - Decide what a daemon does when the guard trips.
+- **Done when:**
+  - scenario tests in both modes:
+    - most of a replica deleted → held back, with the rest synced and nothing coming back on the deleting side;
+    - held back again by the next cycle;
+    - applied with the guard off;
+    - small or partial deletions apply;
+    - a directory replaced by a file counts with its contents;
+  - a CLI test covers the output, the exit status and `--allow-mass-delete`. A config test covers the default and the range;
+  - `cargo test`, `cargo test --features hooks`, clippy and the stress test pass.
+- **Notes:**
+  - **Rule:**
+    - What counts as a deletion on side S (`executor::deletes_on`): a `Push` to S whose target is live, and whose entry is a tombstone or replaces a directory with a file or symlink.
+    - The guard trips for S in a round with more than `MASS_DELETE_MIN` (10) such actions **and** more than `max_delete_percent` (default 50) of S's live entries (the root not counted).
+    - Once tripped, it holds every deletion on S for the rest of the cycle (`Cycle::held`). Otherwise, steps applied in round 1 could bring the share under the limit in round 2.
+    - Holding all of them keeps the plan consistent: an `Rmdir` is held with its children.
+  - **Report:**
+    - `SyncReport::held_back: Vec<HeldBack { side, live, paths }>`. It makes `is_converged` false, but it is not `unresolved`, so a daemon does not retry it after 1 s.
+    - The `sync cycle done` log has `held_back`, and a `mass deletion held back` warning is logged per trip.
+  - **Daemon decision:** it holds the deletions back, warns and keeps syncing everything else; it never stops for this. To apply them, stop it and run `sync --once --allow-mass-delete`. Each later cycle (a hint, or the 10-minute rescan) holds them back and warns again.
+  - **Config:** `max_delete_percent` (`u8`, serde default 50, at most 100; 100 turns the guard off). Old configs load with 50. `Engine::max_delete_percent`.
+  - **CLI:** `sync --once --allow-mass-delete` runs with 100. The summary lists the held-back count per replica, its live entries, the first 5 paths, `… and N more`, and the command to apply them. The command exits 1, with `N path(s) not synced`, which counts held-back paths.
+  - **Tests:**
+    - `tests/sync_once.rs`: `mass_deletion_is_held_back` and `small_or_partial_deletions_apply`, both modes.
+    - `tests/cli.rs`: `mass_deletion_needs_allow_mass_delete`.
+    - `config::tests::load_rejects_invalid_configs`: `max_delete_percent = 101` is rejected, and a missing key gives 50.
+    - The stress test (both modes) passes with the guard on.
+  - **Docs:** `docs/usage.md` §2 (with real output), §5, §9, §10, §12; README; design §6.4.

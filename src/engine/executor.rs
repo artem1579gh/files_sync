@@ -22,6 +22,12 @@
 //! Any other per-path error (e.g. `EACCES`) is logged and reported in
 //! [`SyncReport::errors`], and the path and its subtree are left alone for
 //! the rest of the cycle. Only an index or root failure aborts the cycle.
+//!
+//! **Mass-deletion guard** (design §6.4): when a round would delete more than
+//! [`Engine::max_delete_percent`] of a replica's live entries (and more than
+//! [`MASS_DELETE_MIN`]), no deletion is applied to that replica for the rest
+//! of the cycle. They are reported in [`SyncReport::held_back`]; everything
+//! else syncs as usual.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
@@ -43,12 +49,20 @@ pub const MAX_ROUNDS: usize = 5;
 /// Files smaller than this (old or new) are always sent whole (§7.1).
 pub const DELTA_MIN_SIZE: u64 = 1 << 20;
 
+/// Default of [`Engine::max_delete_percent`].
+pub const DEFAULT_MAX_DELETE_PERCENT: u8 = 50;
+
+/// The mass-deletion guard never holds back this many deletions or fewer,
+/// so deleting most of a small tree needs no confirmation.
+pub const MASS_DELETE_MIN: usize = 10;
+
 /// Runs sync cycles between two replicas.
 #[derive(Clone, Debug)]
 pub struct Engine {
     max_rounds: usize,
     tombstone_retention: Duration,
     delta_min_size: u64,
+    max_delete_percent: u8,
 }
 
 impl Default for Engine {
@@ -57,8 +71,20 @@ impl Default for Engine {
             max_rounds: MAX_ROUNDS,
             tombstone_retention: DEFAULT_TOMBSTONE_RETENTION,
             delta_min_size: DELTA_MIN_SIZE,
+            max_delete_percent: DEFAULT_MAX_DELETE_PERCENT,
         }
     }
+}
+
+/// Deletions on one replica held back by the mass-deletion guard.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeldBack {
+    /// The replica the deletions were for.
+    pub side: Side,
+    /// Its live entries when the guard tripped.
+    pub live: usize,
+    /// The paths that were not deleted, in path order.
+    pub paths: Vec<RelPath>,
 }
 
 /// What a sync cycle did.
@@ -88,13 +114,16 @@ pub struct SyncReport {
     pub collected: [usize; 2],
     /// Files written as a block-level delta (§7.1), among `applied`.
     pub deltas: usize,
+    /// Deletions not applied by the mass-deletion guard, per replica (at
+    /// most one entry each).
+    pub held_back: Vec<HeldBack>,
 }
 
 impl SyncReport {
     /// Both replicas hold the same synced state (nothing unresolved, no
-    /// errors).
+    /// errors, no deletion held back).
     pub fn is_converged(&self) -> bool {
-        self.unresolved.is_empty() && self.errors.is_empty()
+        self.unresolved.is_empty() && self.errors.is_empty() && self.held_back.is_empty()
     }
 }
 
@@ -124,6 +153,15 @@ impl Engine {
         self
     }
 
+    /// Overrides [`DEFAULT_MAX_DELETE_PERCENT`]: the share of a replica's
+    /// live entries (in percent) that one cycle may delete there before the
+    /// mass-deletion guard holds the deletions back. 100 or more turns the
+    /// guard off.
+    pub fn max_delete_percent(mut self, percent: u8) -> Engine {
+        self.max_delete_percent = percent;
+        self
+    }
+
     /// A full sync cycle: scans both replicas completely, then syncs.
     pub fn sync_once(&self, a: &mut dyn Replica, b: &mut dyn Replica) -> Result<SyncReport> {
         self.sync(a, b, Scope::Full)
@@ -150,6 +188,8 @@ impl Engine {
             adopt_asked: BTreeSet::new(),
             last: None,
             delta_min_size: self.delta_min_size,
+            max_delete_percent: self.max_delete_percent,
+            held: [None, None],
         };
         cycle.scan(&scope)?;
         let mut round = 0;
@@ -188,6 +228,7 @@ impl Engine {
         let mut report = cycle.report;
         report.errors = cycle.errors.into_iter().collect();
         report.unmanaged = cycle.unmanaged.into_iter().collect();
+        report.held_back = cycle.held.into_iter().flatten().collect();
         if report.rounds == 0 && report.is_converged() {
             // Nothing to do (e.g. a daemon cycle triggered by our own writes).
             tracing::debug!("sync cycle done: nothing to do");
@@ -200,6 +241,11 @@ impl Engine {
                 conflicts = report.conflicts.len(),
                 errors = report.errors.len(),
                 unresolved = report.unresolved.len(),
+                held_back = report
+                    .held_back
+                    .iter()
+                    .map(|h| h.paths.len())
+                    .sum::<usize>(),
                 "sync cycle done"
             );
         }
@@ -226,6 +272,27 @@ struct Cycle<'r> {
     last: Option<(Snapshot, Snapshot)>,
     /// See [`Engine::delta_min_size`].
     delta_min_size: u64,
+    /// See [`Engine::max_delete_percent`].
+    max_delete_percent: u8,
+    /// Per side (A, B): set once the mass-deletion guard tripped for it this
+    /// cycle; from then on every deletion there is held back.
+    held: [Option<HeldBack>; 2],
+}
+
+/// Whether `action` deletes something live on `side`: a pushed tombstone,
+/// or a directory replaced by a file or symlink (with everything beneath).
+fn deletes_on(action: &Action, side: Side) -> bool {
+    let ActionKind::Push {
+        from,
+        entry,
+        target: Some(target),
+    } = &action.kind
+    else {
+        return false;
+    };
+    *from == side.other()
+        && target.is_live()
+        && (entry.is_tombstone() || (target.kind == Kind::Dir && entry.kind != Kind::Dir))
 }
 
 /// How a step went.
@@ -291,9 +358,54 @@ impl Cycle<'_> {
                 _ => todo.push(action),
             }
         }
+        self.hold_mass_deletes(&mut todo, &a, &b);
         log_resolutions(&todo, [self.a.id(), self.b.id()]);
         self.last = Some((a, b));
         Ok(todo)
+    }
+
+    /// The mass-deletion guard: takes out of `todo` the deletions on a side
+    /// for which it tripped, this round or earlier in the cycle (so the
+    /// share cannot sneak under the limit once other changes applied).
+    fn hold_mass_deletes(&mut self, todo: &mut Vec<Action>, a: &Snapshot, b: &Snapshot) {
+        for (i, side, snap) in [(0, Side::A, a), (1, Side::B, b)] {
+            if self.held[i].is_none() {
+                let deletes = todo.iter().filter(|x| deletes_on(x, side)).count();
+                let live = snap
+                    .entries()
+                    .filter(|(p, e)| !p.is_root() && e.is_live())
+                    .count();
+                if deletes > MASS_DELETE_MIN
+                    && deletes * 100 > live * usize::from(self.max_delete_percent)
+                {
+                    tracing::warn!(
+                        ?side,
+                        replica = %snap.replica(),
+                        deletes,
+                        live,
+                        max_percent = self.max_delete_percent,
+                        "mass deletion held back: too many of the replica's entries would be deleted"
+                    );
+                    self.held[i] = Some(HeldBack {
+                        side,
+                        live,
+                        paths: Vec::new(),
+                    });
+                }
+            }
+            let Some(held) = &mut self.held[i] else {
+                continue;
+            };
+            todo.retain(|x| {
+                if !deletes_on(x, side) {
+                    return true;
+                }
+                if let Err(at) = held.paths.binary_search(&x.path) {
+                    held.paths.insert(at, x.path.clone());
+                }
+                false
+            });
+        }
     }
 
     /// Tells each replica how the cycle ended at its tombstones, so it can

@@ -145,6 +145,52 @@ fn empty_root_in_place_of_replica_is_refused() {
     assert_eq!(names(&b), ["f2.txt", "f3.txt", "sub"]);
 }
 
+/// The mass-deletion guard (design §6.4): `sync --once` holds back the
+/// deletions, says so and fails; `--allow-mass-delete` applies them.
+#[test]
+fn mass_deletion_needs_allow_mass_delete() {
+    let state = tempfile::tempdir().unwrap();
+    let (a, b) = init_pair(state.path(), "p");
+    for i in 0..12 {
+        std::fs::write(a.path().join(format!("f{i:02}")), "x").unwrap();
+    }
+    ok(state.path(), &["sync", "--once", "p"]);
+    for i in 0..12 {
+        std::fs::remove_file(a.path().join(format!("f{i:02}"))).unwrap();
+    }
+    let out = run(state.path(), &["sync", "--once", "p"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success(), "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "held back 12 deletion(s) in {}: more than 50% of its 12 entries",
+            b.path().canonicalize().unwrap().display()
+        )),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("    f00\n") && stdout.contains("… and 7 more"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("sync --once --allow-mass-delete p"),
+        "{stdout}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("12 path(s) not synced"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(names(b.path()).len(), 12);
+
+    let stdout = ok(
+        state.path(),
+        &["sync", "--once", "--allow-mass-delete", "p"],
+    );
+    assert!(stdout.contains("12 change(s) applied"), "{stdout}");
+    assert_eq!(names(b.path()), Vec::<String>::new());
+}
+
 /// `--sandbox` (landlock) still lets a sync write the roots and the state.
 #[test]
 fn sandboxed_sync_and_status() {

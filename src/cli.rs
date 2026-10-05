@@ -115,6 +115,11 @@ enum Command {
         /// Run a single sync pass and exit (use `daemon` for continuous sync).
         #[arg(long)]
         once: bool,
+        /// Apply deletions even if they remove more than `max_delete_percent`
+        /// of a replica's entries (the mass-deletion guard holds them back
+        /// otherwise).
+        #[arg(long)]
+        allow_mass_delete: bool,
         pair: String,
     },
     /// Keep a pair in sync continuously, driven by inotify; stops cleanly on
@@ -214,7 +219,11 @@ fn run_command(cli: Cli) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Command::Sync { once: true, pair } => {
+        Command::Sync {
+            once: true,
+            allow_mass_delete,
+            pair,
+        } => {
             let (cfg, pair_dir) = load_pair(&pair)?;
             if cli.sandbox {
                 sandbox(
@@ -224,15 +233,23 @@ fn run_command(cli: Cli) -> anyhow::Result<()> {
                 )?;
             }
             let [mut a, mut b] = open_pair(&cfg, &pair_dir)?;
-            let engine = Engine::new().tombstone_retention(cfg.tombstone_retention());
+            let max_delete_percent = if allow_mass_delete {
+                100
+            } else {
+                cfg.max_delete_percent
+            };
+            let engine = Engine::new()
+                .tombstone_retention(cfg.tombstone_retention())
+                .max_delete_percent(max_delete_percent);
             let report = engine.sync_once(&mut a, &mut b)?;
             drain_quarantine(&mut [&mut a, &mut b]);
             log_traffic(&[&a, &b]);
             print_report(&cfg, &report);
             if !report.is_converged() {
+                let held: usize = report.held_back.iter().map(|h| h.paths.len()).sum();
                 bail!(
                     "{} path(s) not synced; see above",
-                    report.errors.len() + report.unresolved.len()
+                    report.errors.len() + report.unresolved.len() + held
                 );
             }
             Ok(())
@@ -254,7 +271,9 @@ fn run_command(cli: Cli) -> anyhow::Result<()> {
             let stop = daemon::shutdown_signals()?;
             let [mut a, mut b] = open_pair(&cfg, &pair_dir)?;
             tracing::info!(pair = %cfg.name, "daemon started");
-            let engine = Engine::new().tombstone_retention(cfg.tombstone_retention());
+            let engine = Engine::new()
+                .tombstone_retention(cfg.tombstone_retention())
+                .max_delete_percent(cfg.max_delete_percent);
             let stats = Daemon::new()
                 .engine(engine)
                 .status_dir(pair_dir.clone())
@@ -503,7 +522,29 @@ fn print_report(cfg: &PairConfig, report: &SyncReport) {
     for p in &report.unresolved {
         outln!("  not settled (changed during the sync), retry: {p}");
     }
+    for h in &report.held_back {
+        outln!(
+            "  held back {} deletion(s) in {}: more than {}% of its {} entries",
+            h.paths.len(),
+            root(h.side).display(),
+            cfg.max_delete_percent,
+            h.live
+        );
+        for p in h.paths.iter().take(HELD_BACK_SHOWN) {
+            outln!("    {p}");
+        }
+        if h.paths.len() > HELD_BACK_SHOWN {
+            outln!("    … and {} more", h.paths.len() - HELD_BACK_SHOWN);
+        }
+        outln!(
+            "    if these deletions are intended, apply them with: files_sync sync --once --allow-mass-delete {}",
+            cfg.name
+        );
+    }
 }
+
+/// How many held-back deletions `sync --once` lists by name.
+const HELD_BACK_SHOWN: usize = 5;
 
 /// Probes a replica root, logs the result and checks the required features.
 fn probe_root(root: &Path) -> anyhow::Result<Caps> {

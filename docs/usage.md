@@ -55,6 +55,22 @@ Both replica directories must be on a local filesystem: ext4, xfs, btrfs or tmpf
 
   A pair made before root markers gets its markers on its next sync, unless a root is empty while its index lists files: that is refused in the same way.
   Back up the marker with the rest of the directory, and keep it there. Since there is one marker per replica ID, a directory can be a replica of several pairs.
+- **Mass-deletion guard:** a second safety net, like unison's `confirmbigdeletes`. If one sync would delete more than half of a replica's entries (`max_delete_percent` in [§10](#10-config-file-reference)), and more than 10 of them, none of those deletions is applied there. Everything else is still synced. The deleting side keeps its deletions, so nothing comes back either:
+
+  ```text
+  synced "docs": 0 change(s) applied in 0 round(s)
+    held back 41 deletion(s) in /data/backup: more than 50% of its 42 entries
+      photos
+      photos/img1.jpg
+      photos/img10.jpg
+      photos/img11.jpg
+      photos/img12.jpg
+      … and 36 more
+      if these deletions are intended, apply them with: files_sync sync --once --allow-mass-delete docs
+  Error: 41 path(s) not synced; see above
+  ```
+
+  `sync --once` then exits with status 1, and every later sync holds them back again. If you meant to delete them, run `files_sync sync --once --allow-mass-delete docs`. If not, restore the files on the side that lost them, from the other side for example. A `daemon` holds them back too, logs a warning, and keeps running; stop it to run `sync --once --allow-mass-delete`, then start it again. Deleting at most 10 entries, or at most half of them, is never held back.
 
 ## 3. Quick start
 
@@ -238,6 +254,8 @@ wait
 ```text
 daemon for "live" stopped: 4 cycle(s), 5 change(s) applied, 0 conflict(s)
 ```
+
+If a change would delete most of a replica, the daemon holds those deletions back and logs `mass deletion held back` (see **Mass-deletion guard** in [§2](#2-concepts)).
 
 You can use `sync --once` and the daemon on the same pair, one at a time. Running both at once fails, because each replica's index is locked by the process that has it open.
 
@@ -483,8 +501,10 @@ init <PAIR> --a <DIR> --b <DIR> [--a-remote HOST:PORT] [--b-remote HOST:PORT]
     PAIR may contain ASCII letters, digits, '.', '_' and '-' (max 64 bytes,
     not starting with '.').
 
-sync --once <PAIR>
-    One sync pass, then exit. Exit status 0 when converged.
+sync --once [--allow-mass-delete] <PAIR>
+    One sync pass, then exit. Exit status 0 when converged. Deletions of more
+    than max_delete_percent of a replica's entries are held back (exit
+    status 1) unless --allow-mass-delete is given.
 
 daemon <PAIR>
     Continuous sync driven by inotify (plus a full rescan every 10 minutes).
@@ -512,6 +532,7 @@ If the reader of stdout goes away (`files_sync status docs | head -3`), a comman
 ```toml
 name = "docs"
 tombstone_retention_days = 30      # how long deletions are remembered after both sides agree
+max_delete_percent = 50            # hold back a sync that deletes more of a replica (100: never)
 
 [[replicas]]                       # replica A
 id = "f563ef689fcf91de"            # do not change
@@ -567,4 +588,5 @@ Edit it while no `sync`, `daemon` or `serve` for the pair is running. Unknown ke
 | `not settled (changed during the sync), retry: <path>` | The file kept changing while it was being synced. Nothing was lost; the next run (or the daemon, after 1 s) retries it. |
 | `.sync-conflict-` files appear | Both sides changed the file between syncs. See [§4](#4-conflicts). |
 | `replica root …: its root marker is missing` (or `it is empty, but its index lists N live entries`, or `its root marker is gone`) | The root does not hold the replica's root marker, so it may be the wrong directory, such as the empty mount point of a disk that is not mounted. Nothing was synced. See **Root marker** in [§2](#2-concepts). |
+| `held back N deletion(s) in …: more than 50% of its M entries` | One side lost most of its files since the last sync, and the mass-deletion guard kept the other side from following. If that was intended, run `sync --once --allow-mass-delete`. See [§2](#2-concepts). |
 | `.~fsync.*` files remain after a crash | They are recovered or removed automatically by the next `sync`, `daemon` or `serve` of the pair. `.~fsync.root.<replica-id>` at the top of a root is the root marker: keep it. |

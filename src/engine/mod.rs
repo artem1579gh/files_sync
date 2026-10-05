@@ -12,7 +12,9 @@ pub mod reconcile;
 mod sim;
 
 pub use conflict::ConflictCopy;
-pub use executor::{Engine, MAX_ROUNDS, SyncReport};
+pub use executor::{
+    DEFAULT_MAX_DELETE_PERCENT, Engine, HeldBack, MASS_DELETE_MIN, MAX_ROUNDS, SyncReport,
+};
 pub use plan::{Phase, PhaseKind, Step, plan};
 pub use reconcile::{Action, ActionKind, Resolution, SkipReason, reconcile};
 
