@@ -2,6 +2,14 @@
 
 All times are UTC.
 
+## 0.1.3 — 2026.10.05 15:04:50
+
+Fixes [issue #2](https://github.com/artem1579gh/files_sync/issues/2): a lost or restored index silently overwrote the replica's unsynced edits with the other side's older versions.
+
+- **Clock exchange:** before each sync, the two replicas compare their version clocks, and the lower one is raised to the higher. A replica whose index was deleted or restored from a backup keeps its unsynced changes: they are copied to the other side, or kept as conflict copies where both sides changed a file. Files it deleted since its last sync come back from the other side.
+- **Warning:** a replica whose index is new while its root was synced before logs `this replica was synced before, but its index is new (lost or deleted?)`.
+- **Network protocol v3:** adds the clock exchange. Older peers still connect; an older `serve` does not protect its own replica's index.
+
 ## 0.1.2 — 2026.10.05 10:45:26
 
 Fixes [issue #1](https://github.com/artem1579gh/files_sync/issues/1): an empty or unmounted replica root deleted every file on the other replica.
