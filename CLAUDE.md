@@ -1,10 +1,11 @@
 # CLAUDE.md
 
-`files_sync` is a race-free, two-way file synchronizer for Linux, written in Rust: "syncthing-style sync with rsync symlink semantics". It syncs two local directories, or two directories over the network (`serve`, mutual TLS, block-level deltas). Milestones M0–M10 are implemented, and every task in `claude/tasks.md` is done.
+`files_sync` is a race-free, two-way file synchronizer for Linux, written in Rust: "syncthing-style sync with rsync symlink semantics". It syncs two local directories, or two directories over the network (`serve`, mutual TLS, block-level deltas). Milestones M0–M11 are implemented, and every task in `claude/tasks.md` is done.
 
 - **Design:** [`claude/design.md`](claude/design.md). It is the source of truth; keep it updated when you deviate from it.
 - **Task list:** [`claude/tasks.md`](claude/tasks.md). Its tasks are designed to be done one per session, without prior context.
 - **User guide:** [`docs/usage.md`](docs/usage.md). It describes the CLI, the config file and the user-visible behaviour. Keep it in sync when you change any of these.
+- **Release notes:** [`release_notes.md`](release_notes.md). One note per released version (see "Versions and releases").
 
 ## How to work in a session
 
@@ -25,6 +26,18 @@ cargo build --release                             # binary for manual checks
 ```
 
 To try the binary by hand, follow `docs/usage.md`. Its ```` ```sh ```` blocks form one runnable demo; ```` ```bash ```` blocks are illustrative and not run. Run it under `/tmp`, with `XDG_STATE_HOME` pointing there too, so `~/.local/state` is not touched.
+
+## Versions and releases
+
+- **Format:** `MAJOR.MIDDLE.MINOR`, as in `version` in `Cargo.toml`. `0.1.1` was the initial release.
+- **MINOR:** goes up for bug fixes and optimisations.
+- **MIDDLE:** goes up for new features. MINOR starts again at 1.
+- **MAJOR:** only for special occasions. Never change it without discussing it with the user. Major `0` is a special case (the current pre-1.0 series).
+- **Numbering:** MIDDLE and MINOR start at 1, never 0. A new middle version is `X.Y.1`.
+- **Releasing:** only when the user asks.
+  - Set `version` in `Cargo.toml`, and run `cargo build` so `Cargo.lock` follows.
+  - Add a note at the **top** of `release_notes.md`: a `## <version> — YYYY.MM.DD HH:MM:SS` heading with the date and time the note is added, **in UTC** (`date -u '+%Y.%m.%d %H:%M:%S'`), then briefly what the release does.
+  - Keep one empty line between notes. Never rewrite older notes.
 
 ## Hard rules (these protect race-freedom; do not break them)
 
