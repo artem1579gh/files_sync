@@ -861,3 +861,29 @@ The design lives in [`design.md`](design.md); §N.M below refers to its sections
   - **Tests:** `tests/net.rs` `sync_once_reports_delta_transfers`: `serve` + `sync --once`, a 2 MiB file (create: no delta text), then 1 byte changed → `1 change(s) applied in 1 round(s), 1 sent as delta`, content equal. `tests/cli.rs` `local_sync_prints_no_delta`: the same change on a local pair prints the line without delta text.
   - **Docs:** `docs/usage.md` §7 shows `1 sent as delta` and explains it; §9 mentions it. The guide's `sh` blocks were rerun under `/tmp/fsync-demo` with the release binary: the line matches. (The §7 demo block that changed one byte no longer stops `serve`; the new status block after it does.)
   - **Results (T26–T28):** `cargo test`, `cargo test --features hooks` and clippy (with and without `hooks`) pass.
+
+## M11: bug fixes from GitHub issues
+
+### [x] T29: Refuse a replica root without its root marker (issue #1)
+- **Depends on:** T28
+- **Read:** §5.1 (Root marker), §5.8, §6.4 (Daemon), §9 (Harness)
+- **Files:** `src/fs/tmpname.rs`, `src/fs/commit.rs` (`create_root_marker`), `src/index/store.rs` (meta `root_marker`), `src/replica/local.rs` (`ensure_root_marker`, `scan`), `src/error.rs`, tests that list roots, `docs/usage.md`
+- **Do:**
+  - [Issue #1](https://github.com/artem1579gh/files_sync/issues/1): if a replica root is an empty directory (a disk that is not mounted leaves its empty mount point), every indexed path becomes a tombstone and the deletions propagate to the peer. `sync --once` exits 0, and the quarantine is drained, so the files are gone.
+  - Put a marker `.~fsync.root.<replica-id>` at the top of each root, as syncthing's `.stfolder` does. Refuse to open or scan a replica whose marker is missing once one was made. Give pairs made before markers a marker, unless their root is empty while the index lists live entries.
+- **Done when:**
+  - the issue's reproduction is a test (`tests/cli.rs`) that fails before the fix: the sync exits non-zero, A keeps its files and nothing is written to B. With the disk back, syncing works again;
+  - unit tests cover a marker removed after open (scan and reopen refused, nothing indexed as deleted), a marker that is not a regular file, and a legacy index (refused on an empty root, marked on a non-empty one);
+  - `docs/usage.md` explains the marker, the error and how to recover;
+  - `cargo test`, `cargo test --features hooks` and clippy pass.
+- **Notes:**
+  - **Marker:** `fs::tmpname::root_marker(id)` = `.~fsync.root.<16 hex>`, one per replica ID, so a directory can be a replica of several pairs. It sits in the reserved namespace, so the scanner and watcher ignore it and it is never synced. Only its existence as a regular file counts (`Root::stat`, no symlink followed). Its text says what it is.
+  - **Creation** (`commit::create_root_marker`): `O_CREAT|O_EXCL|O_NOFOLLOW` at the root fd, never over anything; written, fsynced, root fsynced. It needs no journal: one cut short by a crash is still a marker. Hook points `marker.created`, `marker.written`.
+  - **Index:** meta key `root_marker` = 1 once made or found (`IndexStore::root_marked`/`set_root_marked`). It is an additive key, so the schema version stays 2.
+  - **Checks:**
+    - `LocalReplica::open` runs `ensure_root_marker` after opening the index and before replaying the journal, so nothing is done in a wrong directory.
+    - `Replica::scan` checks the marker before the scanner (nothing indexed) and after it (a root removed mid-scan fails the cycle before reconcile). A daemon whose root loses its marker stops with the error.
+  - **Error:** `Error::RootMarkerMissing { path, marker, reason }`. Its message suggests mounting the disk, or `touch`ing the marker if it is the right directory. `docs/usage.md` §2 adds the third way out: delete the replica's index, so it starts over from the peer without deleting anything.
+  - **Tests:** reserved-name checks (harness `walk`, `crash.rs`, `attack.rs`, `local.rs` `leftovers`, `cli.rs` `names`) leave out the root marker at the top of a root. `docs/usage.md`'s `find` listings leave out `.~fsync.*`.
+  - **Not done** (suggested in the issue): a mass-deletion guard (`--force`) and a trash directory. With the marker, a replaced or missing root is caught. A mass deletion inside a real root is a user's change; a guard against it would need a policy for the daemon (refuse every cycle until forced?). Left for a separate task.
+  - **Results:** the issue's shell reproduction, run with release binaries: before the fix (2632a68), the second sync prints `5 change(s) applied`, exits 0 and leaves A empty. After it, the sync exits 1 with the marker error and A keeps its files. Upgrade checked by hand: a pair synced by the old binary is refused by the new one while B is an empty directory, and gets its markers once B is back (0 changes). `cargo test`, `cargo test --features hooks` and clippy (with and without `hooks`) pass. The guide's `sh` blocks were rerun under `/tmp/fsync-demo`; only the `--sandbox` block failed, because that kernel has no Landlock.

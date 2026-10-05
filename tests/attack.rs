@@ -44,7 +44,7 @@ use files_sync::Result;
 use files_sync::config::ReplicaId;
 use files_sync::fs::caps::Caps;
 use files_sync::fs::commit::{self, CopyNode, Ctx, Expected, FileMeta, Outcome, Quarantine};
-use files_sync::fs::{Fingerprint, RelPath, Root, hooks, is_reserved};
+use files_sync::fs::{Fingerprint, RelPath, Root, hooks, is_reserved, is_root_marker};
 use files_sync::index::Journal;
 
 const REPLICA: ReplicaId = ReplicaId(0x0123456789abcdef);
@@ -595,7 +595,9 @@ fn reserved_leftovers(dirs: &[&Path]) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for dir in dirs {
         walk(dir, &mut |path, _| {
-            if is_reserved(path.file_name().unwrap().as_encoded_bytes()) {
+            let name = path.file_name().unwrap().as_encoded_bytes();
+            let marker = path.parent() == Some(*dir) && is_root_marker(name);
+            if is_reserved(name) && !marker {
                 out.push(path.to_path_buf());
             }
         });

@@ -2,8 +2,9 @@
 //!
 //! Every name starting with [`RESERVED_PREFIX`] belongs to us: temp files
 //! (`.~fsync.<id>`), quarantined old inodes (`.~fsync.old.<id>`), files
-//! being deleted (`.~fsync.del.<id>`) and capability probes
-//! (`.~fsync.probe.*`). The scanner and watcher ignore them all.
+//! being deleted (`.~fsync.del.<id>`), capability probes
+//! (`.~fsync.probe.*`) and the root marker (`.~fsync.root.<replica>`,
+//! [`root_marker`]). The scanner and watcher ignore them all.
 //!
 //! [`conflict_name`] lives here rather than in `engine/conflict.rs` because
 //! `fs::commit` needs it too and `fs` must not depend on the engine.
@@ -24,6 +25,26 @@ pub const NAME_MAX: usize = 255;
 /// True for names in the reserved `.~fsync.` namespace.
 pub fn is_reserved(name: &[u8]) -> bool {
     name.starts_with(RESERVED_PREFIX)
+}
+
+/// Prefix of the root marker's name ([`root_marker`]).
+pub const ROOT_MARKER_PREFIX: &[u8] = b".~fsync.root.";
+
+/// `.~fsync.root.<replica>`: the file at the top of a replica root that
+/// shows it is that replica's root (design §5.1). A replica refuses to sync
+/// a root without it once it has been made, so an empty directory in its
+/// place (a disk that is not mounted) is not taken for a replica whose
+/// files were all deleted. One per replica ID, so one directory can be a
+/// replica of several pairs.
+pub fn root_marker(replica: ReplicaId) -> Vec<u8> {
+    let mut name = ROOT_MARKER_PREFIX.to_vec();
+    name.extend_from_slice(replica.to_string().as_bytes());
+    name
+}
+
+/// True for the name of any replica's root marker ([`root_marker`]).
+pub fn is_root_marker(name: &[u8]) -> bool {
+    name.starts_with(ROOT_MARKER_PREFIX)
 }
 
 /// Random identifier of one temp, quarantine or delete name.
@@ -203,6 +224,15 @@ mod tests {
         assert!(is_reserved(b".~fsync.probe.x"));
         assert!(!is_reserved(b".~fsync"));
         assert!(!is_reserved(b"a.~fsync.x"));
+    }
+
+    #[test]
+    fn root_marker_names() {
+        let name = root_marker(ReplicaId(0xabcdef0123456789));
+        assert_eq!(name, b".~fsync.root.abcdef0123456789");
+        assert!(is_reserved(&name) && is_root_marker(&name));
+        assert_eq!(parse(&name), None);
+        assert!(!is_root_marker(b".~fsync.0123456789abcdef"));
     }
 
     #[test]

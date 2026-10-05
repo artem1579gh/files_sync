@@ -44,7 +44,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use files_sync::config::SymlinkPolicy;
-use files_sync::fs::{hooks, is_reserved};
+use files_sync::fs::{hooks, is_reserved, is_root_marker};
 use files_sync::index::IndexStore;
 use harness::{ID_A, ID_B, Node, Pair};
 
@@ -399,12 +399,16 @@ fn clean_run(sc: &Scenario, named: bool) -> Clean {
     }
 }
 
-/// Reserved names under `root`, as (directory, name) relative to it.
+/// Reserved names under `root`, as (directory, name) relative to it; the
+/// root marker at the top is left out (it is not the journal's).
 fn reserved(root: &Path) -> BTreeSet<(PathBuf, Vec<u8>)> {
     fn walk(root: &Path, rel: &Path, out: &mut BTreeSet<(PathBuf, Vec<u8>)>) {
         for e in fs::read_dir(root.join(rel)).unwrap() {
             let e = e.unwrap();
             let name = e.file_name();
+            if rel.as_os_str().is_empty() && is_root_marker(name.as_bytes()) {
+                continue;
+            }
             if is_reserved(name.as_bytes()) {
                 out.insert((rel.to_path_buf(), name.as_bytes().to_vec()));
             }

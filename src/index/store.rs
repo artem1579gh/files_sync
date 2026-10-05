@@ -6,7 +6,9 @@
 //!   than a panic inside redb's `Value::from_bytes`.
 //! - `by_seq`: seq → path bytes. Holds exactly one row per entry, at its
 //!   current seq, so `changes_since` is a range scan.
-//! - `meta`: schema version, replica ID, next seq, max counter.
+//! - `meta`: schema version, replica ID, next seq, max counter, and
+//!   `root_marker` (1 once the replica's root marker was made, design §5.1;
+//!   absent in an index from before markers, so the schema is unchanged).
 //! - `intents`: the commit journal ([`Journal`], design §5.8).
 //! - `peers`: peer replica ID → wall-clock time (ns) of the last sync cycle
 //!   with it ([`IndexStore::record_sync`]).
@@ -45,6 +47,7 @@ const META_SCHEMA: &str = "schema";
 const META_REPLICA: &str = "replica_id";
 const META_NEXT_SEQ: &str = "next_seq";
 const META_MAX_COUNTER: &str = "max_counter";
+const META_ROOT_MARKER: &str = "root_marker";
 
 /// Bump when the encoding of any table changes.
 /// 2: `LinkInfo::adopted` (T17).
@@ -250,6 +253,25 @@ impl IndexStore {
     /// for [`VersionVector::bump_after`](crate::index::VersionVector::bump_after).
     pub fn max_counter(&self) -> Result<u64> {
         self.read()?.max_counter()
+    }
+
+    /// Whether the replica's root marker was made (or found) for this index
+    /// ([`IndexStore::set_root_marked`]). From then on, a root without it is
+    /// refused (design §5.1).
+    pub fn root_marked(&self) -> Result<bool> {
+        let txn = self.db.begin_read().map_err(dberr)?;
+        let meta = txn.open_table(META).map_err(dberr)?;
+        Ok(get_meta(&meta, META_ROOT_MARKER)? == Some(1))
+    }
+
+    /// Records, durably, that the root marker exists.
+    pub fn set_root_marked(&self) -> Result<()> {
+        let txn = self.db.begin_write().map_err(dberr)?;
+        txn.open_table(META)
+            .map_err(dberr)?
+            .insert(META_ROOT_MARKER, 1)
+            .map_err(dberr)?;
+        txn.commit().map_err(dberr)
     }
 
     /// Records a sync cycle with `peer` at `now_ns` and collects tombstones,
@@ -938,6 +960,17 @@ mod tests {
         let err = IndexStore::open(&path, ReplicaId(1)).unwrap_err();
         assert!(matches!(err, Error::BadIndex { .. }), "{err}");
         IndexStore::open(&path, ME).unwrap();
+    }
+
+    #[test]
+    fn root_marked_persists() {
+        let (_dir, store) = open();
+        assert!(!store.root_marked().unwrap());
+        store.set_root_marked().unwrap();
+        assert!(store.root_marked().unwrap());
+        let path = store.path().to_owned();
+        drop(store);
+        assert!(IndexStore::open(&path, ME).unwrap().root_marked().unwrap());
     }
 
     #[test]

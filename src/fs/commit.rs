@@ -25,7 +25,9 @@
 //!   directory a `-K` link points to (§4.3.1);
 //! - **materialize** (§4.3.1) replaces a followed directory link with a real
 //!   copy of the directory, staged as a whole tree under a temp name and
-//!   exchanged with the link like a replace.
+//!   exchanged with the link like a replace;
+//! - **root marker** ([`create_root_marker`], §5.1) is created with `O_EXCL`
+//!   at the top of the root, never over anything.
 //!
 //! After the rename, the parent is fsynced, the name must hold the inode we
 //! staged (or nothing, after a delete), and the parent must still resolve to
@@ -542,6 +544,53 @@ pub fn set_referent_mode(
     t.check_parent()?;
     point("commit.verified");
     Ok(Outcome::Applied(Fingerprint::of_fd(pin.as_fd())?))
+}
+
+/// Creates the root marker of `replica` at the top of `root` (design §5.1,
+/// [`tmpname::root_marker`]). Returns false, changing nothing, if something
+/// already has its name.
+///
+/// The marker is created with `O_EXCL`, so nothing is ever overwritten, and
+/// needs no journal: it is ours from the moment it exists, and only its
+/// existence counts, so one cut short by a crash (empty) is still a marker.
+pub fn create_root_marker(root: &Root, replica: ReplicaId) -> Result<bool> {
+    let name = tmpname::root_marker(replica);
+    let what = |e: Errno| {
+        Error::io(
+            format!("create root marker in {}", root.path().display()),
+            e.into(),
+        )
+    };
+    let fd = match rustix::fs::openat(
+        root.fd(),
+        name.as_slice(),
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o644),
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::EXIST) => return Ok(false),
+        Err(e) => return Err(what(e)),
+    };
+    point("marker.created");
+    let text = format!(
+        "This directory is the root of files_sync replica {replica}.\n\
+         Keep this file: without it, files_sync refuses to sync the directory.\n"
+    );
+    let mut file = std::fs::File::from(fd);
+    let io_err = |e| Error::io(format!("write root marker in {}", root.path().display()), e);
+    io::Write::write_all(&mut file, text.as_bytes()).map_err(io_err)?;
+    file.sync_all().map_err(io_err)?;
+    point("marker.written");
+    let dir = rustix::fs::openat2(
+        root.fd(),
+        ".",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+        RESOLVE,
+    )
+    .map_err(what)?;
+    rustix::fs::fsync(&dir).map_err(what)?;
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------

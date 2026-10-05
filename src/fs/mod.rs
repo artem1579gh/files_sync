@@ -2,7 +2,8 @@
 //! leases, capability probes and race-injection hooks (design §2, §5).
 //!
 //! `commit.rs` is the only code allowed to mutate a replica (plus `caps.rs`,
-//! which creates and removes its own probe files).
+//! which creates and removes its own probe files). It also creates the root
+//! marker ([`commit::create_root_marker`]).
 pub mod caps;
 pub mod commit;
 pub mod hooks;
@@ -16,4 +17,4 @@ pub use stat::{
     Discard, FileKind, Fingerprint, PinnedFile, Recheck, Sink, StableReader, open_checked,
     stable_read, stable_read_with,
 };
-pub use tmpname::{conflict_name, is_conflict_name, is_reserved};
+pub use tmpname::{conflict_name, is_conflict_name, is_reserved, is_root_marker, root_marker};

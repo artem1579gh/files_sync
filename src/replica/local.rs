@@ -71,15 +71,17 @@ pub struct LocalReplica {
 impl LocalReplica {
     /// Opens the replica `config`: its root, its capabilities (probed,
     /// logged, and required, §1) and its index under `pair_dir`
-    /// (`$XDG_STATE_HOME/fsync/<pair>/`, which must exist). Then replays the
-    /// journal (§5.8): commits a crash interrupted are finished or undone,
-    /// and quarantined old inodes are quarantined again.
+    /// (`$XDG_STATE_HOME/fsync/<pair>/`, which must exist). Checks the root
+    /// marker (§5.1, [`ensure_root_marker`]). Then replays the journal
+    /// (§5.8): commits a crash interrupted are finished or undone, and
+    /// quarantined old inodes are quarantined again.
     pub fn open(config: &ReplicaConfig, pair_dir: &Path) -> Result<LocalReplica> {
         let root = Root::open(&config.root)?;
         let caps = Caps::probe(root.fd())?;
         caps.log(root.path());
         caps.require_minimum()?;
         let index = IndexStore::open(&IndexStore::path_for(pair_dir, config.id), config.id)?;
+        ensure_root_marker(&root, &index, config.id)?;
         let mut replica = LocalReplica {
             config: config.clone(),
             root,
@@ -943,7 +945,11 @@ impl Replica for LocalReplica {
     }
 
     fn scan(&mut self, scope: Scope) -> Result<ScanStats> {
+        // Before and after: a root removed during the scan (`rm -rf`, the
+        // marker with it) fails the cycle before its deletions propagate.
+        check_root_marker(&self.root, self.config.id)?;
         let stats = self.scanner().scan(&scope)?;
+        check_root_marker(&self.root, self.config.id)?;
         self.after_scan(&stats);
         Ok(stats)
     }
@@ -1496,6 +1502,89 @@ fn check(cur: Option<&Entry>, pre: &Precondition) -> Option<&'static str> {
     }
 }
 
+/// Whether `root` holds `replica`'s root marker, as a regular file.
+fn has_root_marker(root: &Root, replica: ReplicaId) -> Result<bool> {
+    match root.stat(&RelPath::new(tmpname::root_marker(replica))?) {
+        Ok(fp) => Ok(fp.kind == FileKind::File),
+        Err(e) if e.is_not_found() => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+fn marker_missing(root: &Root, replica: ReplicaId, reason: String) -> Error {
+    Error::RootMarkerMissing {
+        path: root.path().to_owned(),
+        marker: String::from_utf8_lossy(&tmpname::root_marker(replica)).into_owned(),
+        reason,
+    }
+}
+
+/// Fails with [`Error::RootMarkerMissing`] unless `root` holds `replica`'s
+/// root marker (§5.1).
+fn check_root_marker(root: &Root, replica: ReplicaId) -> Result<()> {
+    if has_root_marker(root, replica)? {
+        Ok(())
+    } else {
+        Err(marker_missing(
+            root,
+            replica,
+            "its root marker is gone".into(),
+        ))
+    }
+}
+
+/// Makes sure `root` is `replica`'s root (design §5.1): it must hold the
+/// replica's root marker once `index` has recorded one. An index that has
+/// not (a new one, or one from before markers) gets the marker made, unless
+/// the root is empty while the index lists live entries: that is what a disk
+/// that is not mounted looks like, and syncing it would delete every one of
+/// them on the peer.
+fn ensure_root_marker(root: &Root, index: &IndexStore, replica: ReplicaId) -> Result<()> {
+    if has_root_marker(root, replica)? {
+        if !index.root_marked()? {
+            index.set_root_marked()?;
+        }
+        return Ok(());
+    }
+    if index.root_marked()? {
+        return Err(marker_missing(
+            root,
+            replica,
+            "its root marker is missing".into(),
+        ));
+    }
+    let live = index
+        .iter_prefix(&RelPath::root())?
+        .iter()
+        .filter(|(p, e)| !p.is_root() && e.is_live())
+        .count();
+    let empty = root
+        .read_dir(&RelPath::root())?
+        .iter()
+        .all(|e| tmpname::is_reserved(&e.name));
+    if live > 0 && empty {
+        return Err(marker_missing(
+            root,
+            replica,
+            format!(
+                "it is empty, but its index lists {live} live entries, and it has no root marker"
+            ),
+        ));
+    }
+    commit::create_root_marker(root, replica)?;
+    // Something else may have had the name.
+    if !has_root_marker(root, replica)? {
+        return Err(marker_missing(
+            root,
+            replica,
+            "its root marker is not a regular file".into(),
+        ));
+    }
+    index.set_root_marked()?;
+    tracing::info!(root = %root.path().display(), "created the root marker");
+    Ok(())
+}
+
 fn log_recovered(intent: &Intent, rep: &Recovered) {
     if let Some(why) = rep.skipped {
         tracing::warn!(path = %intent.path, why, "cannot replay intent; its reserved names are left alone");
@@ -1598,10 +1687,11 @@ fn invalid(path: &RelPath, reason: &'static str) -> Error {
 mod tests {
     use super::*;
     use crate::config::SymlinkPolicy;
-    use crate::fs::{hooks, is_reserved};
+    use crate::fs::{hooks, is_reserved, is_root_marker};
     use crate::index::{Ord4, UnmanagedReason};
     use std::fs;
     use std::io::Write;
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt, symlink};
     use std::path::PathBuf;
 
@@ -1692,22 +1782,25 @@ mod tests {
             self.r.apply(&rp(rel), op, pre, Some(&mut &data[..]))
         }
 
-        /// Reserved names left anywhere under the root, after a sweep.
+        /// Reserved names left anywhere under the root (but its root
+        /// marker), after a sweep.
         fn leftovers(&mut self) -> Vec<PathBuf> {
-            fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            fn walk(dir: &Path, top: bool, out: &mut Vec<PathBuf>) {
                 for e in fs::read_dir(dir).unwrap() {
                     let e = e.unwrap();
-                    if is_reserved(e.file_name().as_encoded_bytes()) {
+                    let name = e.file_name();
+                    let marker = top && is_root_marker(name.as_encoded_bytes());
+                    if is_reserved(name.as_encoded_bytes()) && !marker {
                         out.push(e.path());
                     }
                     if e.file_type().unwrap().is_dir() {
-                        walk(&e.path(), out);
+                        walk(&e.path(), false, out);
                     }
                 }
             }
             self.r.sweep_quarantine();
             let mut out = Vec::new();
-            walk(self.dir.path(), &mut out);
+            walk(self.dir.path(), true, &mut out);
             out
         }
     }
@@ -1768,6 +1861,97 @@ mod tests {
             .unwrap()
             .write_all(data)
             .unwrap();
+    }
+
+    fn config(root: &Path) -> ReplicaConfig {
+        ReplicaConfig {
+            id: ME,
+            root: root.to_path_buf(),
+            symlinks: SymlinkPolicy::Links,
+            munge_links: false,
+            keep_dirlinks: false,
+            keep_dirlinks_unsafe: false,
+            followed_write: Default::default(),
+            device: None,
+            remote: None,
+        }
+    }
+
+    fn marker_path(root: &Path) -> PathBuf {
+        root.join(std::ffi::OsStr::from_bytes(&tmpname::root_marker(ME)))
+    }
+
+    /// Issue #1: the root marker is made at the first open; once it is gone
+    /// (the root replaced by an empty directory, e.g. a disk that is not
+    /// mounted), neither a scan nor a new open runs, and nothing is indexed
+    /// as deleted.
+    #[test]
+    fn root_marker_is_made_then_required() {
+        let mut fx = Fx::new();
+        let marker = marker_path(fx.dir.path());
+        assert!(marker.is_file());
+        assert!(fx.r.index().root_marked().unwrap());
+        fs::write(fx.p("f"), "x").unwrap();
+        fx.scan();
+
+        fs::rename(fx.p("f"), fx._state.path().join("f")).unwrap();
+        fs::remove_file(&marker).unwrap();
+        let err = fx.r.scan(Scope::Full).unwrap_err();
+        assert!(matches!(err, Error::RootMarkerMissing { .. }), "{err}");
+        assert!(fx.get("f").is_live(), "a refused scan indexes nothing");
+
+        let cfg = fx.r.config().clone();
+        drop(fx.r);
+        let err = LocalReplica::open(&cfg, fx._state.path()).err().unwrap();
+        assert!(matches!(err, Error::RootMarkerMissing { .. }), "{err}");
+        assert!(err.to_string().contains("is missing"), "{err}");
+        assert!(!marker.exists(), "a refused open makes no marker");
+
+        // The user says it is the right directory.
+        fs::write(&marker, "").unwrap();
+        let mut r = LocalReplica::open(&cfg, fx._state.path()).unwrap();
+        r.scan(Scope::Full).unwrap();
+        assert!(r.index().get(&rp("f")).unwrap().unwrap().is_tombstone());
+    }
+
+    /// A marker that is not a regular file is no marker.
+    #[test]
+    fn root_marker_must_be_a_file() {
+        let (dir, state) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        fs::create_dir(marker_path(dir.path())).unwrap();
+        let err = LocalReplica::open(&config(dir.path()), state.path())
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("not a regular file"), "{err}");
+    }
+
+    /// An index from before root markers gets one made, unless the root is
+    /// empty while the index lists live entries.
+    #[test]
+    fn legacy_index_gets_a_marker_unless_the_root_is_empty() {
+        let (dir, state) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        fs::create_dir(dir.path().join("d")).unwrap();
+        fs::write(dir.path().join("d/f"), "x").unwrap();
+        {
+            let root = Root::open(dir.path()).unwrap();
+            let index = IndexStore::open(&IndexStore::path_for(state.path(), ME), ME).unwrap();
+            Scanner::new(&root, &index, SymlinkPolicy::Links)
+                .scan(&Scope::Full)
+                .unwrap();
+            assert!(!index.root_marked().unwrap());
+        }
+        let away = state.path().join("d");
+        fs::rename(dir.path().join("d"), &away).unwrap();
+        let cfg = config(dir.path());
+        let err = LocalReplica::open(&cfg, state.path()).err().unwrap();
+        assert!(matches!(err, Error::RootMarkerMissing { .. }), "{err}");
+        assert!(err.to_string().contains("it is empty"), "{err}");
+        assert!(!marker_path(dir.path()).exists());
+
+        fs::rename(&away, dir.path().join("d")).unwrap();
+        let r = LocalReplica::open(&cfg, state.path()).unwrap();
+        assert!(marker_path(dir.path()).is_file());
+        assert!(r.index().root_marked().unwrap());
     }
 
     #[test]

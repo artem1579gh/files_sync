@@ -5,6 +5,7 @@ use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use files_sync::config::PairConfig;
+use files_sync::fs::is_root_marker;
 
 fn run(state_home: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_files_sync"))
@@ -101,6 +102,49 @@ fn status_shows_index_conflicts_quarantine_and_last_sync() {
     assert!(!st.contains("never") && !st.contains("daemon"), "{st}");
 }
 
+/// Issue #1: a replica root that is an empty directory in place of the
+/// replica (a disk that is not mounted leaves its empty mount point) must
+/// not be taken for a replica whose files were all deleted. The sync fails
+/// and deletes nothing; with the disk back, it works again.
+#[test]
+fn empty_root_in_place_of_replica_is_refused() {
+    let w = tempfile::tempdir().unwrap();
+    let state = w.path().join("state");
+    let (a, b) = (w.path().join("a"), w.path().join("b"));
+    std::fs::create_dir_all(a.join("sub")).unwrap();
+    std::fs::create_dir(&b).unwrap();
+    for i in 1..=3 {
+        std::fs::write(a.join(format!("f{i}.txt")), format!("file {i}")).unwrap();
+    }
+    std::fs::write(a.join("sub/g.txt"), "deep").unwrap();
+    let (a_str, b_str) = (a.to_str().unwrap(), b.to_str().unwrap());
+    ok(&state, &["init", "d1", "--a", a_str, "--b", b_str]);
+    ok(&state, &["sync", "--once", "d1"]);
+    assert_eq!(std::fs::read(b.join("sub/g.txt")).unwrap(), b"deep");
+
+    // B's disk is "not mounted": an empty mount point is left behind.
+    let real = w.path().join("b.real");
+    std::fs::rename(&b, &real).unwrap();
+    std::fs::create_dir(&b).unwrap();
+    for _ in 0..2 {
+        let out = run(&state, &["sync", "--once", "d1"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{stderr}");
+        assert!(stderr.contains("root marker is missing"), "{stderr}");
+        assert!(stderr.contains("is its disk mounted?"), "{stderr}");
+        assert_eq!(names(&a), ["f1.txt", "f2.txt", "f3.txt", "sub"]);
+        assert_eq!(std::fs::read(a.join("sub/g.txt")).unwrap(), b"deep");
+        assert_eq!(names(&b), Vec::<String>::new(), "nothing written to B");
+    }
+
+    // The disk is back.
+    std::fs::remove_dir(&b).unwrap();
+    std::fs::rename(&real, &b).unwrap();
+    std::fs::remove_file(a.join("f1.txt")).unwrap();
+    ok(&state, &["sync", "--once", "d1"]);
+    assert_eq!(names(&b), ["f2.txt", "f3.txt", "sub"]);
+}
+
 /// `--sandbox` (landlock) still lets a sync write the roots and the state.
 #[test]
 fn sandboxed_sync_and_status() {
@@ -129,11 +173,12 @@ fn sandboxed_sync_and_status() {
     assert!(st.contains("2 entries (2 tombstones)"), "{st}");
 }
 
-/// The names in `dir`, sorted.
+/// The names in `dir`, sorted, without root markers.
 fn names(dir: &Path) -> Vec<String> {
     let mut names: Vec<_> = std::fs::read_dir(dir)
         .unwrap()
         .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| !is_root_marker(n.as_bytes()))
         .collect();
     names.sort();
     names
@@ -238,12 +283,7 @@ fn sync_once_syncs_two_directories() {
     );
     assert_eq!(std::fs::read(b.path().join("replaced")).unwrap(), b"new");
     for root in [&a, &b] {
-        let mut names: Vec<_> = std::fs::read_dir(root.path())
-            .unwrap()
-            .map(|e| e.unwrap().file_name().into_string().unwrap())
-            .collect();
-        names.sort();
-        assert_eq!(names, ["dir", "from_b", "replaced"]);
+        assert_eq!(names(root.path()), ["dir", "from_b", "replaced"]);
     }
 }
 

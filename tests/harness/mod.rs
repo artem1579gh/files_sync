@@ -20,7 +20,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crossbeam_channel::Receiver;
 use files_sync::config::{FollowedWrite, ReplicaConfig, ReplicaId, SymlinkPolicy};
 use files_sync::engine::{Engine, Side, SyncReport};
-use files_sync::fs::{FileKind, RelPath, is_reserved};
+use files_sync::fs::{FileKind, RelPath, is_reserved, is_root_marker};
 use files_sync::index::{Entry, Kind, PeerState, VersionVector};
 use files_sync::replica::proto::PROTOCOL_VERSION;
 use files_sync::replica::{
@@ -797,7 +797,7 @@ struct View<'a> {
 }
 
 /// The tree at `root` as it is: symlinks as symlinks, with their raw target
-/// bytes. Panics on a reserved name.
+/// bytes. Panics on a reserved name; root markers at the top are left out.
 pub fn raw_tree(root: &Path) -> BTreeMap<String, Node> {
     let mut out = BTreeMap::new();
     walk(root, "", None, &mut Vec::new(), &mut out);
@@ -820,6 +820,10 @@ fn walk(
     entries.sort_by_key(|e| e.file_name());
     for e in entries {
         let name = e.file_name();
+        // The root marker (design §5.1) belongs at the top of every root.
+        if prefix.is_empty() && is_root_marker(name.as_bytes()) {
+            continue;
+        }
         assert!(
             !is_reserved(name.as_bytes()),
             "reserved name left in {}: {}",

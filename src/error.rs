@@ -22,6 +22,24 @@ pub enum Error {
     #[error("invalid replica root {}: {reason}", path.display())]
     InvalidRoot { path: PathBuf, reason: String },
 
+    /// A replica root lacks its root marker (design §5.1), so it may not be
+    /// the replica's directory at all: most likely a disk that is not
+    /// mounted, leaving its empty mount point. Nothing is synced, since every
+    /// file the index knows would look deleted.
+    #[error(
+        "replica root {}: {reason}; it may not be the replica's directory \
+         (is its disk mounted?), so it is not synced. If it is the right \
+         directory, create the marker: touch '{}/{marker}' \
+         (see \"Root marker\" in docs/usage.md)",
+        path.display(),
+        path.display()
+    )]
+    RootMarkerMissing {
+        path: PathBuf,
+        marker: String,
+        reason: String,
+    },
+
     /// The configuration file parsed but describes an invalid pair.
     #[error("invalid config {}: {reason}", path.display())]
     InvalidConfig { path: PathBuf, reason: String },

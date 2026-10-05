@@ -47,7 +47,14 @@ Both replica directories must be on a local filesystem: ext4, xfs, btrfs or tmpf
 
   The state directory never lives inside a replica.
 - **Version vectors:** per-file causal history, as in syncthing. They tell an ordinary update ("B has seen A's last change and edited it again") from a real conflict ("both sides changed the file independently").
-- **Reserved names:** names starting with `.~fsync.` are temp, quarantine and probe files. You may briefly see them during a sync. They are never synced, and they are cleaned up, also after a crash.
+- **Reserved names:** names starting with `.~fsync.` are temp, quarantine and probe files. You may briefly see them during a sync. They are never synced, and they are cleaned up, also after a crash. The root marker below is the one that stays.
+- **Root marker:** the first sync puts a small file `.~fsync.root.<replica-id>` at the top of each local root, saying which replica the directory is. Like syncthing's `.stfolder`, it guards against an empty directory standing in for the replica. That happens, for example, when the disk behind a root is not mounted and its empty mount point is left. Without the marker, every file in the index would look deleted, and the deletions would be synced to the other side. If the marker is missing, `sync`, `daemon` and `serve` refuse to run for the pair (a daemon whose root loses its marker stops): ``replica root …: its root marker is missing; it may not be the replica's directory (is its disk mounted?)``. To fix it:
+  - if the disk is not mounted, or the path is wrong, mount it or fix the path, and run again;
+  - if the directory really is the replica (say, you restored it from a backup that skipped the marker), create the marker yourself, e.g. `touch '/data/backup/.~fsync.root.b8585899415ed538'`. Its content does not matter. The next sync then treats whatever is missing from the directory as deleted, and deletes it on the other side too;
+  - to fill an empty directory from the other side instead, delete this replica's index `<replica-id>.redb` from the state directory (only while nothing runs for the pair). The replica then starts over: the next sync copies the other side's files into it and deletes nothing.
+
+  A pair made before root markers gets its markers on its next sync, unless a root is empty while its index lists files: that is refused in the same way.
+  Back up the marker with the rest of the directory, and keep it there. Since there is one marker per replica ID, a directory can be a replica of several pairs.
 
 ## 3. Quick start
 
@@ -87,7 +94,7 @@ initialised pair "docs": /tmp/fsync-demo/state/fsync/docs/config.toml
 
 ```sh
 files_sync sync --once docs
-find backup | sort
+find backup -not -name '.~fsync.*' | sort
 ```
 
 ```text
@@ -97,6 +104,8 @@ backup/notes.txt
 backup/photos
 backup/photos/cat.jpg
 ```
+
+`find` leaves out the root marker `.~fsync.root.<replica-id>` that the sync put in each root (see [§2](#2-concepts)).
 
 Now change things on **both** sides: append to a file in `backup`, and delete a file in `laptop`. One sync carries each change to the other side.
 
@@ -285,7 +294,7 @@ for policy in links skip copy-links copy-unsafe-links safe-links copy-dirlinks; 
   sed -i "s/^symlinks = .*/symlinks = \"$policy\"/" "$XDG_STATE_HOME/fsync/sl-$policy/config.toml"
   files_sync sync --once "sl-$policy" > /dev/null
   echo "== $policy"
-  (cd "sl-$policy/b" && find . -mindepth 1 -printf '%y %p %l\n' | sort)
+  (cd "sl-$policy/b" && find . -mindepth 1 -not -name '.~fsync.*' -printf '%y %p %l\n' | sort)
 done
 ```
 
@@ -534,7 +543,7 @@ Edit it while no `sync`, `daemon` or `serve` for the pair is running. Unknown ke
 - owner and group, ACLs, extended attributes;
 - hard links: each name is synced as a separate file;
 - FIFOs, sockets and device files: they are skipped, and the same path on the other side is left alone;
-- names starting with `.~fsync.`;
+- names starting with `.~fsync.` (temp files, and the root marker of [§2](#2-concepts));
 - anything on another filesystem mounted inside a replica root: the mount point is not crossed and is reported as an error.
 
 **Not supported yet:**
@@ -557,4 +566,5 @@ Edit it while no `sync`, `daemon` or `serve` for the pair is running. Unknown ke
 | A command exits with status 141 | Its stdout was closed early (e.g. `files_sync status docs \| head -3`). Its work was done; only the rest of its output was dropped. See [§9](#9-command-reference). |
 | `not settled (changed during the sync), retry: <path>` | The file kept changing while it was being synced. Nothing was lost; the next run (or the daemon, after 1 s) retries it. |
 | `.sync-conflict-` files appear | Both sides changed the file between syncs. See [§4](#4-conflicts). |
-| `.~fsync.*` files remain after a crash | They are recovered or removed automatically by the next `sync`, `daemon` or `serve` of the pair. |
+| `replica root …: its root marker is missing` (or `it is empty, but its index lists N live entries`, or `its root marker is gone`) | The root does not hold the replica's root marker, so it may be the wrong directory, such as the empty mount point of a disk that is not mounted. Nothing was synced. See **Root marker** in [§2](#2-concepts). |
+| `.~fsync.*` files remain after a crash | They are recovered or removed automatically by the next `sync`, `daemon` or `serve` of the pair. `.~fsync.root.<replica-id>` at the top of a root is the root marker: keep it. |

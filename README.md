@@ -24,6 +24,7 @@ A two-way file synchronizer for Linux that **stays correct while files are being
 - **Conflicts:** both versions are kept. The losing one is renamed to `name.sync-conflict-YYYYMMDD-HHMMSS-<id>.ext`.
 - **Causality:** version vectors per file (like syncthing) tell real conflicts from ordinary updates.
 - **Crash safety:** an intent journal recovers half-finished operations.
+- **Root marker:** each root holds a `.~fsync.root.<replica-id>` file, as syncthing's `.stfolder`. A root without it, such as the empty mount point of a disk that is not mounted, is refused, not synced as "everything deleted".
 - **Network:** mutual TLS 1.3 with pinned self-signed certificates, as in syncthing. A changed file of 1 MiB or more is sent as a block-level delta: only its changed 128 KiB blocks cross the network.
 - **Sandbox (optional):** with `--sandbox`, Landlock confines the process's writes to the replica roots and its state directory.
 
