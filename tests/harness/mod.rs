@@ -304,6 +304,14 @@ impl Replica for TestReplica {
         self.get_mut().record_sync(peer, tombstones, retention)
     }
 
+    fn clock(&self) -> files_sync::Result<u64> {
+        self.get().clock()
+    }
+
+    fn witness(&mut self, floor: u64) -> files_sync::Result<()> {
+        self.get_mut().witness(floor)
+    }
+
     fn is_remote(&self) -> bool {
         self.get().is_remote()
     }
@@ -756,6 +764,14 @@ impl Replica for Racing<'_> {
         retention: Duration,
     ) -> files_sync::Result<Vec<RelPath>> {
         self.inner.record_sync(peer, tombstones, retention)
+    }
+
+    fn clock(&self) -> files_sync::Result<u64> {
+        self.inner.clock()
+    }
+
+    fn witness(&mut self, floor: u64) -> files_sync::Result<()> {
+        self.inner.witness(floor)
     }
 
     fn is_remote(&self) -> bool {

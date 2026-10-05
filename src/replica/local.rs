@@ -1163,6 +1163,17 @@ impl Replica for LocalReplica {
         }
         Ok(removed)
     }
+
+    fn clock(&self) -> Result<u64> {
+        self.index.max_counter()
+    }
+
+    fn witness(&mut self, floor: u64) -> Result<()> {
+        if self.index.witness(floor)? {
+            tracing::debug!(root = %self.root.path().display(), floor, "clock raised to the peer's");
+        }
+        Ok(())
+    }
 }
 
 /// Wall-clock time in ns since the Unix epoch.
@@ -1577,6 +1588,16 @@ fn check_root_marker(root: &Root, replica: ReplicaId) -> Result<()> {
 fn ensure_root_marker(root: &Root, index: &IndexStore, replica: ReplicaId) -> Result<()> {
     if has_root_marker(root, replica)? {
         if !index.root_marked()? {
+            // The marker is only made together with an index that records
+            // it: this index replaces a lost one (issue #2).
+            tracing::warn!(
+                root = %root.path().display(),
+                index = %index.path().display(),
+                "this replica was synced before, but its index is new (lost or deleted?): \
+                 every object counts as a local change, so differences with the peer \
+                 become conflict copies or are pushed to it, and deletions since the \
+                 last sync come back"
+            );
             index.set_root_marked()?;
         }
         return Ok(());

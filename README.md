@@ -26,6 +26,7 @@ A two-way file synchronizer for Linux that **stays correct while files are being
 - **Crash safety:** an intent journal recovers half-finished operations.
 - **Root marker:** each root holds a `.~fsync.root.<replica-id>` file, as syncthing's `.stfolder`. A root without it, such as the empty mount point of a disk that is not mounted, is refused, not synced as "everything deleted".
 - **Trash (optional):** with `trash_days` set, files a sync replaces or deletes are kept in `.~fsync.trash` for that many days.
+- **Lost or restored index:** a replica whose index was deleted or restored from a backup keeps its unsynced changes. They are pushed to the peer or kept as conflict copies, never overwritten by the peer's older versions.
 - **Mass-deletion guard:** a sync that would delete more than half of a replica (configurable) holds those deletions back until you confirm them with `sync --once --allow-mass-delete`.
 - **Network:** mutual TLS 1.3 with pinned self-signed certificates, as in syncthing. A changed file of 1 MiB or more is sent as a block-level delta: only its changed 128 KiB blocks cross the network.
 - **Sandbox (optional):** with `--sandbox`, Landlock confines the process's writes to the replica roots and its state directory.

@@ -39,8 +39,8 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use rustls::{ClientConfig, ClientConnection, StreamOwned};
 
 use super::proto::{
-    BATCH_BYTES, Content, ContentStream, DELTA_VERSION, PROTOCOL_VERSION, Request, Response,
-    batches, client_handshake_upto, read_frame, send_content, write_frame,
+    BATCH_BYTES, CLOCK_VERSION, Content, ContentStream, DELTA_VERSION, PROTOCOL_VERSION, Request,
+    Response, batches, client_handshake_upto, read_frame, send_content, write_frame,
 };
 use super::{BLOCK_SIZE, Blocks, ContentReader, Delta, Op, Outcome, Precondition, Replica};
 use crate::config::{ReplicaConfig, ReplicaId};
@@ -131,6 +131,7 @@ fn response_name(msg: &Response) -> &'static str {
         Response::Content(_) => "Content",
         Response::Hint(_) => "Hint",
         Response::Blocks(_) => "Blocks",
+        Response::Clock(_) => "Clock",
     }
 }
 
@@ -731,9 +732,51 @@ impl Replica for RemoteReplica {
         })?;
         Ok(removed)
     }
+
+    /// On a session older than v3, the largest counter in the mirrored
+    /// index (a lower bound of the server's clock).
+    fn clock(&self) -> Result<u64> {
+        if let Some(clock) = self.clock_request(&Request::Clock)? {
+            return Ok(clock);
+        }
+        let entries = self.changes_since(0)?;
+        Ok(entries
+            .iter()
+            .map(|(_, e)| e.vv.max_counter())
+            .max()
+            .unwrap_or(0))
+    }
+
+    /// Does nothing on a session older than v3: such a server cannot raise
+    /// its clock.
+    fn witness(&mut self, floor: u64) -> Result<()> {
+        if self.clock_request(&Request::Witness { floor })?.is_none() {
+            tracing::debug!(
+                floor,
+                "the server speaks no clock exchange; its clock stays as it is"
+            );
+        }
+        Ok(())
+    }
 }
 
 impl RemoteReplica {
+    /// Sends `Clock` or `Witness` and returns the server's clock; `None` on
+    /// a session older than v3, which has neither.
+    fn clock_request(&self, req: &Request) -> Result<Option<u64>> {
+        self.call(|conn| {
+            if conn.version < CLOCK_VERSION {
+                return Ok(Ok(None));
+            }
+            write_frame(&mut conn.tls, req)?;
+            match recv(&mut conn.tls)? {
+                Response::Clock(clock) => Ok(Ok(Some(clock))),
+                Response::Error(e) => Ok(Err(e.into())),
+                other => Err(unexpected(&other)),
+            }
+        })
+    }
+
     /// Sends `req` and the content `data` after it, and reads the outcome
     /// (`Apply`, `ApplyDelta`).
     fn send_apply(&self, req: &Request, data: Option<&mut dyn Read>) -> Result<Outcome> {

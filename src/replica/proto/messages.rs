@@ -51,8 +51,9 @@ pub enum HelloReply {
 /// [`Request::Apply`] or [`Request::ApplyDelta`].
 ///
 /// Variants are only ever appended, so that the messages of an older
-/// version encode as they did; those marked "v2" need a session of protocol
-/// version 2 or later (a server refuses them on an older session).
+/// version encode as they did; those marked "v2" (or "v3") need a session of
+/// protocol version 2 (or 3) or later (a server refuses them on an older
+/// session).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Request {
     /// → [`Response::Scanned`].
@@ -103,6 +104,11 @@ pub enum Request {
         pre: Precondition,
         delta: Delta,
     },
+    /// v3. → [`Response::Clock`].
+    Clock,
+    /// v3. Raises the replica's clock to at least `floor`.
+    /// → [`Response::Clock`] (the clock afterwards).
+    Witness { floor: u64 },
 }
 
 /// Server to client: the answer to each [`Request`], in order, plus watch
@@ -137,6 +143,9 @@ pub enum Response {
     Hint(Hint),
     /// v2. The answer to [`Request::Blocks`].
     Blocks(Option<Blocks>),
+    /// v3. The answer to [`Request::Clock`] and [`Request::Witness`]: the
+    /// replica's clock.
+    Clock(u64),
 }
 
 /// File content on the wire: any number of chunks, then `End` or `Abort`.

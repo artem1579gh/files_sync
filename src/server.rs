@@ -35,8 +35,8 @@ use crate::config::{PairConfig, ReplicaId};
 use crate::error::{Error, Result};
 use crate::fs::RelPath;
 use crate::replica::proto::{
-    BATCH_BYTES, Content, ContentStream, DELTA_VERSION, PROTOCOL_VERSION, Request, Response,
-    WireError, batches, read_frame, send_content, server_handshake_upto, write_frame,
+    BATCH_BYTES, CLOCK_VERSION, Content, ContentStream, DELTA_VERSION, PROTOCOL_VERSION, Request,
+    Response, WireError, batches, read_frame, send_content, server_handshake_upto, write_frame,
 };
 use crate::replica::remote::{HANDSHAKE_TIMEOUT, tune_socket};
 use crate::replica::{ContentReader, LocalReplica, Replica};
@@ -368,6 +368,12 @@ fn serve(shared: &Shared, tls: &mut Tls, version: u32, req: Request) -> Result<b
             reason: format!("a delta request on a protocol v{version} session"),
         });
     }
+    let v3 = matches!(req, Request::Clock | Request::Witness { .. });
+    if v3 && version < CLOCK_VERSION {
+        return Err(Error::Protocol {
+            reason: format!("a clock request on a protocol v{version} session"),
+        });
+    }
     match req {
         Request::Scan { scope } => {
             let r = shared.replica().scan(scope);
@@ -444,6 +450,15 @@ fn serve(shared: &Shared, tls: &mut Tls, version: u32, req: Request) -> Result<b
         Request::Adopt { path } => {
             let r = shared.replica().adopt(&path);
             answer(tls, r.map(Response::Adopted))?;
+        }
+        Request::Clock => {
+            let r = shared.replica().clock();
+            answer(tls, r.map(Response::Clock))?;
+        }
+        Request::Witness { floor } => {
+            let mut replica = shared.replica();
+            let r = replica.witness(floor).and_then(|()| replica.clock());
+            answer(tls, r.map(Response::Clock))?;
         }
         Request::RecordSync {
             peer,

@@ -191,6 +191,7 @@ impl Engine {
             max_delete_percent: self.max_delete_percent,
             held: [None, None],
         };
+        cycle.sync_clocks()?;
         cycle.scan(&scope)?;
         let mut round = 0;
         loop {
@@ -306,6 +307,21 @@ enum Done {
 }
 
 impl Cycle<'_> {
+    /// Lamport clock exchange, before anything is scanned (design §6.4,
+    /// issue #2): the replica with the lower clock raises it to the
+    /// other's. A replica whose index was lost or restored from a backup
+    /// would otherwise hand out counters the peer has already seen from it,
+    /// and the peer's older versions would dominate its new changes.
+    fn sync_clocks(&mut self) -> Result<()> {
+        let (ca, cb) = (self.a.clock()?, self.b.clock()?);
+        if ca < cb {
+            self.a.witness(cb)?;
+        } else if cb < ca {
+            self.b.witness(ca)?;
+        }
+        Ok(())
+    }
+
     fn scan(&mut self, scope: &Scope) -> Result<()> {
         let stats = self.a.scan(scope.clone())?;
         self.note_scan(Side::A, stats);

@@ -102,6 +102,15 @@ pub trait Replica {
         Ok(Vec::new())
     }
 
+    /// The replica's Lamport clock: the largest version counter its index
+    /// has ever stored (design §3).
+    fn clock(&self) -> Result<u64>;
+
+    /// Raises the replica's clock to at least `floor` (the peer's clock), so
+    /// local changes scanned from now on get counters above every counter
+    /// the peer has seen, also from this replica (design §6.4, issue #2).
+    fn witness(&mut self, floor: u64) -> Result<()>;
+
     /// Whether reaching this replica crosses a network, so that sending
     /// less content pays off (block-level delta transfer, design §7.1).
     fn is_remote(&self) -> bool {
@@ -281,6 +290,14 @@ impl Replica for PairReplica {
         retention: Duration,
     ) -> Result<Vec<RelPath>> {
         self.get_mut().record_sync(peer, tombstones, retention)
+    }
+
+    fn clock(&self) -> Result<u64> {
+        self.get().clock()
+    }
+
+    fn witness(&mut self, floor: u64) -> Result<()> {
+        self.get_mut().witness(floor)
     }
 
     fn is_remote(&self) -> bool {

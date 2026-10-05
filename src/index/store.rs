@@ -35,7 +35,7 @@ use crate::error::{Error, Result};
 use crate::fs::RelPath;
 use crate::index::entry::{Entry, Kind, LocalMeta};
 use crate::index::journal::{INTENTS, Journal};
-use crate::index::vv::VersionVector;
+use crate::index::vv::{MAX_COUNTER, VersionVector};
 
 const ENTRIES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("entries");
 const BY_SEQ: TableDefinition<u64, &[u8]> = TableDefinition::new("by_seq");
@@ -253,6 +253,24 @@ impl IndexStore {
     /// for [`VersionVector::bump_after`](crate::index::VersionVector::bump_after).
     pub fn max_counter(&self) -> Result<u64> {
         self.read()?.max_counter()
+    }
+
+    /// Lamport receive: raises [`max_counter`](Self::max_counter) to at least
+    /// `floor`, a peer's clock, so that every local change from now on gets
+    /// a counter above any the peer has seen, even if this index was lost or
+    /// restored from a backup (issue #2). Never lowers it. Returns whether
+    /// it was raised. A `floor` above [`MAX_COUNTER`] is refused.
+    pub fn witness(&self, floor: u64) -> Result<bool> {
+        if floor > MAX_COUNTER {
+            return Err(bad(format!("clock {floor} is above the counter limit")));
+        }
+        if self.max_counter()? >= floor {
+            return Ok(false);
+        }
+        let mut txn = self.write()?;
+        txn.max_counter = txn.max_counter.max(floor);
+        txn.commit()?;
+        Ok(true)
     }
 
     /// Whether the replica's root marker was made (or found) for this index
@@ -971,6 +989,27 @@ mod tests {
         let path = store.path().to_owned();
         drop(store);
         assert!(IndexStore::open(&path, ME).unwrap().root_marked().unwrap());
+    }
+
+    #[test]
+    fn witness_raises_the_clock_only() {
+        let (_dir, store) = open();
+        store.put(&p(b"f"), &mut file(b"x", 3)).unwrap();
+        assert!(!store.witness(2).unwrap());
+        assert_eq!(store.max_counter().unwrap(), 3);
+        assert!(store.witness(9).unwrap());
+        assert_eq!(store.max_counter().unwrap(), 9);
+        assert!(store.witness(MAX_COUNTER + 1).is_err());
+        let path = store.path().to_owned();
+        drop(store);
+        let store = IndexStore::open(&path, ME).unwrap();
+        assert_eq!(store.max_counter().unwrap(), 9);
+        // A later bump starts above it.
+        let mut txn = store.write().unwrap();
+        let mut vv = VersionVector::new();
+        assert_eq!(vv.bump_after(ME, txn.max_counter()), 10);
+        txn.put(&p(b"g"), &mut file(b"y", 10)).unwrap();
+        txn.commit().unwrap();
     }
 
     #[test]

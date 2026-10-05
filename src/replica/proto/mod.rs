@@ -32,11 +32,15 @@ use crate::error::{Error, Result};
 pub const MAGIC: [u8; 8] = *b"fsync\x00wp";
 
 /// The protocol version this build speaks best. Version 2 added the
-/// block-level delta transfer (`Blocks`, `ReadBlocks`, `ApplyDelta`).
-pub const PROTOCOL_VERSION: u32 = 2;
+/// block-level delta transfer (`Blocks`, `ReadBlocks`, `ApplyDelta`);
+/// version 3 the clock exchange (`Clock`, `Witness`).
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// The first version with block-level delta transfer.
 pub const DELTA_VERSION: u32 = 2;
+
+/// The first version with the clock exchange (issue #2).
+pub const CLOCK_VERSION: u32 = 3;
 
 /// The oldest protocol version this build still speaks.
 pub const MIN_PROTOCOL_VERSION: u32 = 1;
@@ -384,6 +388,9 @@ mod tests {
                 reuse: vec![Some(1), None, Some(u32::MAX)],
             },
         });
+        out.push(Request::Clock);
+        out.push(Request::Witness { floor: 0 });
+        out.push(Request::Witness { floor: u64::MAX });
         out
     }
 
@@ -438,6 +445,8 @@ mod tests {
         out.extend(contents().into_iter().map(Response::Content));
         out.push(Response::Blocks(None));
         out.push(Response::Blocks(Some(block_list())));
+        out.push(Response::Clock(0));
+        out.push(Response::Clock(u64::MAX));
         out
     }
 
@@ -456,6 +465,8 @@ mod tests {
             Request::Blocks { .. } => "Blocks",
             Request::ReadBlocks { .. } => "ReadBlocks",
             Request::ApplyDelta { .. } => "ApplyDelta",
+            Request::Clock => "Clock",
+            Request::Witness { .. } => "Witness",
         }
     }
 
@@ -474,6 +485,7 @@ mod tests {
             Response::Content(_) => "Content",
             Response::Hint(_) => "Hint",
             Response::Blocks(_) => "Blocks",
+            Response::Clock(_) => "Clock",
         }
     }
 
@@ -536,12 +548,14 @@ mod tests {
                 "ApplyDelta",
                 "Blocks",
                 "ChangesSince",
+                "Clock",
                 "Content",
                 "OpenRead",
                 "ReadBlocks",
                 "RecordSync",
                 "Scan",
-                "Watch"
+                "Watch",
+                "Witness"
             ]
         );
         let ops: Vec<Op> = reqs
@@ -557,7 +571,7 @@ mod tests {
         let resps = responses();
         assert_eq!(
             variants(&resps, response_variant).len(),
-            13,
+            14,
             "every Response"
         );
         assert_eq!(through_pipe(resps.clone()), resps);
@@ -584,10 +598,10 @@ mod tests {
         assert_eq!(through_pipe(replies.clone()), replies);
     }
 
-    /// Version 2 only appended variants, so every v1 message encodes as it
-    /// did (postcard: the variant index comes first).
+    /// Versions 2 and 3 only appended variants, so every older message
+    /// encodes as it did (postcard: the variant index comes first).
     #[test]
-    fn v2_variants_are_appended() {
+    fn newer_variants_are_appended() {
         let tag = |body: Vec<u8>| body[0];
         let req = |r: &Request| tag(postcard::to_stdvec(r).unwrap());
         let resp = |r: &Response| tag(postcard::to_stdvec(r).unwrap());
@@ -597,6 +611,8 @@ mod tests {
             Request::Blocks { .. } => Some((r, 8)),
             Request::ReadBlocks { .. } => Some((r, 9)),
             Request::ApplyDelta { .. } => Some((r, 10)),
+            Request::Clock => Some((r, 11)),
+            Request::Witness { .. } => Some((r, 12)),
             _ => None,
         }) {
             assert_eq!(req(r), n);
@@ -604,6 +620,7 @@ mod tests {
         assert_eq!(resp(&Response::Scanned(ScanStats::default())), 0);
         assert_eq!(resp(&Response::Hint(Hint::FullRescan)), 9);
         assert_eq!(resp(&Response::Blocks(None)), 10);
+        assert_eq!(resp(&Response::Clock(0)), 11);
     }
 
     #[test]

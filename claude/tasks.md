@@ -951,3 +951,23 @@ The design lives in [`design.md`](design.md); §N.M below refers to its sections
     - `tests/cli.rs` `trash_keeps_what_a_sync_replaces_or_deletes`. Its `names` helper leaves out the trash;
     - checked by hand over the network: with `trash_days` on a served B, the server put B's old version in B's trash.
   - **Docs:** `docs/usage.md` §2 (Trash), §10, §12; README; design §2, §5.3 step 4(f), §5.10, §9.
+
+### [x] T32: Keep unsynced changes when an index is lost or restored (issue #2)
+- **Depends on:** T31
+- **Read:** §3 (Local change), §6.1, §6.4, §7, §7.1 (Protocol)
+- **Files:** `src/index/store.rs` (`witness`), `src/replica/mod.rs` (`Replica::clock`, `witness`), `src/replica/local.rs`, `src/replica/remote.rs`, `src/replica/proto/`, `src/server.rs`, `src/engine/executor.rs` (`Cycle::sync_clocks`), `tests/harness/mod.rs`, `tests/index_reset.rs`, `docs/usage.md`, `README.md`
+- **Do:**
+  - [Issue #2](https://github.com/artem1579gh/files_sync/issues/2): deleting `<replica-id>.redb` (or restoring an older copy) makes the next sync overwrite the replica's unsynced edits with the peer's older content, silently. The recreated index starts at `max_counter = 0`, so the rescan hands out counters the peer has already seen from this replica with higher values, and the peer's versions dominate. A file recreated on the reset side can likewise be deleted by an old tombstone.
+- **Done when:**
+  - the issue's reproduction is a test that fails before the fix, in both modes, plus: edits on both sides (conflict copy), a recreated file vs. the peer's tombstone, an index restored from a backup, and a protocol v2 server;
+  - a unit test covers `IndexStore::witness`;
+  - `cargo test`, `cargo test --features hooks` and clippy pass.
+- **Notes:**
+  - **Fix: clock exchange.** `Engine::sync` first runs `Cycle::sync_clocks`: it reads both replicas' Lamport clocks (`Replica::clock`, the store's `max_counter`) and raises the lower one to the higher (`Replica::witness` → `IndexStore::witness`, never lowering it, refusing a floor above `MAX_COUNTER`). It runs before any scan, so the reset side's new counters are above every counter the peer holds. No detection or refusal is needed, and no replica ID rotation (which would need both configs changed, and would leave a stale peer in the tombstone GC's `peers` table).
+  - **Rejected:** refusing to sync on "the peer holds a counter for us above our clock". The interrupted conflict-winner write (§6.2: the winner's bump goes to the loser side first) makes the same state, so a refusal would have false positives.
+  - **Warning:** `ensure_root_marker` warns when the root has its marker but the index has not recorded it: the index was recreated. A restored backup is not detected (it looks like a replica that is behind).
+  - **Limit:** a restored index keeps the backup's vector for a path whose content still matches it; if the unsynced change was a revert to exactly that content, the peer's later version wins (design §6.4).
+  - **Protocol v3:** `Request::Clock`, `Request::Witness { floor }` → `Response::Clock(u64)`, appended. On v1/v2 sessions `RemoteReplica::clock` uses the largest counter in its mirror, and `witness` does nothing, so a reset local side is still protected against an old server, but an old server's own index is not.
+  - **Tests:** `tests/index_reset.rs` (4 scenarios × both modes, plus `lost_index_against_a_v2_server`); all 9 fail with `sync_clocks` disabled. `store::tests::witness_raises_the_clock_only`. Proto tests list the new variants and their tags (`newer_variants_are_appended`).
+  - **Results:** the issue's shell reproduction, run with release binaries: before the fix (90b2ac2), both sides end with `v3`, no conflict copy, exit 0. After it, the sync warns that B's index is new, pushes `unsynced edit on B` to A (1 change applied) and exits 0.
+  - **Docs:** `docs/usage.md` §2 (Lost or restored index), §12; README; design §3, §6.4 (Clock exchange), §7, §7.1.
