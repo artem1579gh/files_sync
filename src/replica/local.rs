@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
 use jiff::ToSpan;
@@ -66,7 +66,14 @@ pub struct LocalReplica {
     watcher: Option<Watcher>,
     /// How many followed links the watcher was last given.
     followed: usize,
+    /// How long the trash keeps what it holds, if there is one (T31).
+    trash: Option<Duration>,
+    /// When the trash was last purged.
+    purged: Option<Instant>,
 }
+
+/// How often [`LocalReplica::sweep_quarantine`] purges the trash.
+const PURGE_EVERY: Duration = Duration::from_secs(3600);
 
 impl LocalReplica {
     /// Opens the replica `config`: its root, its capabilities (probed,
@@ -92,7 +99,12 @@ impl LocalReplica {
             event_source: None,
             watcher: None,
             followed: 0,
+            trash: config.trash_retention(),
+            purged: None,
         };
+        if replica.trash.is_some() {
+            replica.quarantine.set_trash(&replica.root)?;
+        }
         let pending = replica.index.journal().pending()?;
         if !pending.is_empty() {
             tracing::info!(root = %replica.root.path().display(), intents = pending.len(), "replaying the journal");
@@ -157,7 +169,25 @@ impl LocalReplica {
             // Replaying them later finds nothing to do.
             tracing::warn!(error = %e, "cannot forget settled quarantine intents");
         }
+        if let Some(keep) = self.trash
+            && self.purged.is_none_or(|t| t.elapsed() >= PURGE_EVERY)
+        {
+            self.purged = Some(Instant::now());
+            self.purge_trash(keep);
+        }
         report
+    }
+
+    /// Removes what the trash has held for longer than `keep` (T31). A
+    /// failure is logged; the next purge tries again.
+    pub fn purge_trash(&mut self, keep: Duration) {
+        match commit::purge_trash(&self.root, keep) {
+            Ok(0) => {}
+            Ok(n) => {
+                tracing::info!(root = %self.root.path().display(), removed = n, "purged the trash")
+            }
+            Err(e) => tracing::warn!(error = %e, "cannot purge the trash"),
+        }
     }
 
     /// Replays the intents `ids` (§5.8), reading those given without one
@@ -176,8 +206,10 @@ impl LocalReplica {
                 }
             }
         }
+        let top = RelPath::root();
         let ctx = Ctx {
             root: &self.root,
+            base: &top,
             caps: &self.caps,
             replica: self.config.id,
             journal: self.index.journal(),
@@ -465,6 +497,7 @@ impl LocalReplica {
         };
         let ctx = Ctx {
             root: base.root(&self.root),
+            base: &base.link,
             caps: &self.caps,
             replica: self.config.id,
             journal: self.index.journal(),
@@ -546,6 +579,7 @@ impl LocalReplica {
             };
             let ctx = Ctx {
                 root: base.root(&self.root),
+                base: &base.link,
                 caps: &self.caps,
                 replica: id,
                 journal: self.index.journal(),
@@ -645,6 +679,7 @@ impl LocalReplica {
         let rel = &rel;
         let ctx = Ctx {
             root: base.root(&self.root),
+            base: &base.link,
             caps: &self.caps,
             replica: id,
             journal: self.index.journal(),
@@ -1725,6 +1760,7 @@ mod tests {
                 keep_dirlinks: false,
                 keep_dirlinks_unsafe: false,
                 followed_write: Default::default(),
+                trash_days: 0,
                 device: None,
                 remote: None,
             };
@@ -1872,6 +1908,7 @@ mod tests {
             keep_dirlinks: false,
             keep_dirlinks_unsafe: false,
             followed_write: Default::default(),
+            trash_days: 0,
             device: None,
             remote: None,
         }

@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use files_sync::config::PairConfig;
 use files_sync::fs::is_root_marker;
+use files_sync::fs::tmpname::TRASH_DIR;
 
 fn run(state_home: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_files_sync"))
@@ -191,6 +192,41 @@ fn mass_deletion_needs_allow_mass_delete() {
     assert_eq!(names(b.path()), Vec::<String>::new());
 }
 
+/// T31: with `trash_days` set on B, the files a sync replaces or deletes
+/// there are kept in B's trash, at their directory path.
+#[test]
+fn trash_keeps_what_a_sync_replaces_or_deletes() {
+    let state = tempfile::tempdir().unwrap();
+    let (a, b) = init_pair(state.path(), "p");
+    let mut cfg = PairConfig::load(state.path(), "p").unwrap();
+    cfg.replicas[1].trash_days = 7;
+    cfg.save(state.path()).unwrap();
+    std::fs::create_dir(a.path().join("d")).unwrap();
+    std::fs::write(a.path().join("d/doc.txt"), "v1").unwrap();
+    std::fs::write(a.path().join("gone"), "bye").unwrap();
+    ok(state.path(), &["sync", "--once", "p"]);
+    std::fs::write(a.path().join("d/doc.txt"), "v2").unwrap();
+    std::fs::remove_file(a.path().join("gone")).unwrap();
+    ok(state.path(), &["sync", "--once", "p"]);
+
+    assert_eq!(std::fs::read(b.path().join("d/doc.txt")).unwrap(), b"v2");
+    assert_eq!(names(b.path()), ["d"]);
+    let trash = b.path().join(".~fsync.trash");
+    let top = names(&trash);
+    assert_eq!(top.len(), 2, "{top:?}");
+    assert_eq!(top[0], "d");
+    assert!(top[1].starts_with("gone~"), "{top:?}");
+    assert_eq!(std::fs::read(trash.join(&top[1])).unwrap(), b"bye");
+    let d = names(&trash.join("d"));
+    assert!(
+        d.len() == 1 && d[0].starts_with("doc~") && d[0].ends_with(".txt"),
+        "{d:?}"
+    );
+    assert_eq!(std::fs::read(trash.join("d").join(&d[0])).unwrap(), b"v1");
+    // A has no trash.
+    assert!(!a.path().join(".~fsync.trash").exists());
+}
+
 /// `--sandbox` (landlock) still lets a sync write the roots and the state.
 #[test]
 fn sandboxed_sync_and_status() {
@@ -219,12 +255,12 @@ fn sandboxed_sync_and_status() {
     assert!(st.contains("2 entries (2 tombstones)"), "{st}");
 }
 
-/// The names in `dir`, sorted, without root markers.
+/// The names in `dir`, sorted, without root markers and the trash.
 fn names(dir: &Path) -> Vec<String> {
     let mut names: Vec<_> = std::fs::read_dir(dir)
         .unwrap()
         .map(|e| e.unwrap().file_name().into_string().unwrap())
-        .filter(|n| !is_root_marker(n.as_bytes()))
+        .filter(|n| !is_root_marker(n.as_bytes()) && n.as_bytes() != TRASH_DIR)
         .collect();
     names.sort();
     names

@@ -922,3 +922,32 @@ The design lives in [`design.md`](design.md); §N.M below refers to its sections
     - `config::tests::load_rejects_invalid_configs`: `max_delete_percent = 101` is rejected, and a missing key gives 50.
     - The stress test (both modes) passes with the guard on.
   - **Docs:** `docs/usage.md` §2 (with real output), §5, §9, §10, §12; README; design §6.4.
+
+### [x] T31: Trash for replaced and deleted files (issue #1)
+- **Depends on:** T29
+- **Read:** §5.3 step 4(f) (Trash), §5.7, §5.8, §5.10
+- **Files:** `src/fs/commit.rs` (`Quarantine`, `Trash`, `purge_trash`, `Ctx::base`), `src/fs/tmpname.rs`, `src/config.rs`, `src/replica/local.rs`, `tests/cli.rs`, `docs/usage.md`
+- **Do:**
+  - The issue's optional third suggestion: keep the files that a sync replaces or deletes in a trash directory, instead of unlinking them after the 400 ms quarantine.
+- **Done when:**
+  - unit tests cover:
+    - replace, delete and rmdir go to the trash at their directory path, and a purge empties it by age;
+    - a symlink in place of the trash or of one of its directories is never followed;
+    - races at the trash's hook points;
+  - a CLI test enables `trash_days` on one replica through the config file;
+  - `cargo test`, `cargo test --features hooks` and clippy pass.
+- **Notes:**
+  - **Opt-in, per replica:** `ReplicaConfig::trash_days` (default 0 = no trash; `init` writes `trash_days = 0`). Per replica because the replicas may have different disks and needs (e.g. only the server keeps one). Old configs load with 0.
+  - **Mechanism:**
+    - The quarantine's **Unlink** verdict becomes a move into `.~fsync.trash/<replica dir>/<stem~YYYYMMDD-HHMMSS.ext>` (`RENAME_NOREPLACE`, still under the lease).
+    - Every earlier step is unchanged: grace, lease, and a changed inode becoming a conflict copy.
+    - Trash directories are made with `mkdirat` and opened `O_PATH` beneath their parent with the `RESOLVE_*` flags. A symlink there fails the move, and the entry stays in quarantine.
+    - `EXDEV` (beneath a `-K` link to another filesystem) unlinks as before. `NOENT` drops the entry.
+  - **`Ctx::base`** (new field): the replica path of the commit's root, so that entries beneath a written-through `-K` link get their replica path in the trash. Set in `LocalReplica` (`Base::link`, or the root for replay) and in the tests.
+  - **Purge:** `commit::purge_trash(root, older_than)` works by ctime (set by the move in), walks with fds without following anything, and removes directories left empty. `LocalReplica::sweep_quarantine` purges at most once an hour (`PURGE_EVERY`; the first sweep of each process purges). So does `serve`, through the same sweep.
+  - **Hook points:** `trash.before_move`, `trash.before_rename`, `trash.before_purge`. They are outside `tests/attack.rs`'s prefixes, since its commit runs have no trash; `commit::tests::trash_races` attacks them instead. (`quarantine.before_trash` was first in the `quarantine` group and failed `every_hook_point_is_attacked`; renamed.)
+  - **Tests:**
+    - `commit::tests::trash_keeps_replaced_and_deleted_files`, `trash_symlink_is_not_followed`, `trash_races`; `tmpname::tests::trash_names`;
+    - `tests/cli.rs` `trash_keeps_what_a_sync_replaces_or_deletes`. Its `names` helper leaves out the trash;
+    - checked by hand over the network: with `trash_days` on a served B, the server put B's old version in B's trash.
+  - **Docs:** `docs/usage.md` §2 (Trash), §10, §12; README; design §2, §5.3 step 4(f), §5.10, §9.

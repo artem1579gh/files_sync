@@ -3,8 +3,9 @@
 //! Every name starting with [`RESERVED_PREFIX`] belongs to us: temp files
 //! (`.~fsync.<id>`), quarantined old inodes (`.~fsync.old.<id>`), files
 //! being deleted (`.~fsync.del.<id>`), capability probes
-//! (`.~fsync.probe.*`) and the root marker (`.~fsync.root.<replica>`,
-//! [`root_marker`]). The scanner and watcher ignore them all.
+//! (`.~fsync.probe.*`), the root marker (`.~fsync.root.<replica>`,
+//! [`root_marker`]) and the trash directory ([`TRASH_DIR`]). The scanner and
+//! watcher ignore them all.
 //!
 //! [`conflict_name`] lives here rather than in `engine/conflict.rs` because
 //! `fs::commit` needs it too and `fs` must not depend on the engine.
@@ -45,6 +46,27 @@ pub fn root_marker(replica: ReplicaId) -> Vec<u8> {
 /// True for the name of any replica's root marker ([`root_marker`]).
 pub fn is_root_marker(name: &[u8]) -> bool {
     name.starts_with(ROOT_MARKER_PREFIX)
+}
+
+/// The trash directory at the top of a root (design §5.3 step 4(f), T31):
+/// with a replica's `trash_days` set, the old files its commits replace or
+/// delete are moved here instead of being unlinked, as [`trash_name`].
+pub const TRASH_DIR: &[u8] = b".~fsync.trash";
+
+/// `stem~YYYYMMDD-HHMMSS.ext`: the name a replaced or deleted object `name`
+/// gets in the trash, `now` being the local time it was moved there. The
+/// extension is split as in [`conflict_name`].
+pub fn trash_name(name: &[u8], split_ext: bool, now: DateTime) -> Vec<u8> {
+    let marker = format!(
+        "~{:04}{:02}{:02}-{:02}{:02}{:02}",
+        now.year(),
+        now.month(),
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second(),
+    );
+    with_marker(name, split_ext, &marker)
 }
 
 /// Random identifier of one temp, quarantine or delete name.
@@ -167,6 +189,12 @@ pub fn conflict_name(name: &[u8], split_ext: bool, now: DateTime, replica: Repli
         now.second(),
         &id[..7]
     );
+    with_marker(name, split_ext, &marker)
+}
+
+/// `name` with `marker` inserted before its extension (if `split_ext`),
+/// shortened to fit [`NAME_MAX`].
+fn with_marker(name: &[u8], split_ext: bool, marker: &str) -> Vec<u8> {
     let dot = name
         .iter()
         .rposition(|&b| b == b'.')
@@ -224,6 +252,17 @@ mod tests {
         assert!(is_reserved(b".~fsync.probe.x"));
         assert!(!is_reserved(b".~fsync"));
         assert!(!is_reserved(b"a.~fsync.x"));
+    }
+
+    #[test]
+    fn trash_names() {
+        let now = date(2026, 10, 2).at(9, 5, 7, 0);
+        let t = |n: &[u8], split| String::from_utf8(trash_name(n, split, now)).unwrap();
+        assert_eq!(t(b"report.txt", true), "report~20261002-090507.txt");
+        assert_eq!(t(b"link.d", false), "link.d~20261002-090507");
+        assert_eq!(t(b".bashrc", true), ".bashrc~20261002-090507");
+        assert_eq!(trash_name(&[b'x'; 300], true, now).len(), NAME_MAX);
+        assert!(is_reserved(TRASH_DIR));
     }
 
     #[test]

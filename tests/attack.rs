@@ -298,8 +298,10 @@ impl World {
     }
 
     fn ctx(&self) -> Ctx<'_> {
+        static TOP: std::sync::LazyLock<RelPath> = std::sync::LazyLock::new(RelPath::root);
         Ctx {
             root: &self.root,
+            base: &TOP,
             caps: &self.caps,
             replica: REPLICA,
             journal: &self.journal,

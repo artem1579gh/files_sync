@@ -27,7 +27,10 @@
 //!   copy of the directory, staged as a whole tree under a temp name and
 //!   exchanged with the link like a replace;
 //! - **root marker** ([`create_root_marker`], §5.1) is created with `O_EXCL`
-//!   at the top of the root, never over anything.
+//!   at the top of the root, never over anything;
+//! - **trash** (T31): a replica with a trash moves settled old inodes from
+//!   the [`Quarantine`] into it rather than unlinking them, and
+//!   [`purge_trash`] empties it of old ones.
 //!
 //! After the rename, the parent is fsynced, the name must hold the inode we
 //! staged (or nothing, after a delete), and the parent must still resolve to
@@ -65,6 +68,9 @@ use crate::index::journal::{Intent, IntentId, IntentOp, IntentState, Journal};
 #[derive(Clone, Copy, Debug)]
 pub struct Ctx<'a> {
     pub root: &'a Root,
+    /// The replica path of `root`: the replica root itself, or a directory
+    /// link written through (`-K`, §4.3.1). Only names the trash path.
+    pub base: &'a RelPath,
     pub caps: &'a Caps,
     /// Used in conflict-copy names (§6.2).
     pub replica: ReplicaId,
@@ -1914,6 +1920,20 @@ pub struct Quarantine {
     replica: ReplicaId,
     grace: Duration,
     pending: Vec<Pending>,
+    /// Where settled old inodes go instead of being unlinked (T31).
+    trash: Option<Trash>,
+}
+
+/// The trash directory of a replica, [`tmpname::TRASH_DIR`] at the top of
+/// its root (T31). An old inode is moved into the same directory path
+/// beneath it as it had in the replica, as [`tmpname::trash_name`]. The
+/// trash and its directories are made on demand, and every step resolves
+/// beneath the root without following symlinks, so a symlink planted there
+/// makes the move fail (the inode stays in quarantine) rather than leave
+/// the root.
+struct Trash {
+    /// The replica root (`O_PATH`).
+    root: OwnedFd,
 }
 
 /// One quarantined inode.
@@ -1925,6 +1945,9 @@ struct Pending {
     dir_fp: Fingerprint,
     /// That directory's path when the entry was made, for conflict paths.
     dir: RelPath,
+    /// The same directory's replica path (beneath a written-through `-K`
+    /// link, `dir` is relative to the link), for the trash.
+    replica_dir: RelPath,
     /// The name the inode was replaced at, for conflict names.
     orig: Vec<u8>,
     /// Its current `.~fsync.old.<id>` name.
@@ -1944,8 +1967,10 @@ struct Pending {
 /// What a [`Quarantine::sweep`] did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SweepReport {
-    /// Old inodes unlinked.
+    /// Old inodes unlinked, or moved to the trash (`trashed` of them).
     pub removed: usize,
+    /// Old inodes moved to the trash rather than unlinked.
+    pub trashed: usize,
     /// Old inodes modified after the replace, now kept under these names.
     pub conflicts: Vec<RelPath>,
     /// Entries forgotten because their name vanished or holds a foreign
@@ -1972,7 +1997,24 @@ impl Quarantine {
             replica,
             grace,
             pending: Vec::new(),
+            trash: None,
         }
+    }
+
+    /// From now on, moves settled old inodes into the trash of `root` (the
+    /// replica's root) instead of unlinking them (T31).
+    pub fn set_trash(&mut self, root: &Root) -> Result<()> {
+        let root = root
+            .fd()
+            .try_clone_to_owned()
+            .map_err(|e| Error::io("duplicate root fd", e))?;
+        self.trash = Some(Trash { root });
+        Ok(())
+    }
+
+    /// Whether settled old inodes go to a trash.
+    pub fn has_trash(&self) -> bool {
+        self.trash.is_some()
     }
 
     pub fn len(&self) -> usize {
@@ -2041,6 +2083,7 @@ impl Quarantine {
                 .map_err(|e| Error::io("duplicate parent fd", e))?,
             dir_fp: t.parent_fp,
             dir: t.path.parent().unwrap_or_default(),
+            replica_dir: replica_path(ctx.base, &t.path.parent().unwrap_or_default())?,
             orig: t.name.to_vec(),
             name,
             fp: old,
@@ -2074,9 +2117,10 @@ impl Quarantine {
     fn process(&mut self, due: impl Fn(&Pending) -> Option<bool>) -> SweepReport {
         let mut report = SweepReport::default();
         let replica = self.replica;
+        let trash = self.trash.as_ref();
         self.pending.retain(|p| {
             let Some(due) = due(p) else { return true };
-            match p.sweep(due, replica, &mut report) {
+            match p.sweep(due, replica, trash, &mut report) {
                 Ok(done) => {
                     if done {
                         report.finished.push(p.intent);
@@ -2127,7 +2171,13 @@ impl Pending {
     }
 
     /// Returns whether the entry is finished.
-    fn sweep(&self, due: bool, replica: ReplicaId, report: &mut SweepReport) -> Result<bool> {
+    fn sweep(
+        &self,
+        due: bool,
+        replica: ReplicaId,
+        trash: Option<&Trash>,
+        report: &mut SweepReport,
+    ) -> Result<bool> {
         let parent = self.parent.as_fd();
         let shown = || format!("{}/{}", self.dir, self.name.escape_ascii());
         let (verdict, _lease) = self.verdict(due)?;
@@ -2139,6 +2189,39 @@ impl Pending {
                 Ok(true)
             }
             Verdict::Unlink => {
+                if let Some(trash) = trash {
+                    // Still under the lease, if one was taken.
+                    point("trash.before_move");
+                    match trash.put(
+                        parent,
+                        &self.name,
+                        &self.replica_dir,
+                        &self.orig,
+                        self.fp.kind,
+                    ) {
+                        Ok(at) => {
+                            tracing::debug!(name = %shown(), trash = %at, "moved to the trash");
+                            report.removed += 1;
+                            report.trashed += 1;
+                            return Ok(true);
+                        }
+                        // On another filesystem (beneath a `-K` link): no
+                        // trash there, unlinked as without one.
+                        Err(Errno::XDEV) => {
+                            tracing::warn!(name = %shown(), "old file is on another filesystem than the trash; unlinking it");
+                        }
+                        Err(Errno::NOENT) => {
+                            report.dropped += 1;
+                            return Ok(true);
+                        }
+                        Err(e) => {
+                            return Err(Error::io(
+                                format!("move {} to the trash", shown()),
+                                e.into(),
+                            ));
+                        }
+                    }
+                }
                 point("quarantine.before_unlink");
                 match rustix::fs::unlinkat(parent, self.name.as_slice(), AtFlags::empty()) {
                     Ok(()) | Err(Errno::NOENT) => {}
@@ -2161,6 +2244,163 @@ impl Pending {
             }
         }
     }
+}
+
+/// The replica path of `dir`, a directory path relative to the commit's
+/// root, whose replica path is `base`.
+fn replica_path(base: &RelPath, dir: &RelPath) -> Result<RelPath> {
+    if dir.is_root() {
+        Ok(base.clone())
+    } else {
+        base.join(dir.as_bytes())
+    }
+}
+
+impl Trash {
+    /// Moves `parent/from` (an old inode of the replica directory `dir`,
+    /// named `orig` there) into the trash. Returns its trash path.
+    fn put(
+        &self,
+        parent: BorrowedFd<'_>,
+        from: &[u8],
+        dir: &RelPath,
+        orig: &[u8],
+        kind: FileKind,
+    ) -> std::result::Result<String, Errno> {
+        let mut at = open_or_make_dir(self.root.as_fd(), tmpname::TRASH_DIR)?;
+        for c in dir.components() {
+            at = open_or_make_dir(at.as_fd(), c)?;
+        }
+        point("trash.before_rename");
+        let now = jiff::Zoned::now().datetime();
+        for i in 0..NAME_RETRIES {
+            let when = now.checked_add(i.seconds()).unwrap_or(now);
+            let name = tmpname::trash_name(orig, kind == FileKind::File, when);
+            match rustix::fs::renameat_with(
+                parent,
+                from,
+                at.as_fd(),
+                name.as_slice(),
+                RenameFlags::NOREPLACE,
+            ) {
+                Ok(()) => {
+                    let mut shown = tmpname::TRASH_DIR.to_vec();
+                    for c in dir.components().chain([name.as_slice()]) {
+                        shown.push(b'/');
+                        shown.extend_from_slice(c);
+                    }
+                    return Ok(shown.escape_ascii().to_string());
+                }
+                Err(Errno::EXIST) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(Errno::EXIST)
+    }
+}
+
+/// The directory `name` beneath `dir`, made (mode 0700) if missing; never
+/// through a symlink, a magic link or a mount point.
+fn open_or_make_dir(dir: BorrowedFd<'_>, name: &[u8]) -> std::result::Result<OwnedFd, Errno> {
+    match rustix::fs::mkdirat(dir, name, Mode::from_raw_mode(0o700)) {
+        Ok(()) | Err(Errno::EXIST) => {}
+        Err(e) => return Err(e),
+    }
+    rustix::fs::openat2(
+        dir,
+        name,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+        RESOLVE,
+    )
+}
+
+/// Empties the trash of `root` (T31) of everything moved there more than
+/// `older_than` ago (by ctime, which the move into the trash set), and of
+/// the directories that are then empty; the trash directory itself stays.
+/// Nothing is followed: the walk opens each directory beneath its parent
+/// with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV`. Returns
+/// how many objects were removed.
+pub fn purge_trash(root: &Root, older_than: Duration) -> Result<usize> {
+    let err = |what: &str, e: Errno| {
+        Error::io(
+            format!("{what} in the trash of {}", root.path().display()),
+            e.into(),
+        )
+    };
+    let trash = match rustix::fs::openat2(
+        root.fd(),
+        tmpname::TRASH_DIR,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+        RESOLVE,
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT) => return Ok(0),
+        Err(e) => return Err(err("open", e)),
+    };
+    let now_ns = jiff::Timestamp::now().as_nanosecond();
+    let cutoff = now_ns.saturating_sub(older_than.as_nanos().try_into().unwrap_or(i128::MAX));
+    let mut removed = 0;
+    purge_dir(trash.as_fd(), cutoff, &mut removed).map_err(|e| err("purge", e))?;
+    Ok(removed)
+}
+
+/// Purges the trash directory `dir` (see [`purge_trash`]); returns whether
+/// it is empty afterwards.
+fn purge_dir(
+    dir: BorrowedFd<'_>,
+    cutoff_ns: i128,
+    removed: &mut usize,
+) -> std::result::Result<bool, Errno> {
+    let mut names = Vec::new();
+    for entry in Dir::read_from(dir)? {
+        let name = entry?.file_name().to_bytes().to_vec();
+        if name != b"." && name != b".." {
+            names.push(name);
+        }
+    }
+    let mut empty = true;
+    for name in names {
+        let st = match rustix::fs::statat(dir, name.as_slice(), AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(st) => st,
+            Err(Errno::NOENT) => continue,
+            Err(e) => return Err(e),
+        };
+        if FileType::from_raw_mode(st.st_mode) == FileType::Directory {
+            let sub = rustix::fs::openat2(
+                dir,
+                name.as_slice(),
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+                RESOLVE,
+            )?;
+            if purge_dir(sub.as_fd(), cutoff_ns, removed)? {
+                match rustix::fs::unlinkat(dir, name.as_slice(), AtFlags::REMOVEDIR) {
+                    Ok(()) => {
+                        *removed += 1;
+                        continue;
+                    }
+                    // Something was moved in meanwhile.
+                    Err(Errno::NOTEMPTY | Errno::EXIST) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            empty = false;
+            continue;
+        }
+        let ctime = i128::from(st.st_ctime) * 1_000_000_000 + i128::from(st.st_ctime_nsec);
+        if ctime >= cutoff_ns {
+            empty = false;
+            continue;
+        }
+        point("trash.before_purge");
+        match rustix::fs::unlinkat(dir, name.as_slice(), AtFlags::empty()) {
+            Ok(()) | Err(Errno::NOENT) => *removed += 1,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(empty)
 }
 
 #[cfg(test)]
@@ -2218,8 +2458,10 @@ mod tests {
         }
 
         fn ctx(&self) -> Ctx<'_> {
+            static TOP: std::sync::LazyLock<RelPath> = std::sync::LazyLock::new(RelPath::root);
             Ctx {
                 root: &self.root,
+                base: &TOP,
                 caps: &self.caps,
                 replica: REPLICA,
                 journal: &self.journal,
@@ -3268,6 +3510,163 @@ mod tests {
         let out = rmdir(&fx.ctx(), &mut q, &rp("e")).unwrap();
         assert_eq!(out, Outcome::PreconditionFailed("not a directory"));
         assert_eq!(fs::read(fx.p("e")).unwrap(), b"user");
+    }
+
+    // ----- T31: trash --------------------------------------------------
+
+    /// The names in the trash directory `rel` (beneath `.~fsync.trash`).
+    fn trash_ls(fx: &Fx, rel: &str) -> Vec<String> {
+        let dir = fx.p(".~fsync.trash").join(rel);
+        let mut names: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Replaced and deleted files, and the children an rmdir settles, go
+    /// to the trash at their directory path, not away; a purge removes
+    /// them once they are old enough.
+    #[test]
+    fn trash_keeps_replaced_and_deleted_files() {
+        let fx = Fx::new();
+        fs::create_dir_all(fx.p("d/sub")).unwrap();
+        let f = fx.user_file("d/f.txt", b"old");
+        let g = fx.user_file("d/g", b"gone");
+        let h = fx.user_file("d/sub/h", b"h");
+        let mut q = quarantine();
+        q.set_trash(&fx.root).unwrap();
+        applied(replace(&fx, &mut q, "d/f.txt", &f, b"new").unwrap());
+        assert_eq!(del(&fx, &mut q, "d/g", &g).unwrap(), Outcome::Removed);
+        let report = q.sweep();
+        assert_eq!((report.removed, report.trashed), (2, 2), "{report:?}");
+        assert!(q.is_empty());
+        assert_eq!(fs::read(fx.p("d/f.txt")).unwrap(), b"new");
+        let names = trash_ls(&fx, "d");
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(
+            names[0].starts_with("f~") && names[0].ends_with(".txt"),
+            "{names:?}"
+        );
+        assert!(names[1].starts_with("g~"), "{names:?}");
+        let trashed = |n: &str| fs::read(fx.p(".~fsync.trash/d").join(n)).unwrap();
+        assert_eq!(trashed(&names[0]), b"old");
+        assert_eq!(trashed(&names[1]), b"gone");
+
+        // rmdir settles its quarantined child into the trash at once.
+        let mut slow = Quarantine::new(REPLICA, Duration::from_secs(3600));
+        slow.set_trash(&fx.root).unwrap();
+        assert_eq!(
+            del(&fx, &mut slow, "d/sub/h", &h).unwrap(),
+            Outcome::Removed
+        );
+        assert_eq!(
+            rmdir(&fx.ctx(), &mut slow, &rp("d/sub")).unwrap(),
+            Outcome::Removed
+        );
+        assert!(slow.is_empty());
+        assert_eq!(trash_ls(&fx, "d/sub").len(), 1);
+        // Nothing reserved is left outside the trash.
+        let outside: Vec<_> = fx
+            .leftovers()
+            .into_iter()
+            .filter(|p| !p.starts_with(fx.p(".~fsync.trash")))
+            .collect();
+        assert_eq!(outside, Vec::<PathBuf>::new());
+
+        // Too recent to purge; then everything goes, the trash itself stays.
+        assert_eq!(purge_trash(&fx.root, Duration::from_secs(3600)).unwrap(), 0);
+        assert_eq!(purge_trash(&fx.root, Duration::ZERO).unwrap(), 5);
+        assert_eq!(trash_ls(&fx, ""), Vec::<String>::new());
+    }
+
+    /// A symlink in place of the trash (or of a directory in it) is never
+    /// followed: the old inode stays in quarantine, and nothing is written
+    /// where the link points. A purge does not follow it either.
+    #[test]
+    fn trash_symlink_is_not_followed() {
+        let fx = Fx::new();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), fx.p(".~fsync.trash")).unwrap();
+        let f = fx.user_file("f", b"old");
+        let mut q = quarantine();
+        q.set_trash(&fx.root).unwrap();
+        applied(replace(&fx, &mut q, "f", &f, b"new").unwrap());
+        let report = q.sweep();
+        assert_eq!((report.removed, report.trashed), (0, 0), "{report:?}");
+        assert_eq!(q.len(), 1, "kept in quarantine");
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+        assert!(purge_trash(&fx.root, Duration::ZERO).is_err());
+
+        // A real trash, with a symlink where the file's directory would go.
+        fs::remove_file(fx.p(".~fsync.trash")).unwrap();
+        fs::create_dir(fx.p(".~fsync.trash")).unwrap();
+        fs::create_dir(fx.p("d")).unwrap();
+        let g = fx.user_file("d/g", b"g");
+        symlink(outside.path(), fx.p(".~fsync.trash/d")).unwrap();
+        assert_eq!(del(&fx, &mut q, "d/g", &g).unwrap(), Outcome::Removed);
+        let report = q.sweep();
+        assert_eq!(report.trashed, 1, "only f: {report:?}");
+        assert_eq!(q.len(), 1);
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+        // The purge removes the link itself, not what it points to.
+        fs::write(outside.path().join("keep"), "x").unwrap();
+        assert_eq!(purge_trash(&fx.root, Duration::ZERO).unwrap(), 2);
+        assert!(outside.path().join("keep").exists());
+    }
+
+    /// Races at the trash's steps (§9): right before the move, a write
+    /// through an fd held on the old file, and the trash directory moved
+    /// away with a symlink to outside put in its place. The move goes into
+    /// the directory already opened, so nothing leaves the root, and the
+    /// late write is kept in the trash. A purge leaves a new arrival alone.
+    #[test]
+    fn trash_races() {
+        let fx = Fx::new();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir_all(fx.p(".~fsync.trash/d")).unwrap();
+        fs::create_dir(fx.p("d")).unwrap();
+        let f = fx.user_file("d/f", b"old");
+        let mut held = fs::File::options().append(true).open(fx.p("d/f")).unwrap();
+        let mut q = quarantine();
+        q.set_trash(&fx.root).unwrap();
+        applied(replace(&fx, &mut q, "d/f", &f, b"new").unwrap());
+
+        let (trash, out) = (fx.p(".~fsync.trash"), outside.path().to_path_buf());
+        let _move = hooks::once("trash.before_rename", move || {
+            fs::rename(trash.join("d"), trash.join("d-moved")).unwrap();
+            symlink(&out, trash.join("d")).unwrap();
+        });
+        let _write = hooks::once("trash.before_move", move || {
+            held.write_all(b" late").unwrap();
+        });
+        hooks::start_trace();
+        let report = q.sweep();
+        let trace = hooks::take_trace();
+        for p in ["trash.before_move", "trash.before_rename"] {
+            assert!(trace.contains(&p), "{p} not reached: {trace:?}");
+        }
+        // The write came after the quarantine's check, so it is in the
+        // trash with the old content (unlinked, without a trash).
+        assert_eq!(report.trashed, 1, "{report:?}");
+        let moved = trash_ls(&fx, "d-moved");
+        assert_eq!(moved.len(), 1, "{moved:?}");
+        let kept = fs::read(fx.p(".~fsync.trash/d-moved").join(&moved[0])).unwrap();
+        assert_eq!(kept, b"old late");
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+
+        // A purge that finds a new arrival keeps it, and the directory.
+        fs::remove_file(fx.p(".~fsync.trash/d")).unwrap();
+        let arrival = fx.p(".~fsync.trash/d-moved/new");
+        let _arrive = hooks::once("trash.before_purge", move || {
+            fs::write(&arrival, b"just trashed").unwrap();
+        });
+        purge_trash(&fx.root, Duration::ZERO).unwrap();
+        assert_eq!(
+            fs::read(fx.p(".~fsync.trash/d-moved/new")).unwrap(),
+            b"just trashed"
+        );
     }
 
     /// Children deleted just before are still in quarantine (a long grace

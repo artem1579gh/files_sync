@@ -98,7 +98,7 @@ tests/       harness/, attack.rs, symlink_matrix.rs, stress.rs, crash.rs, remote
 - **Closed stdout (T26).** Rust ignores `SIGPIPE`, so `println!` panics on `EPIPE`. The CLI prints through `cli::out` (`outln!`): every line is written and flushed on the locked stdout, and a failed write only stops further printing; the command runs to its end (a daemon or `serve` keeps running, only its output is lost). After an `EPIPE` the binary exits with 141 (128 + `SIGPIPE`, what a shell shows for a C program killed by the signal; chosen over 0 so that `set -o pipefail` sees truncated output as it does for coreutils); any other write error fails the command (exit 1). `SIGPIPE` is deliberately left ignored: socket writes (std `TcpStream`, rustls over it) then get `EPIPE`, and a peer that hangs up stays an `Error::Connection`.
 - `--sandbox` (global flag; used by `sync`, `daemon` and `status`) calls `sandbox::restrict` before any thread starts: a landlock ruleset handling every write right (`WRITE_FILE`, `REMOVE_*`, `MAKE_*`, plus `REFER` from ABI 2 and `TRUNCATE` from ABI 3) allows them beneath the two roots and the pair's state directory only. Reads are not restricted (followed links may point anywhere). Without landlock the command fails rather than run unconfined. Writing through an out-of-tree `-K` link (`keep_dirlinks_unsafe`) then fails with `EACCES`.
 
-**Temp files:** they always live in the same directory as their target (same filesystem, same parent dirfd). They use the reserved prefix `.~fsync.`, which the scanner and watcher always ignore. The same namespace holds the root marker `.~fsync.root.<replica-id>` (§5.1), the one reserved name that stays.
+**Temp files:** they always live in the same directory as their target (same filesystem, same parent dirfd). They use the reserved prefix `.~fsync.`, which the scanner and watcher always ignore. The same namespace holds the root marker `.~fsync.root.<replica-id>` (§5.1) and the trash `.~fsync.trash/` (§5.3 step 4(f)), the reserved names that stay.
 
 ---
 
@@ -264,6 +264,7 @@ A link the user made in a munging replica without the prefix is synced with its 
   - Rename `.~fsync.<id>` to `.~fsync.old.<id>`.
   - Unlink it only once a write lease can be taken (no fds or mmaps remain) or a grace period (2 × debounce) has passed with mtime and size unchanged.
   - If it changed meanwhile (a writer still held an fd to it), turn it into a conflict copy.
+  - **Trash (T31, issue #1).** With `ReplicaConfig::trash_days` > 0, `LocalReplica::open` gives the quarantine a trash (`Quarantine::set_trash`): the replica root's fd. The **Unlink** verdict then moves the old inode into `.~fsync.trash/<its replica directory>/<name~YYYYMMDD-HHMMSS.ext>` (`tmpname::trash_name`; on a taken name the timestamp moves on a second, as for conflict names) with `renameat2(RENAME_NOREPLACE)` from the quarantine name, still under the lease if one was taken. Everything before that is unchanged: the grace period, the lease, and a changed old inode becoming a conflict copy. The trash and its directories are made on demand (`mkdirat` 0700), and each is opened `O_PATH` beneath its parent with `RESOLVE_BENEATH|NO_SYMLINKS|NO_MAGICLINKS|NO_XDEV`. A symlink planted in the trash makes the move fail: the entry stays in quarantine and is retried, so nothing leaves the root. The move goes into the directory already opened, so swapping a trash directory afterwards cannot redirect it. Beneath a written-through `-K` link the directory path is the replica path (`Ctx::base`, the replica path of the commit's root). On another filesystem (`EXDEV`) the inode is unlinked as without a trash. `rmdir`'s `settle_dir` moves unchanged children to the trash the same way. A crash after the move leaves the intent's `old` name empty, which replay treats as done. A write through an fd still held on the old inode after the check now lands in the trash instead of being lost (§5.10). **Purge:** `commit::purge_trash(root, older_than)` walks the trash with fds (`openat2` beneath each parent, `statat` without following), unlinks every non-directory whose ctime is older than the cutoff (the move into the trash set the ctime), and removes directories left empty (`ENOTEMPTY` means something arrived: kept). The trash directory itself stays. `LocalReplica::sweep_quarantine` purges at most once an hour (`PURGE_EVERY`). Hook points: `trash.before_move`, `trash.before_rename`, `trash.before_purge`.
   - As implemented (T18): each entry remembers whether its replica has leases. A sweep stats the entry; if unchanged, it tries a lease on it (regular files only). With the lease, it re-checks size and mtime through the lease fd (a change → conflict copy) and unlinks **while holding the lease**, so no write can slip in between the check and the unlink; this happens before the deadline too. Without one (an fd is open, a symlink, no leases), the grace period applies as before. The daemon also sweeps right after every cycle, and `sync --once` sweeps at once, so leased entries go without waiting.
 
 **Step 5. After commit.**
@@ -346,7 +347,7 @@ As implemented (T16, `src/watch/`):
 | Hardlinks | We never write in place, so other links keep the old content. Matches rsync without `-H`; `-H` may come later. |
 | A directory moved out of the root while we hold its fd | Post-commit (dev, ino) check of the parent (§5.1). |
 | A writer holding an fd to a deleted child when its directory is removed | rmdir settles the directory's quarantine early (§5.7), so the grace period is cut short. An unchanged child is unlinked under a lease if one can be taken, but a writer holding an fd refuses the lease, so its write right after the check is lost. |
-| The quarantine sweep's stat → unlink window | Closed by the lease (T18) where one can be taken; without leases, a write through a held fd in that instant is lost. |
+| The quarantine sweep's stat → unlink window | Closed by the lease (T18) where one can be taken; without leases, a write through a held fd in that instant is lost, unless the replica has a trash (T31): then it lands there. |
 | Holding a lease delays other openers of the old file | Only between (b) and (d) (plus a rehash, up to 1 MiB or a racy file); the kernel revokes it after `lease-break-time` anyway, which (d) then sees as a change. |
 
 ---
@@ -505,7 +506,7 @@ enum Outcome { Applied(Entry), PreconditionFailed(Option<Entry>), Preserved{ con
 | M8 | network: **production variant** | T20–T22 |
 | M9 | follow-ups: crash-suite flake, block-level delta transfer | T23–T25 |
 | M10 | usability fixes found while writing `docs/usage.md`: broken pipe, server-side `status`, delta visibility | T26–T28 |
-| M11 | bug fixes from GitHub issues: root marker, mass-deletion guard (issue #1) | T29–T30 |
+| M11 | bug fixes from GitHub issues: root marker, mass-deletion guard, trash (issue #1) | T29–T31 |
 
 ---
 
@@ -522,6 +523,8 @@ enum Outcome { Applied(Entry), PreconditionFailed(Option<Entry>), Preserved{ con
   Each test asserts no loss and no escape.
 
   Delta assembly (§7.1) has the points `delta.block` and `delta.assembled`; a closure there changes the destination's current file mid-assembly.
+
+  The trash (T31) has the points `trash.*`, attacked by `commit::tests::trash_races` (a late write and a trash directory swapped for a symlink right before the move; a new arrival during a purge), not by `tests/attack.rs`, whose commit runs have no trash. The root marker's `marker.*` points are likewise outside its prefix list.
 
   A syscall failure that no filesystem change can trigger on cue (`openat2`'s `EAGAIN` for a rename racing anywhere on the system, §4.5) has a **fault point** instead: `fs::hooks::fault("root.in_tree_lookup")` returns the errno a closure registered with `hooks::on_fault` injects, and the caller acts as if the syscall had failed with it. Fault points are not traced, so the crash suite does not crash at them.
 - **proptest:**

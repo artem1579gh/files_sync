@@ -47,7 +47,7 @@ Both replica directories must be on a local filesystem: ext4, xfs, btrfs or tmpf
 
   The state directory never lives inside a replica.
 - **Version vectors:** per-file causal history, as in syncthing. They tell an ordinary update ("B has seen A's last change and edited it again") from a real conflict ("both sides changed the file independently").
-- **Reserved names:** names starting with `.~fsync.` are temp, quarantine and probe files. You may briefly see them during a sync. They are never synced, and they are cleaned up, also after a crash. The root marker below is the one that stays.
+- **Reserved names:** names starting with `.~fsync.` are temp, quarantine and probe files. You may briefly see them during a sync. They are never synced, and they are cleaned up, also after a crash. The root marker and the trash below are the ones that stay.
 - **Root marker:** the first sync puts a small file `.~fsync.root.<replica-id>` at the top of each local root, saying which replica the directory is. Like syncthing's `.stfolder`, it guards against an empty directory standing in for the replica. That happens, for example, when the disk behind a root is not mounted and its empty mount point is left. Without the marker, every file in the index would look deleted, and the deletions would be synced to the other side. If the marker is missing, `sync`, `daemon` and `serve` refuse to run for the pair (a daemon whose root loses its marker stops): ``replica root …: its root marker is missing; it may not be the replica's directory (is its disk mounted?)``. To fix it:
   - if the disk is not mounted, or the path is wrong, mount it or fix the path, and run again;
   - if the directory really is the replica (say, you restored it from a backup that skipped the marker), create the marker yourself, e.g. `touch '/data/backup/.~fsync.root.b8585899415ed538'`. Its content does not matter. The next sync then treats whatever is missing from the directory as deleted, and deletes it on the other side too;
@@ -55,6 +55,7 @@ Both replica directories must be on a local filesystem: ext4, xfs, btrfs or tmpf
 
   A pair made before root markers gets its markers on its next sync, unless a root is empty while its index lists files: that is refused in the same way.
   Back up the marker with the rest of the directory, and keep it there. Since there is one marker per replica ID, a directory can be a replica of several pairs.
+- **Trash (optional):** by default, a file that a sync replaces or deletes is gone shortly afterwards. It is unlinked once nothing writes to it any more, or after a short grace period. If someone writes to it in the meantime, it is kept as a conflict copy instead. Set `trash_days` on a replica ([§10](#10-config-file-reference)) to keep such files in its trash, `.~fsync.trash` at the top of its root, for that many days. They keep their directory path there, with the time they were moved in added to the name, e.g. `.~fsync.trash/reports/q3~20261005-091139.pdf`. A sync never looks inside the trash. Files are removed once older than `trash_days`, checked about once an hour while a `sync`, `daemon` or `serve` runs. Restore a file by copying or moving it back. The trash is on the replica's own disk, so it takes space there. A file beneath a `keep_dirlinks` link to another filesystem cannot be moved there, and is removed as without a trash.
 - **Mass-deletion guard:** a second safety net, like unison's `confirmbigdeletes`. If one sync would delete more than half of a replica's entries (`max_delete_percent` in [§10](#10-config-file-reference)), and more than 10 of them, none of those deletions is applied there. Everything else is still synced. The deleting side keeps its deletions, so nothing comes back either:
 
   ```text
@@ -542,6 +543,7 @@ munge_links = false                # rsync --munge-links
 keep_dirlinks = false              # rsync -K
 keep_dirlinks_unsafe = false       # with keep_dirlinks: also links to directories outside the root
 followed_write = "replace"         # replace | conflict (incoming change to a followed link)
+trash_days = 0                     # keep replaced/deleted files in .~fsync.trash this many days (0: no trash)
 device = "cdfacff3…"               # pinned TLS certificate hash; do not change
 # remote = "host:7777"             # set by init --a-remote: replica is served there
 
@@ -589,4 +591,5 @@ Edit it while no `sync`, `daemon` or `serve` for the pair is running. Unknown ke
 | `.sync-conflict-` files appear | Both sides changed the file between syncs. See [§4](#4-conflicts). |
 | `replica root …: its root marker is missing` (or `it is empty, but its index lists N live entries`, or `its root marker is gone`) | The root does not hold the replica's root marker, so it may be the wrong directory, such as the empty mount point of a disk that is not mounted. Nothing was synced. See **Root marker** in [§2](#2-concepts). |
 | `held back N deletion(s) in …: more than 50% of its M entries` | One side lost most of its files since the last sync, and the mass-deletion guard kept the other side from following. If that was intended, run `sync --once --allow-mass-delete`. See [§2](#2-concepts). |
-| `.~fsync.*` files remain after a crash | They are recovered or removed automatically by the next `sync`, `daemon` or `serve` of the pair. `.~fsync.root.<replica-id>` at the top of a root is the root marker: keep it. |
+| `.~fsync.*` files remain after a crash | They are recovered or removed automatically by the next `sync`, `daemon` or `serve` of the pair. `.~fsync.root.<replica-id>` at the top of a root is the root marker: keep it. `.~fsync.trash` is the trash, if `trash_days` is set. |
+| I need a file back that a sync replaced or deleted | Look in `.~fsync.trash` at the top of that replica's root, if `trash_days` is set there (see **Trash** in [§2](#2-concepts)). Otherwise it is gone, unless the other replica still has it. Consider turning the trash on. |
