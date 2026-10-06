@@ -531,7 +531,7 @@ mod tests {
         assert_eq!(got, want);
 
         // The conflict: A's loser is renamed, then gets B's content with the
-        // merged vector plus B's bump.
+        // merged vector plus A's bump (A records it, issue #3).
         let rename = &phases[0].steps[0];
         let Op::RenameToConflict { to } = &rename.op else {
             panic!()
@@ -542,7 +542,7 @@ mod tests {
         );
         assert_eq!(rename.pre, Precondition::matching(&file(1, vv(2, 1))));
         let write = &phases[2].steps[0];
-        assert!(matches!(&write.op, Op::WriteFile { vv: v, .. } if *v == vv(2, 3)));
+        assert!(matches!(&write.op, Op::WriteFile { vv: v, .. } if *v == vv(3, 2)));
         assert_eq!(write.source.as_ref().map(|e| e.vv.clone()), Some(vv(1, 2)));
     }
 
@@ -583,10 +583,10 @@ mod tests {
                 (Creates, Side::A, "d/e/new", "write", true),
             ]
         );
-        // The resurrected directories dominate A's tombstones.
+        // The resurrected directories dominate A's tombstones, with A's bump.
         for step in &phases[2].steps {
             if let Op::Mkdir { vv: v, .. } = &step.op {
-                assert_eq!(*v, vv(3, 4));
+                assert_eq!(*v, vv(4, 1));
             }
         }
     }

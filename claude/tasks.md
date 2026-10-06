@@ -971,3 +971,22 @@ The design lives in [`design.md`](design.md); §N.M below refers to its sections
   - **Tests:** `tests/index_reset.rs` (4 scenarios × both modes, plus `lost_index_against_a_v2_server`); all 9 fail with `sync_clocks` disabled. `store::tests::witness_raises_the_clock_only`. Proto tests list the new variants and their tags (`newer_variants_are_appended`).
   - **Results:** the issue's shell reproduction, run with release binaries: before the fix (90b2ac2), both sides end with `v3`, no conflict copy, exit 0. After it, the sync warns that B's index is new, pushes `unsynced edit on B` to A (1 change applied) and exits 0.
   - **Docs:** `docs/usage.md` §2 (Lost or restored index), §12; README; design §3, §6.4 (Clock exchange), §7, §7.1.
+
+### [x] T33: Keep a conflict winner's new edit made before it learns the merged vector (issue #3)
+- **Depends on:** T32
+- **Read:** §3 (Local change), §6.2, §6.3, §6.4 (Clock exchange)
+- **Files:** `src/engine/reconcile.rs` (`resolve`), `src/engine/executor.rs` (`Engine::sync`, `Cycle::sync_clocks`), `src/engine/sim.rs`, `src/engine/plan.rs` (tests), `tests/harness/mod.rs` (`sync_racing_at`), `tests/conflict_clock.rs`, `tests/model.rs`, `docs/usage.md`
+- **Do:**
+  - [Issue #3](https://github.com/artem1579gh/files_sync/issues/3): `resolve` bumped the merged vector in the **winner's** name, but only the loser records it; the winner learns it a round later (`SetMeta`). Until then the winner's clock is below that counter, so a local change on the winner in that window reuses it (`bump_after(winner, clock)`), the loser's vector (holding the winner's older content) dominates it, and the new edit is replaced without a conflict.
+- **Done when:**
+  - tests reproduce it, in both modes: an edit on the winner during the round after the resolution, and a cycle cut off after round 1 followed by an edit on the winner (also against a protocol v2 server);
+  - the `sim` model checks that no index holds a counter in a replica's name above that replica's clock;
+  - `cargo test`, `cargo test --features hooks` and clippy pass.
+- **Notes:**
+  - **Fix 1: the loser's bump.** `resolve` (conflicts and resurrections) bumps the merged vector in the loser's name. The loser records it with its own index write, so its clock covers it; a later change on the winner is concurrent with it, a conflict that keeps both versions. Every counter in a replica's name is now issued on that replica's index.
+  - **Fix 2: Lamport receive before every rescan.** `Engine::sync` runs `Cycle::sync_clocks` before each rescan of dirty paths too, not only before the first scan. Defence in depth: the last round may have given a side counters (its own, e.g. a conflict copy's) its peer has not seen.
+  - **Why the in-cycle case was rare:** the loser's conflict copy has a counter above the merged vector's, and its push to the winner in round 2 usually raised the winner's clock before the rescan. The data loss needed that push to fail too (the test touches B's copy while A reads it). A directory mode conflict has no copy, but an index-only `SetMeta` on a directory only checks the inode, so a racing `chmod` does not fail it (the next scan picks the new mode up; nothing is lost). Across cycles, T32's clock exchange already covered it, except against a v2 server (which cannot `witness`).
+  - **Tests:** `tests/conflict_clock.rs` (2 scenarios × both modes, plus the v2 server). Before the fix, the in-cycle test fails in both modes and the v2 test fails; with only fix 1 the in-cycle test's counter check fails, with only fix 2 the v2 test fails. `sim`'s new invariant fails at once with the winner's bump. The harness's `sync_racing_at` races at the first path a predicate accepts (a conflict copy's name holds the time). Unit tests in `reconcile.rs` and `plan.rs` now expect the loser's bump.
+  - **Also fixed:** `tests/model.rs` was flaky since T30: its reference model applies every deletion, but the engine's mass-deletion guard can hold them back (proptest found a case deleting all 11 entries, failing at HEAD too). It now runs with `max_delete_percent(100)`.
+  - **Results:** `cargo test`, `cargo test --features hooks`, clippy (with and without `hooks`) and the release stress test (both modes) pass.
+  - **Docs:** `docs/usage.md` §4; design §3, §6.2, §6.3, §6.4 (Clock exchange).

@@ -196,6 +196,9 @@ impl Engine {
         let mut round = 0;
         loop {
             if !cycle.dirty.is_empty() {
+                // The last round may have given a side counters its peer's
+                // clock has not seen yet (issue #3).
+                cycle.sync_clocks()?;
                 let dirty = std::mem::take(&mut cycle.dirty);
                 cycle.scan(&Scope::Paths(dirty.into_iter().collect()))?;
             }
@@ -307,11 +310,12 @@ enum Done {
 }
 
 impl Cycle<'_> {
-    /// Lamport clock exchange, before anything is scanned (design §6.4,
-    /// issue #2): the replica with the lower clock raises it to the
-    /// other's. A replica whose index was lost or restored from a backup
-    /// would otherwise hand out counters the peer has already seen from it,
-    /// and the peer's older versions would dominate its new changes.
+    /// Lamport clock exchange, before every scan (design §6.4, issues #2
+    /// and #3): the replica with the lower clock raises it to the other's.
+    /// A replica whose index was lost or restored from a backup would
+    /// otherwise hand out counters the peer has already seen from it, and
+    /// the peer's older versions would dominate its new changes. Before a
+    /// rescan within the cycle, it also covers what the last round wrote.
     fn sync_clocks(&mut self) -> Result<()> {
         let (ca, cb) = (self.a.clock()?, self.b.clock()?);
         if ca < cb {

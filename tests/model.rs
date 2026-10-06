@@ -37,7 +37,7 @@ use std::fs;
 use std::io::Write as _;
 
 use files_sync::config::{ReplicaId, SymlinkPolicy};
-use files_sync::engine::Side;
+use files_sync::engine::{Engine, Side};
 use harness::{ID_A, ID_B, Mode, Pair, Tree, id7};
 use proptest::prelude::*;
 use rustix::fs::{AtFlags, CWD, Timespec, Timestamps, utimensat};
@@ -498,8 +498,11 @@ struct Run {
 
 impl Run {
     fn new(m: Mode) -> Run {
+        let mut pair = Pair::new(SymlinkPolicy::Links).over(m);
+        // The model applies every deletion: no mass-deletion guard (§6.4).
+        pair.engine = Engine::new().max_delete_percent(100);
         Run {
-            pair: Pair::new(SymlinkPolicy::Links).over(m),
+            pair,
             model: Model::default(),
             clock: EPOCH,
             writes: 0,

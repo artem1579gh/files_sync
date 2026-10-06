@@ -614,9 +614,22 @@ impl Pair {
         path: &str,
         edit: impl FnOnce() + 'static,
     ) -> SyncReport {
+        let path = rp(path);
+        self.sync_racing_at(side, when, move |p| *p == path, edit)
+    }
+
+    /// Like [`sync_racing`](Self::sync_racing), at the first path that
+    /// `at` accepts (e.g. a conflict copy, whose name holds the time).
+    pub fn sync_racing_at(
+        &mut self,
+        side: Side,
+        when: When,
+        at: impl Fn(&RelPath) -> bool + 'static,
+        edit: impl FnOnce() + 'static,
+    ) -> SyncReport {
         let race = Race {
             when,
-            path: rp(path),
+            at: Box::new(at),
             edit: RefCell::new(Some(Box::new(edit))),
         };
         let (mut a, mut b) = (
@@ -682,14 +695,14 @@ pub enum When {
 
 struct Race {
     when: When,
-    path: RelPath,
+    at: Box<dyn Fn(&RelPath) -> bool>,
     edit: RefCell<Option<Box<dyn FnOnce()>>>,
 }
 
 impl Race {
     fn fire(&self, when: When, path: &RelPath) {
         if self.when == when
-            && self.path == *path
+            && (self.at)(path)
             && let Some(edit) = self.edit.borrow_mut().take()
         {
             edit();

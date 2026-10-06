@@ -288,6 +288,16 @@ fn sync(a: &mut Model, b: &mut Model) -> Result<usize, String> {
         if !failed.is_empty() {
             return Err(format!("round {round}: steps failed at {failed:?}"));
         }
+        // No counter in a replica's name is above its clock, or its next
+        // local change could reuse it (issue #3).
+        for (m, peer) in [(&*a, &*b), (&*b, &*a)] {
+            if let Some((p, e)) = peer.map.iter().find(|(_, e)| e.vv.get(m.id) > m.max) {
+                return Err(format!(
+                    "round {round}: {p} holds {:?}, above {}'s clock {}",
+                    e.vv, m.id, m.max
+                ));
+            }
+        }
     }
     unreachable!()
 }

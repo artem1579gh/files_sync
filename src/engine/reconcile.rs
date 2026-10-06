@@ -72,8 +72,8 @@ pub struct Resolution {
     pub winner: Side,
     /// The winner's current entry (its own version vector).
     pub entry: Entry,
-    /// The merged version vector plus a bump by the winner's replica: it
-    /// dominates both sides' entries.
+    /// The merged version vector plus a bump by the loser's replica (the
+    /// side that records it): it dominates both sides' entries.
     pub vv: VersionVector,
     /// The loser side's current entry.
     pub loser: Entry,
@@ -263,10 +263,16 @@ impl Decision {
 
 /// `winner`'s version stays; the loser side gets it with the merged vector
 /// plus a bump, after its own file or symlink is moved to a conflict name.
+///
+/// The bump is the loser's: only the loser side records the vector, so its
+/// clock takes the new counter with it. A counter issued in the winner's
+/// name would be above the winner's clock until the winner learns the
+/// vector, and the winner's next local change could reuse it and be
+/// dominated by its own older version (issue #3).
 fn resolve(path: &RelPath, winner: Side, views: &Views, names: &mut Names) -> Resolution {
     let (entry, loser) = (views.entry(winner, path), views.entry(winner.other(), path));
     let mut vv = entry.vv.merge(&loser.vv);
-    vv.bump(views.id(winner));
+    vv.bump(views.id(winner.other()));
     let conflict_name = matches!(loser.kind, Kind::File { .. } | Kind::Symlink { .. })
         .then(|| names.choose(path, &loser, views.id(winner.other())));
     Resolution {
@@ -692,13 +698,14 @@ mod tests {
         d.mtime_ns = 1;
         assert_eq!(winner(d, file(1, 99, vv(1, 2))), Side::A);
         assert_eq!(winner(link(99, vv(2, 1)), file(1, 1, vv(1, 2))), Side::B);
-        // The vv the loser gets: merged plus a bump by the winner.
+        // The vv the loser gets: merged plus a bump by the loser, the side
+        // that records it (issue #3).
         let a = snap(IA, &[("f", Some(file(1, 5, vv(3, 1))))]);
         let b = snap(IB, &[("f", Some(file(2, 6, vv(1, 2))))]);
         let ActionKind::Conflict(r) = only(run(&a, &b)) else {
             panic!()
         };
-        assert_eq!(r.vv, vv(3, 4));
+        assert_eq!((r.winner, r.vv), (Side::B, vv(4, 2)));
         // A mode-only directory conflict is resolved without a rename.
         let mut d700 = dir(vv(1, 2));
         d700.mode = 0o700;
@@ -836,7 +843,8 @@ mod tests {
             ActionKind::Resurrect(r) => {
                 assert_eq!(r.winner, Side::B);
                 assert_eq!(r.loser, tomb(vv(3, 1)));
-                assert_eq!(r.vv, vv(3, 4));
+                // A records the vector, so the bump is A's (issue #3).
+                assert_eq!(r.vv, vv(4, 1));
                 assert_eq!(r.conflict_name, None);
             }
             other => panic!("{p}: {other:?}"),

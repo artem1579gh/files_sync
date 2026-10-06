@@ -208,6 +208,7 @@ Other conflict rules:
 - **Edit vs. delete:** the edit wins. The deleted file comes back with the new content.
 - **File vs. directory vs. symlink at the same name:** the directory keeps the name, then the file; the loser becomes a conflict copy.
 - **Deleting a directory on one side while the other side adds files to it:** the directory is kept, with the new files in it.
+- **Saving the winning file again while the conflict is being synced** (or before the next sync, if that one was interrupted): the new save is a new conflict with the version just copied to the other side, so it wins by its newer modification time and the older version becomes a second conflict copy. Version 0.1.3 and older could replace the new save by the older version, without a conflict copy (issue #3).
 
 ## 5. Continuous sync with the daemon
 
