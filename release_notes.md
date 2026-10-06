@@ -2,6 +2,14 @@
 
 All times are UTC.
 
+## 0.1.4 — 2026.10.06 10:31:00
+
+Fixes [issue #3](https://github.com/artem1579gh/files_sync/issues/3): after a conflict, saving the winning file again before the sync finished could replace the new save with its own older version, without a conflict copy.
+
+- **Conflict resolution:** the merged version now carries a counter of the replica that records it (the conflict's loser), not of the winner. A new save on the winner is then a conflict like any other, and both versions are kept.
+- **Clock exchange:** the two replicas now compare their version clocks before every rescan within a sync, not only before the first scan.
+- Also covered against an older `serve` (protocol v2), which cannot take part in the clock exchange.
+
 ## 0.1.3 — 2026.10.05 15:04:50
 
 Fixes [issue #2](https://github.com/artem1579gh/files_sync/issues/2): a lost or restored index silently overwrote the replica's unsynced edits with the other side's older versions.
